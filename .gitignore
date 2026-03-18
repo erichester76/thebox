@@ -144,6 +144,9 @@ ENV/
 env.bak/
 venv.bak/
 
+# Auto-generated Docker Compose overlays (created by scripts/setup.sh)
+docker-compose.macos.ports.yml
+
 # Spyder project settings
 .spyderproject
 .spyproject
