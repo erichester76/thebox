@@ -864,7 +864,7 @@ def process_dns_sniff_queue(conn, rdb) -> int:
             host["hostname"] = extra_info["tls_cn"]
         host["extra_info"] = extra_info
         host["device_type"] = guess_device_type(
-            host.get("vendor"), host.get("open_ports", []), host.get("os_guess"), extra_info
+            host.get("vendor"), host.get("open_ports", []), host.get("os_guess"), extra_info,
             host.get("hostname"),
         )
 
