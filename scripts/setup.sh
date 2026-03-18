@@ -34,12 +34,17 @@ done
 
 # ── macOS-specific prerequisite hint ────────────────────────────────────────
 if [ "$OS" = "Darwin" ]; then
-  echo "  ℹ  macOS detected — using Docker Desktop networking."
-  echo "     ARP-based LAN scanning requires the host to be on the same L2"
-  echo "     segment as the devices.  On macOS, Docker Desktop runs inside a"
-  echo "     Linux VM so network scanning will be limited to Docker-internal"
-  echo "     traffic.  All other services (dashboard, Pi-hole, honeypot, etc.)"
-  echo "     will work normally."
+  echo "  ℹ  macOS detected — checking Docker Desktop host networking."
+  echo "     TheBox uses network_mode: host so that the discovery, guardian,"
+  echo "     and honeypot services can access the Mac's network interfaces."
+  echo "     This requires Docker Desktop ≥ 4.29 with 'Enable host networking'"
+  echo "     turned on:"
+  echo "       Docker Desktop → Settings → Resources → Network"
+  echo "       → Enable 'Enable host networking' → Apply & Restart"
+  echo
+  echo "     If host networking is not enabled, start with the base compose"
+  echo "     file only (bridge networking, limited scanning capability):"
+  echo "       docker compose up -d"
   echo
 fi
 
@@ -91,8 +96,9 @@ fi
 # On Linux, overlay docker-compose.linux.yml which adds network_mode: host to
 # discovery, guardian, and honeypot for full ARP scanning and iptables
 # enforcement on the physical LAN.
-# On macOS, overlay docker-compose.macos.yml which adds explicit port mappings
-# for the honeypot so its listener ports are reachable from the Mac host.
+# On macOS, overlay docker-compose.macos.yml which adds network_mode: host to
+# discovery, guardian, and honeypot — requires Docker Desktop ≥ 4.29 with
+# "Enable host networking" turned on (Settings → Resources → Network).
 if [ "$OS" = "Darwin" ] && [ -f "$REPO_DIR/docker-compose.macos.yml" ]; then
   COMPOSE_FILES="-f $REPO_DIR/docker-compose.yml -f $REPO_DIR/docker-compose.macos.yml"
 elif [ "$OS" = "Linux" ] && [ -f "$REPO_DIR/docker-compose.linux.yml" ]; then

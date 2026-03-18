@@ -64,9 +64,9 @@ TheBox is a self-hosted, Docker Compose-based home network security and manageme
 
 | | Linux | macOS |
 |---|---|---|
-| OS | Debian / Ubuntu / Fedora / etc. | macOS 12+ with [Docker Desktop](https://www.docker.com/products/docker-desktop/) |
-| Docker | ≥ 24 with Compose v2 plugin | Docker Desktop ≥ 4.x (includes Compose v2) |
-| Network | Host must be on the same L2 segment as managed devices | Same; see [macOS notes](#-macos-notes) below |
+| OS | Debian / Ubuntu / Fedora / etc. | macOS 12+ with [Docker Desktop ≥ 4.29](https://www.docker.com/products/docker-desktop/) |
+| Docker | ≥ 24 with Compose v2 plugin | Docker Desktop ≥ 4.29 (includes Compose v2) |
+| Host networking | Automatic | Must enable in Docker Desktop — see [macOS notes](#-macos-notes) below |
 
 ### 1. Clone & configure
 
@@ -111,27 +111,46 @@ all devices use Pi-hole for DNS resolution.
 
 ## 🍎 macOS Notes
 
-TheBox runs on macOS using [Docker Desktop](https://www.docker.com/products/docker-desktop/).
-The base `docker-compose.yml` uses bridge networking so all services start on macOS without modification.
-The `docker-compose.macos.yml` overlay adds explicit port mappings for the honeypot so its listener ports are reachable from the Mac host.
-The setup script automatically applies the correct overlay for each platform.
+### Enabling host networking in Docker Desktop
+
+TheBox uses `network_mode: host` for the discovery, guardian, and honeypot
+services.  Docker Desktop ≥ 4.29 supports this on macOS, but the feature must
+be explicitly enabled before running the stack:
+
+1. Open **Docker Desktop → Settings (⚙) → Resources → Network**
+2. Turn on **"Enable host networking"**
+3. Click **Apply & Restart**
+
+Once enabled, the `docker-compose.macos.yml` overlay applies `network_mode: host`
+to those services — identical to the Linux overlay — so ports are bound directly
+on the Mac host's interfaces without any explicit port-mapping workarounds.
+The setup script detects macOS and applies this overlay automatically.
 
 **How the compose files fit together:**
 
 | File | Purpose |
 |------|---------|
-| `docker-compose.yml` | Base — works on all platforms (bridge networking, no `network_mode: host`) |
-| `docker-compose.linux.yml` | Linux overlay — adds `network_mode: host` to discovery, guardian, honeypot for full LAN capabilities |
-| `docker-compose.macos.yml` | macOS overlay — adds explicit honeypot port mappings for Docker Desktop |
+| `docker-compose.yml` | Base — bridge networking, works on all platforms without host networking |
+| `docker-compose.linux.yml` | Linux overlay — adds `network_mode: host` to discovery, guardian, honeypot |
+| `docker-compose.macos.yml` | macOS overlay — same as the Linux overlay; requires Docker Desktop ≥ 4.29 with host networking enabled |
 
-**Feature availability on macOS:**
+**Feature availability on macOS (with host networking enabled):**
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| Dashboard, Pi-hole, PostgreSQL, Redis | ✅ Full | Bridge networking works normally |
-| Honeypot (port listeners) | ✅ Full | Ports are explicitly mapped via `docker-compose.macos.yml` |
-| ARP-based LAN scanning | ⚠️ Limited | Docker Desktop runs inside a Linux VM; containers cannot reach the Mac's physical LAN segment via ARP. The discovery service starts without errors but will only see Docker-internal traffic. |
-| iptables quarantine / IoT allow-lists | ⚠️ Limited | iptables rules apply within the container's network namespace, not the Mac host. The guardian service starts without errors but will not enforce rules on the physical LAN. |
+| Dashboard, Pi-hole, PostgreSQL, Redis | ✅ Full | Bridge networking; unaffected by host-networking setting |
+| Honeypot (port listeners) | ✅ Full | Ports bound directly on Mac host via `network_mode: host` |
+| ARP-based LAN scanning | ⚠️ Limited | `network_mode: host` attaches to the Docker Desktop Linux VM's network namespace. ARP sweeps may not reach all physical LAN devices depending on the VM's interface attachment. Discovery starts without errors. |
+| iptables quarantine / IoT allow-lists | ⚠️ Limited | iptables/ipset are Linux kernel features that operate on the Linux VM's network stack, not the Mac host. Guardian starts and manages database state normally but will not enforce rules on physical LAN traffic. |
+
+**Running without host networking (Docker Desktop < 4.29 or feature disabled):**
+
+Use the base compose file only — all services start in bridge mode.
+The honeypot is not accessible from outside Docker in this mode.
+
+```bash
+docker compose up -d
+```
 
 For full network enforcement capabilities, run TheBox on a dedicated Linux host
 (Raspberry Pi, mini-PC, VM, etc.) on your LAN.

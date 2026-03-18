@@ -15,7 +15,7 @@ services:
       - ./config/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     networks:
       - thebox_internal
-      - default
+      - default   # also on default so host-mode services can reach it by name
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-thebox}"]
       interval: 10s
@@ -32,7 +32,7 @@ services:
       - ./config/redis/redis.conf:/etc/redis/redis.conf:ro
     networks:
       - thebox_internal
-      - default
+      - default   # also on default so host-mode services can reach it by name
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
