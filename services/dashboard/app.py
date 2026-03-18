@@ -92,10 +92,12 @@ def ensure_schema():
             extra_info      JSONB DEFAULT '{}',
             owner_id        INTEGER REFERENCES users(id) ON DELETE SET NULL
         )""",
-        # iot_allowlist — dashboard manages per-device IoT FQDN allow-lists
+        # iot_allowlist — FQDNs that IoT devices are permitted to reach.
+        # device_id is nullable: NULL marks a globally-shared entry added by
+        # the learning engine; a non-NULL value ties the FQDN to a specific device.
         """CREATE TABLE IF NOT EXISTS iot_allowlist (
             id          SERIAL PRIMARY KEY,
-            device_id   INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+            device_id   INTEGER REFERENCES devices(id) ON DELETE CASCADE,
             fqdn        VARCHAR(255) NOT NULL,
             created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             UNIQUE(device_id, fqdn)
