@@ -66,6 +66,7 @@
     .badge-low        { background: rgba(63,185,80,.15);  color: var(--success); }
     .badge-high       { background: rgba(210,153,34,.15); color: var(--warning); }
     .badge-critical   { background: rgba(248,81,73,.15);  color: var(--danger);  }
+    .badge-group      { background: rgba(139,148,158,.15);color: var(--text); margin: 1px; }
 
     /* ── Buttons ────────────────────────────────────── */
     .btn { border: none; border-radius: 6px; padding: 4px 10px; font-size: 12px; cursor: pointer; font-weight: 600; }
@@ -80,13 +81,18 @@
     /* ── Modal ──────────────────────────────────────── */
     .modal-backdrop { display:none; position:fixed; inset:0; background:rgba(0,0,0,.6); z-index:100; align-items:center; justify-content:center; }
     .modal-backdrop.open { display:flex; }
-    .modal { background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); padding:24px; min-width:320px; max-width:480px; width:100%; }
+    .modal { background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); padding:24px; min-width:320px; max-width:520px; width:100%; max-height:90vh; overflow-y:auto; }
     .modal h3 { font-size:15px; font-weight:700; margin-bottom:16px; }
     .modal label { display:block; font-size:12px; color:var(--muted); margin-bottom:4px; margin-top:12px; }
     .modal input, .modal select { width:100%; background:var(--bg); border:1px solid var(--border); border-radius:6px; padding:6px 10px; color:var(--text); font-size:13px; }
     .modal input:focus, .modal select:focus { outline:none; border-color:var(--accent); }
     .modal-actions { display:flex; gap:8px; justify-content:flex-end; margin-top:20px; }
     .btn-primary { background:var(--accent); color:#000; padding:6px 16px; font-size:13px; }
+
+    /* ── Checklist (group membership editor) ────────── */
+    .checklist { max-height:160px; overflow-y:auto; border:1px solid var(--border); border-radius:6px; padding:8px; background:var(--bg); }
+    .checklist label { display:flex; align-items:center; gap:8px; padding:4px 0; font-size:13px; color:var(--text); cursor:pointer; margin-top:0; }
+    .checklist input[type=checkbox] { width:auto; }
 
     /* ── Form row ───────────────────────────────────── */
     .form-row { display:flex; gap:8px; align-items:flex-end; flex-wrap:wrap; }
@@ -152,9 +158,9 @@
         <table id="devices-table">
           <thead><tr>
             <th>IP</th><th>MAC</th><th>Hostname</th><th>Vendor</th>
-            <th>Type</th><th>OS</th><th>Owner</th><th>Status</th><th>Last Seen</th><th>Actions</th>
+            <th>Type</th><th>OS</th><th>Owner</th><th>Groups</th><th>Status</th><th>Last Seen</th><th>Actions</th>
           </tr></thead>
-          <tbody id="devices-body"><tr><td colspan="10" class="empty">Loading…</td></tr></tbody>
+          <tbody id="devices-body"><tr><td colspan="11" class="empty">Loading…</td></tr></tbody>
         </table>
       </div>
     </div>
@@ -189,9 +195,34 @@
         <table id="users-table">
           <thead><tr>
             <th>Username</th><th>Display Name</th><th>Email</th>
-            <th>Devices</th><th>Created</th><th>Actions</th>
+            <th>Groups</th><th>Devices</th><th>Created</th><th>Actions</th>
           </tr></thead>
-          <tbody id="users-body"><tr><td colspan="6" class="empty">Loading…</td></tr></tbody>
+          <tbody id="users-body"><tr><td colspan="7" class="empty">Loading…</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- Groups management -->
+  <div class="card full">
+    <div class="card-header">
+      <h2>Groups</h2>
+      <button class="btn btn-ack" onclick="loadGroups()">Refresh</button>
+    </div>
+    <div class="card-body">
+      <div class="form-row" style="margin-bottom:16px">
+        <input id="new-groupname"        type="text"  placeholder="Group name *" />
+        <input id="new-groupdesc"        type="text"  placeholder="Description" />
+        <input id="new-pihole-groupname" type="text"  placeholder="Pi-hole group name" />
+        <button class="btn btn-primary" onclick="createGroup()">Add Group</button>
+      </div>
+      <div class="scrollable">
+        <table id="groups-table">
+          <thead><tr>
+            <th>Name</th><th>Description</th><th>Pi-hole Group</th>
+            <th>Users</th><th>Devices</th><th>Actions</th>
+          </tr></thead>
+          <tbody id="groups-body"><tr><td colspan="6" class="empty">Loading…</td></tr></tbody>
         </table>
       </div>
     </div>
@@ -229,6 +260,38 @@
   </div>
 </div>
 
+<!-- Edit Group Modal -->
+<div class="modal-backdrop" id="edit-group-modal">
+  <div class="modal">
+    <h3>Edit Group</h3>
+    <input type="hidden" id="edit-group-id" />
+    <label>Description</label>
+    <input id="edit-group-desc" type="text" placeholder="Description" />
+    <label>Pi-hole Group Name</label>
+    <input id="edit-pihole-groupname" type="text" placeholder="Pi-hole group name" />
+    <div class="modal-actions">
+      <button class="btn btn-ack" onclick="closeEditGroupModal()">Cancel</button>
+      <button class="btn btn-primary" onclick="confirmEditGroup()">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- Manage Group Members Modal -->
+<div class="modal-backdrop" id="manage-group-modal">
+  <div class="modal">
+    <h3 id="manage-group-title">Manage Group Members</h3>
+    <input type="hidden" id="manage-group-id" />
+    <label>Users</label>
+    <div class="checklist" id="manage-group-users"></div>
+    <label>Devices</label>
+    <div class="checklist" id="manage-group-devices"></div>
+    <div class="modal-actions">
+      <button class="btn btn-ack" onclick="closeManageGroupModal()">Cancel</button>
+      <button class="btn btn-primary" onclick="confirmManageGroup()">Save</button>
+    </div>
+  </div>
+</div>
+
 <script>
 // ── API helpers ──────────────────────────────────────────────────────────────
 async function api(path, opts={}) {
@@ -242,13 +305,18 @@ function fmtDate(iso) {
   return new Date(iso).toLocaleString();
 }
 
+function escHtml(s) {
+  if (!s) return '';
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+
 function statusBadge(s) {
   const map = { trusted:'trusted', quarantined:'quarantine', blocked:'blocked', iot:'iot', new:'new' };
-  return `<span class="badge badge-${map[s]||'new'}">${s}</span>`;
+  return `<span class="badge badge-${map[s]||'new'}">${escHtml(s)}</span>`;
 }
 
 function severityBadge(s) {
-  return `<span class="badge badge-${s||'low'}">${s||'low'}</span>`;
+  return `<span class="badge badge-${escHtml(s)||'low'}">${escHtml(s)||'low'}</span>`;
 }
 
 // ── Stats ────────────────────────────────────────────────────────────────────
@@ -267,31 +335,33 @@ async function loadStats() {
 async function loadDevices() {
   const devices = await api('/api/devices');
   const tbody = document.getElementById('devices-body');
-  if (!devices.length) { tbody.innerHTML = '<tr><td colspan="10" class="empty">No devices yet</td></tr>'; return; }
+  if (!devices.length) { tbody.innerHTML = '<tr><td colspan="11" class="empty">No devices yet</td></tr>'; return; }
   tbody.innerHTML = devices.map(d => {
     const ownerLabel = d.owner_display_name || d.owner_username
-      ? `<span style="color:var(--accent)">${d.owner_display_name || d.owner_username}</span>`
+      ? `<span style="color:var(--accent)">${escHtml(d.owner_display_name || d.owner_username)}</span>`
       : `<span style="color:var(--muted)">–</span>`;
-    const needsOwner = (d.status === 'quarantined' || d.status === 'new') && !d.owner_id;
+    const groupBadges = (d.groups || []).map(g => `<span class="badge badge-group">${escHtml(g.name)}</span>`).join('');
+    const needsOwner = !d.owner_id;
     const trustBtn = needsOwner
-      ? `<button class="btn btn-trust" title="Assign a user first" onclick="alert('Assign a user owner before trusting this device.')" style="opacity:.4;cursor:not-allowed">Trust</button>`
+      ? `<button class="btn btn-trust" title="Assign a user owner before trusting this device." style="opacity:.4;cursor:not-allowed" disabled>Trust</button>`
       : `<button class="btn btn-trust" onclick="setStatus(${d.id},'trusted')">Trust</button>`;
     return `
     <tr>
-      <td>${d.ip_address||'–'}</td>
-      <td style="font-family:monospace">${d.mac_address}</td>
-      <td>${d.hostname||'–'}</td>
-      <td>${d.vendor||'–'}</td>
-      <td>${d.device_type||'–'}</td>
-      <td>${d.os_guess||'–'}</td>
+      <td>${escHtml(d.ip_address)||'–'}</td>
+      <td style="font-family:monospace">${escHtml(d.mac_address)}</td>
+      <td>${escHtml(d.hostname)||'–'}</td>
+      <td>${escHtml(d.vendor)||'–'}</td>
+      <td>${escHtml(d.device_type)||'–'}</td>
+      <td>${escHtml(d.os_guess)||'–'}</td>
       <td>${ownerLabel}</td>
+      <td>${groupBadges||'<span style="color:var(--muted)">–</span>'}</td>
       <td>${statusBadge(d.status)}</td>
       <td>${fmtDate(d.last_seen)}</td>
       <td>
         ${trustBtn}
         <button class="btn btn-block" onclick="setStatus(${d.id},'blocked')">Block</button>
         <button class="btn btn-iot"   onclick="setStatus(${d.id},'iot')">IoT</button>
-        <button class="btn btn-user"  onclick="openAssignModal(${d.id}, ${d.owner_id||'null'})">👤</button>
+        <button class="btn btn-user"  data-device-id="${d.id}" data-owner-id="${d.owner_id||''}" onclick="openAssignModalFromBtn(this)">👤</button>
       </td>
     </tr>`;
   }).join('');
@@ -314,12 +384,16 @@ async function setStatus(id, status) {
 // ── Assign user modal ─────────────────────────────────────────────────────────
 let _assignDeviceId = null;
 
+function openAssignModalFromBtn(btn) {
+  openAssignModal(parseInt(btn.dataset.deviceId), btn.dataset.ownerId ? parseInt(btn.dataset.ownerId) : null);
+}
+
 async function openAssignModal(deviceId, currentUserId) {
   _assignDeviceId = deviceId;
   const users = await api('/api/users');
   const sel = document.getElementById('assign-user-select');
   sel.innerHTML = '<option value="">— Unassigned —</option>' +
-    users.map(u => `<option value="${u.id}"${u.id===currentUserId?' selected':''}>${u.display_name||u.username} (@${u.username})</option>`).join('');
+    users.map(u => `<option value="${u.id}"${u.id===currentUserId?' selected':''}>${escHtml(u.display_name||u.username)} (@${escHtml(u.username)})</option>`).join('');
   document.getElementById('assign-modal').classList.add('open');
 }
 
@@ -382,19 +456,30 @@ async function loadHoneypot() {
 async function loadUsers() {
   const users = await api('/api/users');
   const tbody = document.getElementById('users-body');
-  if (!users.length) { tbody.innerHTML = '<tr><td colspan="6" class="empty">No users yet</td></tr>'; return; }
-  tbody.innerHTML = users.map(u => `
+  if (!users.length) { tbody.innerHTML = '<tr><td colspan="7" class="empty">No users yet</td></tr>'; return; }
+  tbody.innerHTML = users.map(u => {
+    const groupBadges = (u.groups || []).map(g => `<span class="badge badge-group">${escHtml(g.name)}</span>`).join('');
+    return `
     <tr>
-      <td style="font-weight:600">${u.username}</td>
-      <td>${u.display_name||'–'}</td>
-      <td>${u.email||'–'}</td>
+      <td style="font-weight:600">${escHtml(u.username)}</td>
+      <td>${escHtml(u.display_name)||'–'}</td>
+      <td>${escHtml(u.email)||'–'}</td>
+      <td>${groupBadges||'<span style="color:var(--muted)">–</span>'}</td>
       <td>${u.device_count}</td>
       <td>${fmtDate(u.created_at)}</td>
       <td>
-        <button class="btn btn-user" onclick="openEditUserModal(${u.id},'${(u.display_name||'').replace(/'/g,"\\'")}','${(u.email||'').replace(/'/g,"\\'")}')">Edit</button>
-        <button class="btn btn-danger" onclick="deleteUser(${u.id},'${u.username.replace(/'/g,"\\'")}')">Delete</button>
+        <button class="btn btn-user"
+          data-user-id="${u.id}"
+          data-display-name="${escHtml(u.display_name||'')}"
+          data-email="${escHtml(u.email||'')}"
+          onclick="openEditUserModalFromBtn(this)">Edit</button>
+        <button class="btn btn-danger"
+          data-user-id="${u.id}"
+          data-username="${escHtml(u.username)}"
+          onclick="deleteUserFromBtn(this)">Delete</button>
       </td>
-    </tr>`).join('');
+    </tr>`;
+  }).join('');
 }
 
 async function createUser() {
@@ -417,6 +502,10 @@ async function createUser() {
   document.getElementById('new-displayname').value = '';
   document.getElementById('new-email').value       = '';
   loadUsers();
+}
+
+function openEditUserModalFromBtn(btn) {
+  openEditUserModal(parseInt(btn.dataset.userId), btn.dataset.displayName, btn.dataset.email);
 }
 
 function openEditUserModal(id, displayName, email) {
@@ -449,6 +538,10 @@ async function confirmEditUser() {
   loadUsers();
 }
 
+async function deleteUserFromBtn(btn) {
+  deleteUser(parseInt(btn.dataset.userId), btn.dataset.username);
+}
+
 async function deleteUser(id, username) {
   if (!confirm(`Delete user "${username}"? Their devices will become unassigned.`)) return;
   try {
@@ -462,7 +555,191 @@ async function deleteUser(id, username) {
   loadUsers(); loadDevices();
 }
 
-// ── SSE live updates ──────────────────────────────────────────────────────────
+// ── Groups ───────────────────────────────────────────────────────────────────
+async function loadGroups() {
+  const groups = await api('/api/groups');
+  const tbody = document.getElementById('groups-body');
+  if (!groups.length) { tbody.innerHTML = '<tr><td colspan="6" class="empty">No groups yet</td></tr>'; return; }
+  tbody.innerHTML = groups.map(g => `
+    <tr>
+      <td style="font-weight:600">${escHtml(g.name)}</td>
+      <td>${escHtml(g.description)||'–'}</td>
+      <td>${g.pihole_group_name ? `<span class="badge badge-group">${escHtml(g.pihole_group_name)}</span>` : '<span style="color:var(--muted)">–</span>'}</td>
+      <td>${g.user_count}</td>
+      <td>${g.device_count}</td>
+      <td>
+        <button class="btn btn-user"
+          data-group-id="${g.id}"
+          data-description="${escHtml(g.description||'')}"
+          data-pihole-group-name="${escHtml(g.pihole_group_name||'')}"
+          onclick="openEditGroupModalFromBtn(this)">Edit</button>
+        <button class="btn btn-user"
+          data-group-id="${g.id}"
+          data-group-name="${escHtml(g.name)}"
+          onclick="openManageGroupModalFromBtn(this)">Members</button>
+        <button class="btn btn-danger"
+          data-group-id="${g.id}"
+          data-group-name="${escHtml(g.name)}"
+          onclick="deleteGroupFromBtn(this)">Delete</button>
+      </td>
+    </tr>`).join('');
+}
+
+async function createGroup() {
+  const name            = document.getElementById('new-groupname').value.trim();
+  const description     = document.getElementById('new-groupdesc').value.trim();
+  const piholeGroupName = document.getElementById('new-pihole-groupname').value.trim();
+  if (!name) { alert('Group name is required.'); return; }
+  try {
+    await api('/api/groups', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({name, description: description||null, pihole_group_name: piholeGroupName||null})
+    });
+  } catch(e) {
+    let msg = 'Failed to create group.';
+    try { msg = JSON.parse(e.message).error || msg; } catch(_) {}
+    alert(msg);
+    return;
+  }
+  document.getElementById('new-groupname').value        = '';
+  document.getElementById('new-groupdesc').value        = '';
+  document.getElementById('new-pihole-groupname').value = '';
+  loadGroups();
+}
+
+function openEditGroupModalFromBtn(btn) {
+  openEditGroupModal(parseInt(btn.dataset.groupId), btn.dataset.description, btn.dataset.piholeGroupName);
+}
+
+function openEditGroupModal(id, description, piholeGroupName) {
+  document.getElementById('edit-group-id').value         = id;
+  document.getElementById('edit-group-desc').value       = description;
+  document.getElementById('edit-pihole-groupname').value = piholeGroupName;
+  document.getElementById('edit-group-modal').classList.add('open');
+}
+
+function closeEditGroupModal() {
+  document.getElementById('edit-group-modal').classList.remove('open');
+}
+
+async function confirmEditGroup() {
+  const id              = document.getElementById('edit-group-id').value;
+  const description     = document.getElementById('edit-group-desc').value.trim();
+  const piholeGroupName = document.getElementById('edit-pihole-groupname').value.trim();
+  try {
+    await api(`/api/groups/${id}`, {
+      method:'PUT', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({description: description||null, pihole_group_name: piholeGroupName||null})
+    });
+  } catch(e) {
+    let msg = 'Failed to update group.';
+    try { msg = JSON.parse(e.message).error || msg; } catch(_) {}
+    alert(msg);
+    return;
+  }
+  closeEditGroupModal();
+  loadGroups();
+}
+
+async function deleteGroupFromBtn(btn) {
+  deleteGroup(parseInt(btn.dataset.groupId), btn.dataset.groupName);
+}
+
+async function deleteGroup(id, name) {
+  if (!confirm(`Delete group "${name}"? Members will be unlinked.`)) return;
+  try {
+    await api(`/api/groups/${id}`, {method:'DELETE'});
+  } catch(e) {
+    let msg = 'Failed to delete group.';
+    try { msg = JSON.parse(e.message).error || msg; } catch(_) {}
+    alert(msg);
+    return;
+  }
+  loadGroups(); loadUsers(); loadDevices();
+}
+
+// ── Manage group members modal ────────────────────────────────────────────────
+async function openManageGroupModalFromBtn(btn) {
+  openManageGroupModal(parseInt(btn.dataset.groupId), btn.dataset.groupName);
+}
+
+async function openManageGroupModal(groupId, groupName) {
+  document.getElementById('manage-group-id').value      = groupId;
+  document.getElementById('manage-group-title').textContent = `Manage Members — ${groupName}`;
+
+  const [allUsers, allDevices, memberUsers, memberDevices] = await Promise.all([
+    api('/api/users'),
+    api('/api/devices'),
+    api(`/api/groups/${groupId}/users`),
+    api(`/api/groups/${groupId}/devices`),
+  ]);
+
+  const memberUserIds   = new Set(memberUsers.map(u => u.id));
+  const memberDeviceIds = new Set(memberDevices.map(d => d.id));
+
+  const usersEl = document.getElementById('manage-group-users');
+  usersEl.innerHTML = allUsers.length
+    ? allUsers.map(u => `
+        <label>
+          <input type="checkbox" value="${u.id}" ${memberUserIds.has(u.id)?'checked':''} />
+          ${escHtml(u.display_name||u.username)} (@${escHtml(u.username)})
+        </label>`).join('')
+    : '<span style="color:var(--muted);font-size:12px">No users</span>';
+
+  const devicesEl = document.getElementById('manage-group-devices');
+  devicesEl.innerHTML = allDevices.length
+    ? allDevices.map(d => `
+        <label>
+          <input type="checkbox" value="${d.id}" ${memberDeviceIds.has(d.id)?'checked':''} />
+          ${escHtml(d.ip_address||d.mac_address)} ${d.hostname ? `(${escHtml(d.hostname)})` : ''}
+        </label>`).join('')
+    : '<span style="color:var(--muted);font-size:12px">No devices</span>';
+
+  document.getElementById('manage-group-modal').classList.add('open');
+}
+
+function closeManageGroupModal() {
+  document.getElementById('manage-group-modal').classList.remove('open');
+}
+
+async function confirmManageGroup() {
+  const groupId = document.getElementById('manage-group-id').value;
+
+  const userChecks   = document.querySelectorAll('#manage-group-users input[type=checkbox]');
+  const deviceChecks = document.querySelectorAll('#manage-group-devices input[type=checkbox]');
+
+  const [currentMembers, currentDevices] = await Promise.all([
+    api(`/api/groups/${groupId}/users`),
+    api(`/api/groups/${groupId}/devices`),
+  ]);
+  const currentUserIds   = new Set(currentMembers.map(u => u.id));
+  const currentDeviceIds = new Set(currentDevices.map(d => d.id));
+
+  const ops = [];
+  userChecks.forEach(cb => {
+    const uid = parseInt(cb.value);
+    if (cb.checked && !currentUserIds.has(uid))
+      ops.push(api(`/api/groups/${groupId}/users/${uid}`, {method:'PUT'}));
+    else if (!cb.checked && currentUserIds.has(uid))
+      ops.push(api(`/api/groups/${groupId}/users/${uid}`, {method:'DELETE'}));
+  });
+  deviceChecks.forEach(cb => {
+    const did = parseInt(cb.value);
+    if (cb.checked && !currentDeviceIds.has(did))
+      ops.push(api(`/api/groups/${groupId}/devices/${did}`, {method:'PUT'}));
+    else if (!cb.checked && currentDeviceIds.has(did))
+      ops.push(api(`/api/groups/${groupId}/devices/${did}`, {method:'DELETE'}));
+  });
+
+  try { await Promise.all(ops); } catch(e) {
+    let msg = 'Failed to save group members.';
+    try { msg = JSON.parse(e.message).error || msg; } catch(_) {}
+    alert(msg);
+    return;
+  }
+  closeManageGroupModal();
+  loadGroups(); loadUsers(); loadDevices();
+}
 function connectSSE() {
   const es = new EventSource('/api/events');
   const dot = document.getElementById('live-dot');
@@ -486,10 +763,16 @@ document.getElementById('assign-modal').addEventListener('click', function(e) {
 document.getElementById('edit-user-modal').addEventListener('click', function(e) {
   if (e.target === this) closeEditUserModal();
 });
+document.getElementById('edit-group-modal').addEventListener('click', function(e) {
+  if (e.target === this) closeEditGroupModal();
+});
+document.getElementById('manage-group-modal').addEventListener('click', function(e) {
+  if (e.target === this) closeManageGroupModal();
+});
 
 // ── Bootstrap ────────────────────────────────────────────────────────────────
 (async () => {
-  await Promise.all([loadStats(), loadDevices(), loadAlerts(), loadHoneypot(), loadUsers()]);
+  await Promise.all([loadStats(), loadDevices(), loadAlerts(), loadHoneypot(), loadUsers(), loadGroups()]);
   connectSSE();
   // Periodic refresh
   setInterval(() => { loadStats(); loadAlerts(); loadHoneypot(); }, 30000);
