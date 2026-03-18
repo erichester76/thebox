@@ -14,6 +14,46 @@ echo "║       TheBox — Home Network Server Setup     ║"
 echo "╚══════════════════════════════════════════════╝"
 echo
 
+configure_linux_dns_stub_listener() {
+  local resolved_dropin_dir="/etc/systemd/resolved.conf.d"
+  local resolved_dropin="$resolved_dropin_dir/thebox.conf"
+  local current_resolv=""
+
+  if [ "$OS" != "Linux" ]; then
+    return
+  fi
+
+  if ! command -v systemctl &>/dev/null; then
+    return
+  fi
+
+  if ! systemctl is-active --quiet systemd-resolved; then
+    return
+  fi
+
+  echo "Disabling systemd-resolved DNS stub listener so Pi-hole can bind port 53…"
+  mkdir -p "$resolved_dropin_dir"
+  cat > "$resolved_dropin" <<'EOF'
+[Resolve]
+DNSStubListener=no
+EOF
+
+  current_resolv=$(readlink -f /etc/resolv.conf 2>/dev/null || true)
+  if [ "$current_resolv" = "/run/systemd/resolve/stub-resolv.conf" ] \
+    && [ -e /run/systemd/resolve/resolv.conf ]; then
+    ln -sf /run/systemd/resolve/resolv.conf /etc/resolv.conf
+  fi
+
+  systemctl restart systemd-resolved
+
+  if command -v ss &>/dev/null \
+    && ss -lntup 2>/dev/null | grep -q '127\.0\.0\.53.*:53'; then
+    echo "ERROR: systemd-resolved is still binding 127.0.0.53:53."
+    echo "       Review $resolved_dropin and 'systemctl status systemd-resolved'."
+    exit 1
+  fi
+}
+
 # ── Prerequisite checks ──────────────────────────────────────────────────────
 # docker compose v2 (plugin) is preferred; fall back to docker-compose v1.
 if docker compose version &>/dev/null; then
@@ -59,6 +99,12 @@ else
   GATEWAY=$(ip route 2>/dev/null | awk '/default/ {print $3; exit}')
 fi
 echo "Detected primary interface: ${IFACE:-unknown}  (gateway: ${GATEWAY:-unknown})"
+
+# ── Free host DNS port 53 for Pi-hole on Ubuntu/systemd-resolved hosts ─────
+# systemd-resolved commonly binds 127.0.0.53:53 on Linux. Docker treats that
+# as a host port 53 conflict, so Pi-hole cannot start until the stub listener
+# is disabled and /etc/resolv.conf points at the non-stub resolver file.
+configure_linux_dns_stub_listener
 
 # ── Enable IP forwarding (required for gateway / routing features) ───────────
 echo "Enabling IP forwarding…"

@@ -86,6 +86,10 @@ nano .env
 
 The setup script auto-detects Linux vs macOS and uses the appropriate settings.
 
+On Ubuntu and other `systemd-resolved` hosts, the script also disables the
+local DNS stub listener (`DNSStubListener=no`) and repoints `/etc/resolv.conf`
+to the non-stub resolver file so Pi-hole can claim host port 53.
+
 ```bash
 sudo bash scripts/setup.sh
 ```
@@ -94,6 +98,13 @@ Or start manually:
 
 ```bash
 # Linux (full capabilities — ARP scanning + iptables enforcement)
+# If systemd-resolved is active, disable its stub listener first:
+#   sudo mkdir -p /etc/systemd/resolved.conf.d
+#   printf '[Resolve]\nDNSStubListener=no\n' | sudo tee /etc/systemd/resolved.conf.d/thebox.conf >/dev/null
+#   if [ "$(readlink -f /etc/resolv.conf)" = "/run/systemd/resolve/stub-resolv.conf" ]; then
+#     sudo ln -sf /run/systemd/resolve/resolv.conf /etc/resolv.conf
+#   fi
+#   sudo systemctl restart systemd-resolved
 docker compose -f docker-compose.yml -f docker-compose.linux.yml up -d
 
 # macOS (Docker Desktop)
