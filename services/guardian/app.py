@@ -53,11 +53,146 @@ def get_redis():
     return redis.from_url(REDIS_URL, decode_responses=True)
 
 
+# ─── Schema bootstrap ────────────────────────────────────────────────────────
+
+def ensure_schema():
+    """Create any missing tables / indexes this service depends on.
+
+    Executes the full schema DDL idempotently (all statements use
+    ``IF NOT EXISTS``) so that tables added to ``init.sql`` after the initial
+    deployment are created automatically by whichever service starts first.
+    """
+    statements = [
+        """CREATE TABLE IF NOT EXISTS users (
+            id              SERIAL PRIMARY KEY,
+            username        VARCHAR(64) NOT NULL UNIQUE,
+            display_name    VARCHAR(255),
+            email           VARCHAR(255),
+            created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""",
+        """CREATE TABLE IF NOT EXISTS devices (
+            id              SERIAL PRIMARY KEY,
+            mac_address     VARCHAR(17) NOT NULL UNIQUE,
+            ip_address      VARCHAR(45),
+            hostname        VARCHAR(255),
+            vendor          VARCHAR(255),
+            device_type     VARCHAR(64) DEFAULT 'unknown',
+            os_guess        VARCHAR(255),
+            first_seen      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            last_seen       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            status          VARCHAR(32) NOT NULL DEFAULT 'new',
+            notes           TEXT,
+            open_ports      JSONB DEFAULT '[]',
+            extra_info      JSONB DEFAULT '{}',
+            owner_id        INTEGER REFERENCES users(id) ON DELETE SET NULL
+        )""",
+        """CREATE TABLE IF NOT EXISTS iot_allowlist (
+            id          SERIAL PRIMARY KEY,
+            device_id   INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+            fqdn        VARCHAR(255) NOT NULL,
+            created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE(device_id, fqdn)
+        )""",
+        """CREATE TABLE IF NOT EXISTS honeypot_events (
+            id              SERIAL PRIMARY KEY,
+            src_ip          VARCHAR(45) NOT NULL,
+            src_port        INTEGER,
+            dst_port        INTEGER NOT NULL,
+            protocol        VARCHAR(10) NOT NULL DEFAULT 'tcp',
+            payload_preview TEXT,
+            severity        VARCHAR(16) NOT NULL DEFAULT 'low',
+            device_id       INTEGER REFERENCES devices(id),
+            created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""",
+        """CREATE TABLE IF NOT EXISTS dns_events (
+            id          SERIAL PRIMARY KEY,
+            device_id   INTEGER REFERENCES devices(id),
+            src_ip      VARCHAR(45) NOT NULL,
+            query       VARCHAR(255) NOT NULL,
+            query_type  VARCHAR(16) NOT NULL DEFAULT 'A',
+            blocked     BOOLEAN NOT NULL DEFAULT FALSE,
+            created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""",
+        """CREATE TABLE IF NOT EXISTS scan_runs (
+            id              SERIAL PRIMARY KEY,
+            started_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            finished_at     TIMESTAMPTZ,
+            network_range   VARCHAR(64) NOT NULL,
+            devices_found   INTEGER NOT NULL DEFAULT 0,
+            new_devices     INTEGER NOT NULL DEFAULT 0,
+            status          VARCHAR(32) NOT NULL DEFAULT 'running'
+        )""",
+        """CREATE TABLE IF NOT EXISTS alerts (
+            id           SERIAL PRIMARY KEY,
+            source       VARCHAR(64) NOT NULL,
+            level        VARCHAR(16) NOT NULL DEFAULT 'info',
+            title        VARCHAR(255) NOT NULL,
+            detail       TEXT,
+            device_id    INTEGER REFERENCES devices(id),
+            acknowledged BOOLEAN NOT NULL DEFAULT FALSE,
+            created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""",
+        """CREATE TABLE IF NOT EXISTS groups (
+            id                SERIAL PRIMARY KEY,
+            name              VARCHAR(64) NOT NULL UNIQUE,
+            description       TEXT,
+            pihole_group_name VARCHAR(64),
+            created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""",
+        """CREATE TABLE IF NOT EXISTS user_groups (
+            user_id  INTEGER NOT NULL REFERENCES users(id)  ON DELETE CASCADE,
+            group_id INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+            PRIMARY KEY (user_id, group_id)
+        )""",
+        """CREATE TABLE IF NOT EXISTS device_groups (
+            device_id INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+            group_id  INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+            PRIMARY KEY (device_id, group_id)
+        )""",
+        """CREATE TABLE IF NOT EXISTS redirect_events (
+            id          SERIAL PRIMARY KEY,
+            action      VARCHAR(64) NOT NULL,
+            target_ip   VARCHAR(45) NOT NULL,
+            target_mac  VARCHAR(17),
+            mode        VARCHAR(64) NOT NULL,
+            detail      TEXT,
+            device_id   INTEGER REFERENCES devices(id),
+            created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_devices_mac       ON devices(mac_address)",
+        "CREATE INDEX IF NOT EXISTS idx_devices_ip        ON devices(ip_address)",
+        "CREATE INDEX IF NOT EXISTS idx_devices_status    ON devices(status)",
+        "CREATE INDEX IF NOT EXISTS idx_devices_owner     ON devices(owner_id)",
+        "CREATE INDEX IF NOT EXISTS idx_honeypot_src_ip   ON honeypot_events(src_ip)",
+        "CREATE INDEX IF NOT EXISTS idx_honeypot_created  ON honeypot_events(created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_alerts_level      ON alerts(level)",
+        "CREATE INDEX IF NOT EXISTS idx_alerts_created    ON alerts(created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_user_groups_group   ON user_groups(group_id)",
+        "CREATE INDEX IF NOT EXISTS idx_device_groups_group ON device_groups(group_id)",
+        "CREATE INDEX IF NOT EXISTS idx_redirect_target_ip  ON redirect_events(target_ip)",
+        "CREATE INDEX IF NOT EXISTS idx_redirect_created    ON redirect_events(created_at)",
+    ]
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            for stmt in statements:
+                cur.execute(stmt)
+        conn.commit()
+    finally:
+        conn.close()
+    log.info("schema_ensured")
+
+
 # ─── iptables / ipset helpers ────────────────────────────────────────────────
 
-# Set to False by bootstrap_iptables() when ipset is unavailable so that
-# subsequent ipset calls are skipped silently instead of flooding the log.
+# Set to False by bootstrap_iptables() when ipset hash:mac is unavailable.
+# When False, policy is enforced via per-IP iptables rules in THEBOX_POLICY.
 _ipsets_available: bool = True
+
+# Name of the dedicated iptables chain used for IP-based fallback rules.
+_THEBOX_CHAIN = "THEBOX_POLICY"
 
 
 def run_cmd(args: list[str], check: bool = True) -> subprocess.CompletedProcess:
@@ -97,10 +232,84 @@ def flush_ipset(name: str):
     run_cmd(["ipset", "flush", name], check=False)
 
 
+# ─── IP-based iptables fallback (when ipset hash:mac is unavailable) ─────────
+
+def _bootstrap_iptables_ip_fallback():
+    """Create the THEBOX_POLICY chain and insert a jump into FORWARD.
+
+    Used when the kernel does not support the ``hash:mac`` ipset type (e.g.
+    macOS Docker Desktop).  Policy is enforced via per-IP iptables rules in
+    the dedicated chain rather than MAC-based ipsets.
+    """
+    # Create the chain (idempotent — -N fails if it already exists)
+    run_cmd(["iptables", "-N", _THEBOX_CHAIN], check=False)
+    # Insert the jump rule into FORWARD if not already there
+    if run_cmd(["iptables", "-C", "FORWARD", "-j", _THEBOX_CHAIN], check=False).returncode != 0:
+        run_cmd(["iptables", "-I", "FORWARD", "-j", _THEBOX_CHAIN])
+    log.info("iptables_ip_fallback_ready", chain=_THEBOX_CHAIN)
+
+
+def _flush_iptables_ip_chain():
+    """Remove all per-IP rules from the THEBOX_POLICY chain."""
+    run_cmd(["iptables", "-F", _THEBOX_CHAIN], check=False)
+
+
+def _remove_iptables_ip_rules(ip: str):
+    """Delete all THEBOX_POLICY rules that reference source IP *ip*.
+
+    Tries every rule variant we might have inserted and repeats each deletion
+    until iptables reports no matching rule (handles duplicate entries).
+    A maximum of 10 iterations per variant guards against unexpected loops.
+    """
+    _MAX_ITER = 10
+    for extra in [
+        ["-p", "udp", "--dport", "53", "-j", "ACCEPT"],
+        ["-p", "udp", "--dport", "67", "-j", "ACCEPT"],
+        ["-p", "udp", "--dport", "68", "-j", "ACCEPT"],
+        ["-j", "DROP"],
+    ]:
+        for _ in range(_MAX_ITER):
+            if run_cmd(
+                ["iptables", "-D", _THEBOX_CHAIN, "-s", ip] + extra, check=False
+            ).returncode != 0:
+                break
+
+
+def _apply_iptables_ip_policy(ip: str, status: str):
+    """Insert per-IP THEBOX_POLICY rules for a single device.
+
+    The caller is responsible for removing any stale rules for *ip* first
+    (either via :func:`_remove_iptables_ip_rules` or
+    :func:`_flush_iptables_ip_chain`).
+    """
+    if not ip:
+        return
+
+    if status in ("quarantined", "new", "iot"):
+        rules = [
+            ["-A", _THEBOX_CHAIN, "-s", ip, "-p", "udp", "--dport", "53", "-j", "ACCEPT"],
+            ["-A", _THEBOX_CHAIN, "-s", ip, "-p", "udp", "--dport", "67", "-j", "ACCEPT"],
+            ["-A", _THEBOX_CHAIN, "-s", ip, "-p", "udp", "--dport", "68", "-j", "ACCEPT"],
+            ["-A", _THEBOX_CHAIN, "-s", ip, "-j", "DROP"],
+        ]
+    elif status == "blocked":
+        rules = [
+            ["-A", _THEBOX_CHAIN, "-s", ip, "-j", "DROP"],
+        ]
+    else:
+        return  # trusted — no rules; unrestricted access
+
+    for rule in rules:
+        run_cmd(["iptables"] + rule)
+
+
 def bootstrap_iptables():
     """
     Create the ipsets and iptables chains used by the guardian.
     Idempotent — safe to call on every start.
+
+    Falls back to per-IP iptables rules in the ``THEBOX_POLICY`` chain when
+    the kernel does not support the ``hash:mac`` ipset type.
     """
     global _ipsets_available
 
@@ -114,9 +323,13 @@ def bootstrap_iptables():
     ]
     for name, settype in ipsets:
         if not ensure_ipset(name, settype):
-            log.error("ipset_creation_failed", name=name,
-                      msg="iptables bootstrap aborted — ipsets are required")
+            log.warning(
+                "ipset_unavailable_using_ip_fallback",
+                name=name,
+                msg="hash:mac ipset not supported -- falling back to per-IP iptables rules",
+            )
             _ipsets_available = False
+            _bootstrap_iptables_ip_fallback()
             return
 
     # Insert jump rules into FORWARD chain (idempotent via -C check)
@@ -145,31 +358,57 @@ def bootstrap_iptables():
 
 
 def apply_device_policy(mac: str, ip: str, status: str):
-    """Apply iptables policy for a single device based on its status."""
-    # Remove from all ipsets first
-    remove_from_ipset("thebox_quarantine", mac)
-    remove_from_ipset("thebox_iot",        mac)
-    remove_from_ipset("thebox_blocked",    mac)
+    """Apply iptables policy for a single device based on its status.
 
-    if status == "quarantined" or status == "new":
-        add_to_ipset("thebox_quarantine", mac)
-        log.info("device_quarantined", mac=mac, ip=ip)
-    elif status == "blocked":
-        add_to_ipset("thebox_blocked", mac)
-        log.info("device_blocked", mac=mac, ip=ip)
-    elif status == "iot":
-        add_to_ipset("thebox_iot", mac)
-        log.info("device_iot_restricted", mac=mac, ip=ip)
-    # trusted — no ipset entry; unrestricted access
+    Uses MAC-based ipsets when available; falls back to per-IP iptables rules
+    in the THEBOX_POLICY chain when the kernel does not support hash:mac.
+    """
+    if _ipsets_available:
+        # Preferred path: O(1) MAC-based ipset membership
+        remove_from_ipset("thebox_quarantine", mac)
+        remove_from_ipset("thebox_iot",        mac)
+        remove_from_ipset("thebox_blocked",    mac)
+
+        if status in ("quarantined", "new"):
+            add_to_ipset("thebox_quarantine", mac)
+            log.info("device_quarantined", mac=mac, ip=ip)
+        elif status == "blocked":
+            add_to_ipset("thebox_blocked", mac)
+            log.info("device_blocked", mac=mac, ip=ip)
+        elif status == "iot":
+            add_to_ipset("thebox_iot", mac)
+            log.info("device_iot_restricted", mac=mac, ip=ip)
+        # trusted — no ipset entry; unrestricted access
+    else:
+        # Fallback: per-IP rules in THEBOX_POLICY chain
+        if not ip:
+            log.warning(
+                "apply_device_policy_no_ip",
+                mac=mac, status=status,
+                msg="Cannot apply IP-based fallback rules -- device has no IP address",
+            )
+            return
+        _remove_iptables_ip_rules(ip)
+        _apply_iptables_ip_policy(ip, status)
+        if status in ("quarantined", "new"):
+            log.info("device_quarantined_ip_rules", mac=mac, ip=ip)
+        elif status == "blocked":
+            log.info("device_blocked_ip_rules", mac=mac, ip=ip)
+        elif status == "iot":
+            log.info("device_iot_restricted_ip_rules", mac=mac, ip=ip)
 
 
 def sync_all_policies():
-    """Rebuild ipsets from the current database state."""
+    """Rebuild ipset / THEBOX_POLICY rules from the current database state."""
     log.info("sync_all_policies_start")
     conn = get_db()
-    flush_ipset("thebox_quarantine")
-    flush_ipset("thebox_iot")
-    flush_ipset("thebox_blocked")
+
+    if _ipsets_available:
+        flush_ipset("thebox_quarantine")
+        flush_ipset("thebox_iot")
+        flush_ipset("thebox_blocked")
+    else:
+        _flush_iptables_ip_chain()
 
     with conn.cursor() as cur:
         cur.execute("SELECT mac_address, ip_address, status FROM devices")
@@ -258,6 +497,8 @@ def subscribe_loop():
 
 def main():
     log.info("guardian_service_start")
+
+    ensure_schema()
 
     # Wait for iptables to be available (may not be in all environments)
     try:
