@@ -567,24 +567,52 @@ def run_scan():
             scan_id = cur.fetchone()["id"]
         conn.commit()
 
-        hosts = arp_sweep(network)
-        if not hosts:
-            log.info("arp_sweep_empty_nmap_fallback", network=network)
-            hosts = nmap_ping_sweep(network)
+        # ── Step 1: Layer-3 discovery — nmap ping sweep ───────────────────────
+        # Works across Docker NAT, macOS bridge, and host networking alike.
+        # Discovers hosts via ICMP/TCP/UDP probes without needing direct LAN
+        # (layer-2) access.
+        hosts = nmap_ping_sweep(network)
+        host_by_ip: dict[str, dict] = {h["ip"]: h for h in hosts}
+        log.info("nmap_sweep_done", network=network, found=len(hosts))
 
-        # Merge Pi-hole network clients so devices that answered Pi-hole DNS
-        # queries (but didn't respond to ARP) are also discovered.
+        # ── Step 2: Pi-hole client list (also layer 3) ────────────────────────
+        # Pi-hole records every device that has queried DNS, and often includes
+        # the MAC address from DHCP lease data.  Merge in any IPs not already
+        # found by nmap and back-fill missing MACs/hostnames.
         pihole_clients = query_pihole_clients()
         if pihole_clients:
-            host_by_ip = {h["ip"]: h for h in hosts}
             for client in pihole_clients:
-                if client["ip"] not in host_by_ip:
+                ip = client["ip"]
+                if ip not in host_by_ip:
                     hosts.append(client)
-                    host_by_ip[client["ip"]] = client
-                elif not host_by_ip[client["ip"]].get("mac"):
-                    # Back-fill MAC from Pi-hole if ARP didn't capture it
-                    host_by_ip[client["ip"]]["mac"] = client["mac"]
+                    host_by_ip[ip] = client
+                else:
+                    if client.get("mac") and not host_by_ip[ip].get("mac"):
+                        host_by_ip[ip]["mac"] = client["mac"]
+                    if client.get("hostname") and not host_by_ip[ip].get("hostname"):
+                        host_by_ip[ip]["hostname"] = client["hostname"]
             log.info("pihole_merge_done", total_after_merge=len(hosts))
+
+        # ── Step 3: ARP sweep (layer 2) — augment with authoritative MACs ────
+        # ARP provides the ground-truth MAC address for every host on the same
+        # broadcast domain.  When the container runs with network_mode: host on
+        # Linux (see docker-compose.linux.yml) the sweep reaches all LAN devices
+        # directly.  When behind Docker NAT it may only see the gateway; we
+        # still merge in whatever ARP replies we do receive to back-fill MACs
+        # and pick up any hosts that nmap/Pi-hole missed.
+        arp_hosts = arp_sweep(network)
+        if arp_hosts:
+            for arp_host in arp_hosts:
+                ip = arp_host["ip"]
+                if ip in host_by_ip:
+                    # ARP gives us the authoritative MAC; always overwrite.
+                    host_by_ip[ip]["mac"] = arp_host["mac"]
+                else:
+                    hosts.append(arp_host)
+                    host_by_ip[ip] = arp_host
+            log.info("arp_augment_done", arp_found=len(arp_hosts), total_after_augment=len(hosts))
+        else:
+            log.info("arp_sweep_empty", network=network, note="continuing with layer3 results only")
 
         new_count = 0
 
