@@ -15,7 +15,6 @@ Additional discovery methods:
     addresses and then upserted like any other discovered device.
 """
 
-import hashlib
 import json
 import logging
 import os
@@ -101,22 +100,34 @@ def arp_resolve(ip: str) -> str | None:
 
 # ─── Pi-hole API integration ─────────────────────────────────────────────────
 
-def _compute_pihole_token(password: str) -> str:
-    """Return the Pi-hole v5 API token derived from the admin *password*.
+def _get_pihole_sid(password: str) -> str | None:
+    """Authenticate with the Pi-hole v6 API and return a session ID.
 
-    Pi-hole stores WEBPASSWORD as ``md5(md5(password))``, which is also the
-    token expected by the ``?auth=`` query parameter.
-
-    Note: MD5 is used here solely because it is the algorithm Pi-hole itself
-    uses for its API token.  Ensure Pi-hole is only reachable on a trusted
-    internal network.
+    POSTs the password to ``/api/auth`` and returns the ``sid`` from the
+    response.  Returns ``None`` on failure.
     """
-    first = hashlib.md5(password.encode()).hexdigest()  # noqa: S324
-    return hashlib.md5(first.encode()).hexdigest()  # noqa: S324
+    url = f"{PIHOLE_URL}/api/auth"
+    try:
+        resp = requests.post(url, json={"password": password}, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get("session", {}).get("sid") or None
+    except Exception as exc:
+        log.warning("pihole_auth_failed", error=str(exc))
+        return None
+
+
+def _delete_pihole_sid(sid: str) -> None:
+    """Log out of the Pi-hole v6 API by deleting the session."""
+    url = f"{PIHOLE_URL}/api/auth"
+    try:
+        requests.delete(url, params={"sid": sid}, timeout=10)
+    except Exception:
+        pass
 
 
 def query_pihole_clients() -> list[dict]:
-    """Query the Pi-hole FTL API for known network clients.
+    """Query the Pi-hole v6 API for known network clients.
 
     Returns a list of dicts with keys ``ip``, ``mac``, and optionally
     ``hostname``.  Returns an empty list when Pi-hole is not configured or
@@ -125,24 +136,33 @@ def query_pihole_clients() -> list[dict]:
     if not PIHOLE_URL:
         return []
 
-    token = _compute_pihole_token(PIHOLE_PASSWORD)
-    url = f"{PIHOLE_URL}/admin/api.php"
+    sid = _get_pihole_sid(PIHOLE_PASSWORD)
+    if not sid:
+        return []
+
+    url = f"{PIHOLE_URL}/api/network/devices"
+    data: dict = {}
     try:
-        resp = requests.get(url, params={"network": "", "auth": token}, timeout=10)
+        resp = requests.get(url, params={"sid": sid}, timeout=10)
         resp.raise_for_status()
         data = resp.json()
     except Exception as exc:
         log.warning("pihole_query_failed", error=str(exc))
-        return []
+    finally:
+        _delete_pihole_sid(sid)
 
     clients: list[dict] = []
-    for entry in data.get("network", []):
+    for entry in data.get("devices", []):
         hwaddr = (entry.get("hwaddr") or "").upper()
         # Skip placeholder / all-zero MACs
         if not hwaddr or hwaddr in ("00:00:00:00:00:00", ""):
             continue
-        hostname = entry.get("name") or None
-        for ip_addr in entry.get("ip", []):
+        # Pi-hole v6: each IP entry carries its own name (hostname is per-IP)
+        for ip_entry in entry.get("ips", []):
+            ip_addr = ip_entry.get("ip") if isinstance(ip_entry, dict) else ip_entry
+            hostname = (
+                ip_entry.get("name") if isinstance(ip_entry, dict) else None
+            ) or None
             if ip_addr:
                 clients.append({"ip": ip_addr, "mac": hwaddr, "hostname": hostname})
 
