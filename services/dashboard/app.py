@@ -134,15 +134,19 @@ def ensure_schema():
         )""",
         # honeypot_events — dashboard displays honeypot hit log
         """CREATE TABLE IF NOT EXISTS honeypot_events (
-            id              SERIAL PRIMARY KEY,
-            src_ip          VARCHAR(45) NOT NULL,
-            src_port        INTEGER,
-            dst_port        INTEGER NOT NULL,
-            protocol        VARCHAR(10) NOT NULL DEFAULT 'tcp',
-            payload_preview TEXT,
-            severity        VARCHAR(16) NOT NULL DEFAULT 'low',
-            device_id       INTEGER REFERENCES devices(id),
-            created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            id                SERIAL PRIMARY KEY,
+            src_ip            VARCHAR(45) NOT NULL,
+            src_port          INTEGER,
+            dst_port          INTEGER NOT NULL,
+            protocol          VARCHAR(10) NOT NULL DEFAULT 'tcp',
+            payload_preview   TEXT,
+            severity          VARCHAR(16) NOT NULL DEFAULT 'low',
+            interaction_level VARCHAR(16) NOT NULL DEFAULT 'none',
+            intent            VARCHAR(32) NOT NULL DEFAULT 'scan',
+            is_sweep          BOOLEAN NOT NULL DEFAULT FALSE,
+            ports_scanned     JSONB,
+            device_id         INTEGER REFERENCES devices(id),
+            created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )""",
         "CREATE INDEX IF NOT EXISTS idx_devices_mac         ON devices(mac_address)",
         "CREATE INDEX IF NOT EXISTS idx_devices_ip          ON devices(ip_address)",
@@ -154,6 +158,11 @@ def ensure_schema():
         "CREATE INDEX IF NOT EXISTS idx_honeypot_created    ON honeypot_events(created_at)",
         "CREATE INDEX IF NOT EXISTS idx_user_groups_group   ON user_groups(group_id)",
         "CREATE INDEX IF NOT EXISTS idx_device_groups_group ON device_groups(group_id)",
+        # Migration: add new honeypot columns to existing deployments
+        "ALTER TABLE honeypot_events ADD COLUMN IF NOT EXISTS interaction_level VARCHAR(16) NOT NULL DEFAULT 'none'",
+        "ALTER TABLE honeypot_events ADD COLUMN IF NOT EXISTS intent VARCHAR(32) NOT NULL DEFAULT 'scan'",
+        "ALTER TABLE honeypot_events ADD COLUMN IF NOT EXISTS is_sweep BOOLEAN NOT NULL DEFAULT FALSE",
+        "ALTER TABLE honeypot_events ADD COLUMN IF NOT EXISTS ports_scanned JSONB",
     ]
     conn = get_db()
     try:
@@ -656,6 +665,20 @@ def api_honeypot():
     )
     conn.close()
     return Response(json.dumps(rows, default=serialize), mimetype="application/json")
+
+
+@app.route("/api/honeypot/<int:event_id>")
+def api_honeypot_event(event_id: int):
+    conn = get_db()
+    rows = rows_to_list(
+        conn,
+        "SELECT * FROM honeypot_events WHERE id=%s",
+        (event_id,),
+    )
+    conn.close()
+    if not rows:
+        return jsonify({"error": "not found"}), 404
+    return Response(json.dumps(rows[0], default=serialize), mimetype="application/json")
 
 
 # --- Pi-hole helpers ---------------------------------------------------------

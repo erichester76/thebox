@@ -119,13 +119,28 @@
     /* ── Scrollable panel ───────────────────────────── */
     .scrollable { max-height: 380px; overflow-y: auto; }
 
-    /* ── Honeypot mini-feed ─────────────────────────── */
-    #hp-feed { font-family: monospace; font-size: 12px; }
-    #hp-feed .row { padding: 4px 8px; border-bottom: 1px solid var(--border); display: flex; gap: 8px; }
-    #hp-feed .row:hover { background: rgba(255,255,255,.03); }
-    #hp-feed .src { flex: 1; color: var(--danger); }
-    #hp-feed .port { color: var(--warning); width: 50px; }
-    #hp-feed .time { color: var(--muted); width: 160px; text-align: right; }
+    /* ── Honeypot table ─────────────────────────────── */
+    #hp-table-wrap table { font-size: 12px; }
+    #hp-table-wrap tr.clickable { cursor: pointer; }
+    #hp-table-wrap tr.clickable:hover td { background: rgba(88,166,255,0.08); }
+    .badge-sweep     { background: rgba(168,85,247,.15); color: #c084fc; }
+    .badge-none      { background: rgba(139,148,158,.15); color: var(--muted); }
+    .badge-banner    { background: rgba(88,166,255,.15);  color: var(--accent); }
+    .badge-data      { background: rgba(210,153,34,.15);  color: var(--warning); }
+    .badge-credentials { background: rgba(248,81,73,.15); color: var(--danger); }
+    .badge-commands  { background: rgba(248,81,73,.15);   color: var(--danger); }
+    .badge-scan      { background: rgba(139,148,158,.15); color: var(--muted); }
+    .badge-recon     { background: rgba(88,166,255,.15);  color: var(--accent); }
+    .badge-probe     { background: rgba(210,153,34,.15);  color: var(--warning); }
+    .badge-exploit   { background: rgba(248,81,73,.15);   color: var(--danger); }
+    .badge-brute_force { background: rgba(248,81,73,.15); color: var(--danger); }
+
+    /* ── Event detail modal ─────────────────────────── */
+    .event-detail-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 16px; }
+    .event-detail-grid .full { grid-column: 1 / -1; }
+    .event-detail-label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; margin-bottom: 2px; }
+    .event-detail-val { font-size: 13px; color: var(--text); font-family: monospace; word-break: break-all; }
+    .payload-box { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; font-family: monospace; font-size: 12px; white-space: pre-wrap; word-break: break-all; max-height: 200px; overflow-y: auto; color: var(--text); }
 
     /* ── Pi-hole stats ──────────────────────────────────────── */
     #pihole-stats { display: flex; gap: 12px; flex-wrap: wrap; }
@@ -219,9 +234,21 @@
   </div>
 
   <!-- Honeypot feed -->
-  <div class="card">
-    <div class="card-header"><h2>Honeypot Activity</h2><button class="btn btn-ack" onclick="loadHoneypot()">Refresh</button></div>
-    <div class="card-body scrollable" id="hp-feed"><div class="empty">Loading…</div></div>
+  <div class="card full">
+    <div class="card-header"><h2>Honeypot Activity</h2><span style="font-size:11px;color:var(--muted);margin-left:8px">Click a row to view full details</span><button class="btn btn-ack" style="margin-left:auto" onclick="loadHoneypot()">Refresh</button></div>
+    <div class="card-body scrollable" id="hp-table-wrap">
+      <table id="hp-table">
+        <thead><tr>
+          <th>Time</th>
+          <th>Source IP</th>
+          <th>Dst Port</th>
+          <th>Interaction</th>
+          <th>Intent</th>
+          <th>Severity</th>
+        </tr></thead>
+        <tbody id="hp-body"><tr><td colspan="6" class="empty">Loading…</td></tr></tbody>
+      </table>
+    </div>
   </div>
 
   <!-- Users management -->
@@ -275,6 +302,17 @@
   </div>
 
 </main>
+
+<!-- Honeypot Event Detail Modal -->
+<div class="modal-backdrop" id="hp-event-modal">
+  <div class="modal" style="max-width:640px">
+    <h3>Honeypot Event Detail</h3>
+    <div class="event-detail-grid" id="hp-event-grid"></div>
+    <div class="modal-actions" style="margin-top:16px">
+      <button class="btn btn-ack" onclick="closeHpEventModal()">Close</button>
+    </div>
+  </div>
+</div>
 
 <!-- Assign User Modal -->
 <div class="modal-backdrop" id="assign-modal">
@@ -555,17 +593,96 @@ async function ackAlert(id) {
 }
 
 // ── Honeypot ─────────────────────────────────────────────────────────────────
+function intentBadge(s) {
+  const safe = escHtml(s || 'scan');
+  return `<span class="badge badge-${safe}">${safe}</span>`;
+}
+
+function interactionBadge(s) {
+  const safe = escHtml(s || 'none');
+  return `<span class="badge badge-${safe}">${safe}</span>`;
+}
+
 async function loadHoneypot() {
   const rows = await api('/api/honeypot');
-  const el = document.getElementById('hp-feed');
-  if (!rows.length) { el.innerHTML = '<div class="empty">No honeypot activity</div>'; return; }
-  el.innerHTML = rows.slice(0,50).map(r => `
-    <div class="row">
-      <span class="src">${r.src_ip}</span>
-      <span class="port">:${r.dst_port}</span>
-      <span>${severityBadge(r.severity)}</span>
-      <span class="time">${fmtDate(r.created_at)}</span>
-    </div>`).join('');
+  const tbody = document.getElementById('hp-body');
+  if (!rows.length) { tbody.innerHTML = '<tr><td colspan="6" class="empty">No honeypot activity</td></tr>'; return; }
+  tbody.innerHTML = rows.slice(0, 100).map(r => `
+    <tr class="clickable" onclick="openHpEventModal(${r.id})">
+      <td style="color:var(--muted);white-space:nowrap">${fmtDate(r.created_at)}</td>
+      <td style="color:var(--danger);font-family:monospace">${escHtml(r.src_ip)}${r.is_sweep ? ' <span class="badge badge-sweep">sweep</span>' : ''}</td>
+      <td style="color:var(--warning);font-family:monospace">${r.dst_port}</td>
+      <td>${interactionBadge(r.interaction_level)}</td>
+      <td>${intentBadge(r.intent)}</td>
+      <td>${severityBadge(r.severity)}</td>
+    </tr>`).join('');
+}
+
+async function openHpEventModal(eventId) {
+  let ev;
+  try { ev = await api(`/api/honeypot/${eventId}`); } catch(_) { return; }
+
+  const portsSel = ev.ports_scanned
+    ? (typeof ev.ports_scanned === 'string' ? JSON.parse(ev.ports_scanned) : ev.ports_scanned)
+    : null;
+
+  document.getElementById('hp-event-grid').innerHTML = `
+    <div>
+      <div class="event-detail-label">Time</div>
+      <div class="event-detail-val">${fmtDate(ev.created_at)}</div>
+    </div>
+    <div>
+      <div class="event-detail-label">Event ID</div>
+      <div class="event-detail-val">#${ev.id}</div>
+    </div>
+    <div>
+      <div class="event-detail-label">Source IP</div>
+      <div class="event-detail-val">${escHtml(ev.src_ip)}</div>
+    </div>
+    <div>
+      <div class="event-detail-label">Source Port</div>
+      <div class="event-detail-val">${ev.src_port || '–'}</div>
+    </div>
+    <div>
+      <div class="event-detail-label">Destination Port</div>
+      <div class="event-detail-val">${ev.dst_port}</div>
+    </div>
+    <div>
+      <div class="event-detail-label">Protocol</div>
+      <div class="event-detail-val">${escHtml(ev.protocol)}</div>
+    </div>
+    <div>
+      <div class="event-detail-label">Severity</div>
+      <div class="event-detail-val">${severityBadge(ev.severity)}</div>
+    </div>
+    <div>
+      <div class="event-detail-label">Interaction Level</div>
+      <div class="event-detail-val">${interactionBadge(ev.interaction_level)}</div>
+    </div>
+    <div>
+      <div class="event-detail-label">Inferred Intent</div>
+      <div class="event-detail-val">${intentBadge(ev.intent)}</div>
+    </div>
+    <div>
+      <div class="event-detail-label">Port Sweep</div>
+      <div class="event-detail-val">${ev.is_sweep ? `<span class="badge badge-sweep">Yes</span>` : 'No'}</div>
+    </div>
+    ${portsSel ? `
+    <div class="full">
+      <div class="event-detail-label">Ports Scanned</div>
+      <div class="event-detail-val">${escHtml(portsSel.join(', '))}</div>
+    </div>` : ''}
+    ${ev.payload_preview ? `
+    <div class="full">
+      <div class="event-detail-label">Protocol Conversation</div>
+      <div class="payload-box">${escHtml(ev.payload_preview)}</div>
+    </div>` : ''}
+  `;
+  document.getElementById('hp-event-modal').classList.add('open');
+}
+
+function closeHpEventModal() {
+  document.getElementById('hp-event-modal').classList.remove('open');
 }
 
 // ── Users ────────────────────────────────────────────────────────────────────
@@ -873,6 +990,9 @@ function connectSSE() {
 }
 
 // Close modals on backdrop click
+document.getElementById('hp-event-modal').addEventListener('click', function(e) {
+  if (e.target === this) closeHpEventModal();
+});
 document.getElementById('assign-modal').addEventListener('click', function(e) {
   if (e.target === this) closeAssignModal();
 });
