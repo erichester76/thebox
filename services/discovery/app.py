@@ -16,6 +16,7 @@ Additional discovery methods:
 """
 
 import json
+import hashlib
 import logging
 import os
 import queue
@@ -84,6 +85,62 @@ def arp_sweep(network: str) -> list[dict]:
         hosts.append({"ip": rcv.psrc, "mac": rcv.hwsrc.upper()})
     log.info("arp_sweep_done", network=network, found=len(hosts))
     return hosts
+
+
+def nmap_ping_sweep(network: str) -> list[dict]:
+    """Discover live hosts in *network* using nmap's ping scan (``-sn``).
+
+    Used as a fallback when ARP sweep returns no results (e.g. macOS Docker
+    Desktop bridge networking where raw Ethernet frames cannot reach LAN
+    devices).  Unlike ARP sweep, nmap uses ICMP/TCP/UDP probes that work
+    across the container's default gateway.
+
+    .. note::
+        Requires the container to run with ``NET_RAW`` capability (or as
+        root) so that nmap can send ICMP echo requests and raw TCP probes.
+        On Linux the ``docker-compose.linux.yml`` overlay sets
+        ``network_mode: host`` which provides this capability automatically.
+        On macOS Docker Desktop the service runs without host networking;
+        nmap falls back to TCP-based probes (``-PS/-PA``) which work without
+        raw-socket access.
+
+    Returns a list of dicts with ``ip`` and, when nmap was able to determine
+    the MAC address via ARP (same broadcast domain), ``mac``.
+    """
+    log.info("nmap_ping_sweep_start", network=network)
+    nm = nmap.PortScanner()
+    try:
+        nm.scan(hosts=network, arguments="-sn -T4 --host-timeout 5s")
+    except Exception as exc:
+        log.warning("nmap_ping_sweep_error", network=network, error=str(exc))
+        return []
+
+    hosts = []
+    for ip in nm.all_hosts():
+        host_data: dict[str, str] = {"ip": ip}
+        mac = nm[ip].get("addresses", {}).get("mac", "").upper()
+        if mac:
+            host_data["mac"] = mac
+        hosts.append(host_data)
+
+    log.info("nmap_ping_sweep_done", network=network, found=len(hosts))
+    return hosts
+
+
+def _synthetic_mac_for_ip(ip: str) -> str:
+    """Return a deterministic locally-administered MAC derived from *ip*.
+
+    Uses the ``02:xx:…`` locally-administered unicast prefix so the address
+    can never collide with a real OUI.  The remaining five octets are derived
+    from a stable hash of the IP string so each address is unique and
+    reproducible across scan cycles.
+
+    This is used as a last-resort device identifier when a host is reachable
+    but its real MAC cannot be obtained (e.g. macOS Docker Desktop bridge
+    networking where raw ARP is unavailable).
+    """
+    h = hashlib.sha256(ip.encode()).hexdigest()
+    return f"02:{h[0:2]}:{h[2:4]}:{h[4:6]}:{h[6:8]}:{h[8:10]}".upper()
 
 
 def arp_resolve(ip: str) -> str | None:
@@ -448,6 +505,9 @@ def run_scan():
         conn.commit()
 
         hosts = arp_sweep(network)
+        if not hosts:
+            log.warning("arp_sweep_empty_nmap_fallback", network=network)
+            hosts = nmap_ping_sweep(network)
 
         # Merge Pi-hole network clients so devices that answered Pi-hole DNS
         # queries (but didn't respond to ARP) are also discovered.
@@ -466,11 +526,22 @@ def run_scan():
         new_count = 0
 
         for host in hosts:
-            # Skip hosts still missing a MAC address (Pi-hole entries where
-            # the MAC was not available and ARP back-fill also failed)
+            # Ensure every host has a MAC address.  nmap ping-sweep hosts may
+            # arrive without one; try ARP resolution first, then fall back to
+            # a synthetic locally-administered MAC derived from the IP so that
+            # every reachable device can still be tracked and stored.
             if not host.get("mac"):
-                log.debug("skip_host_no_mac", ip=host.get("ip"))
-                continue
+                mac = arp_resolve(host["ip"])
+                if mac:
+                    host["mac"] = mac
+                else:
+                    host["mac"] = _synthetic_mac_for_ip(host["ip"])
+                    log.debug(
+                        "synthetic_mac_assigned",
+                        ip=host["ip"],
+                        mac=host["mac"],
+                        reason="arp_unavailable",
+                    )
             # Enrich
             host["hostname"] = host.get("hostname") or resolve_hostname(host["ip"])
             host["vendor"] = host.get("vendor") or vendor_lookup(host["mac"])
