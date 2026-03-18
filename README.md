@@ -62,9 +62,11 @@ TheBox is a self-hosted, Docker Compose-based home network security and manageme
 
 ### Prerequisites
 
-- Linux host (Debian/Ubuntu/Fedora/etc.)
-- Docker ≥ 24 and Docker Compose v2
-- The host must be on the same L2 segment as the devices you want to manage
+| | Linux | macOS |
+|---|---|---|
+| OS | Debian / Ubuntu / Fedora / etc. | macOS 12+ with [Docker Desktop](https://www.docker.com/products/docker-desktop/) |
+| Docker | ≥ 24 with Compose v2 plugin | Docker Desktop ≥ 4.x (includes Compose v2) |
+| Network | Host must be on the same L2 segment as managed devices | Same; see [macOS notes](#-macos-notes) below |
 
 ### 1. Clone & configure
 
@@ -78,6 +80,8 @@ nano .env
 
 ### 2. Run the setup script (recommended)
 
+The setup script auto-detects Linux vs macOS and uses the appropriate settings.
+
 ```bash
 sudo bash scripts/setup.sh
 ```
@@ -85,7 +89,11 @@ sudo bash scripts/setup.sh
 Or start manually:
 
 ```bash
+# Linux
 docker compose up -d
+
+# macOS
+docker compose -f docker-compose.yml -f docker-compose.macos.yml up -d
 ```
 
 ### 3. Open the dashboard
@@ -98,6 +106,28 @@ http://<host-ip>:3000
 
 Set your DHCP server's DNS option to the IP address of the Docker host so that
 all devices use Pi-hole for DNS resolution.
+
+---
+
+## 🍎 macOS Notes
+
+TheBox runs on macOS using [Docker Desktop](https://www.docker.com/products/docker-desktop/).
+The setup script automatically applies `docker-compose.macos.yml` as an overlay,
+which switches the `discovery`, `guardian`, and `honeypot` services from
+`network_mode: host` to user-defined bridge networks so all services can reach
+each other by container-name DNS.
+
+**Feature availability on macOS:**
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| Dashboard, Pi-hole, PostgreSQL, Redis | ✅ Full | Bridge networking works normally |
+| Honeypot (port listeners) | ✅ Full | Ports are explicitly mapped in `docker-compose.macos.yml` |
+| ARP-based LAN scanning | ⚠️ Limited | Docker Desktop runs inside a Linux VM; containers cannot reach the Mac's physical LAN segment via ARP. The discovery service starts without errors but will only see Docker-internal traffic. |
+| iptables quarantine / IoT allow-lists | ⚠️ Limited | iptables rules apply within the container's network namespace, not the Mac host. The guardian service starts without errors but will not enforce rules on the physical LAN. |
+
+For full network enforcement capabilities, run TheBox on a dedicated Linux host
+(Raspberry Pi, mini-PC, VM, etc.) on your LAN.
 
 ---
 

@@ -1,0 +1,216 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# docker-compose.macos.yml — Standalone Docker Compose file for macOS
+# ─────────────────────────────────────────────────────────────────────────────
+# Docker Desktop for Mac runs containers inside a Linux VM.  The Linux kernel
+# feature "network_mode: host" attaches containers to the VM's network
+# namespace rather than the Mac's physical interface.  This file replaces
+# "network_mode: host" with user-defined bridge networks so all services can
+# reach each other by container-name DNS as intended, and exposes the honeypot
+# listener ports explicitly.
+#
+# Usage:
+#   docker compose -f docker-compose.macos.yml up -d
+#
+# The setup script (scripts/setup.sh) uses this file automatically when it
+# detects macOS.
+#
+# ⚠  Limitation: ARP-based LAN scanning in the discovery service requires
+#    direct access to the host's physical network interface.  On macOS Docker
+#    Desktop, the container is inside a Linux VM and cannot reach the Mac's
+#    physical LAN segment, so ARP sweeps will not discover real LAN devices.
+#    All other services (dashboard, Pi-hole, PostgreSQL, Redis, honeypot)
+#    work normally.
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+  # ─── Database ───────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: thebox-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-thebox}
+      POSTGRES_USER: ${POSTGRES_USER:-thebox}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-thebox_secret}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./config/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    networks:
+      - thebox_internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-thebox}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: thebox-redis
+    restart: unless-stopped
+    command: redis-server /etc/redis/redis.conf
+    volumes:
+      - redis_data:/data
+      - ./config/redis/redis.conf:/etc/redis/redis.conf:ro
+    networks:
+      - thebox_internal
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─── DNS / Ad-blocking (Pi-hole) ────────────────────────────────────────────
+  pihole:
+    image: pihole/pihole:latest
+    container_name: thebox-pihole
+    restart: unless-stopped
+    ports:
+      - "${PIHOLE_DNS_PORT:-53}:53/tcp"
+      - "${PIHOLE_DNS_PORT:-53}:53/udp"
+      - "${PIHOLE_WEB_PORT:-8080}:80/tcp"
+    environment:
+      TZ: ${TZ:-America/New_York}
+      WEBPASSWORD: ${PIHOLE_PASSWORD:-thebox_pihole}
+      PIHOLE_DNS_: "1.1.1.1;8.8.8.8"
+      DNSMASQ_LISTENING: all
+      VIRTUAL_HOST: pihole.thebox.local
+    volumes:
+      - ./config/pihole/etc-pihole:/etc/pihole
+      - ./config/pihole/etc-dnsmasq.d:/etc/dnsmasq.d
+    cap_add:
+      - NET_ADMIN
+    networks:
+      - thebox_internal
+      - thebox_external
+    dns:
+      - 127.0.0.1
+      - 1.1.1.1
+
+  # ─── Network Discovery Service ──────────────────────────────────────────────
+  # On macOS, network_mode: host is replaced with bridge networking.
+  # ARP sweeps will only see Docker-internal hosts; they cannot reach the
+  # Mac's physical LAN segment from inside the Docker Desktop VM.
+  discovery:
+    build:
+      context: ./services/discovery
+      dockerfile: Dockerfile
+    container_name: thebox-discovery
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-thebox}:${POSTGRES_PASSWORD:-thebox_secret}@postgres:5432/${POSTGRES_DB:-thebox}
+      REDIS_URL: redis://redis:6379/0
+      SCAN_INTERVAL: ${SCAN_INTERVAL:-300}
+      NETWORK_RANGES: ${NETWORK_RANGES:-192.168.1.0/24}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    networks:
+      - thebox_internal
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # ─── Device Guardian (Quarantine + IoT Manager) ─────────────────────────────
+  # On macOS, iptables rules apply within the container's network namespace and
+  # do not affect the Mac host's network traffic.  The guardian service starts
+  # and manages the database state normally.
+  guardian:
+    build:
+      context: ./services/guardian
+      dockerfile: Dockerfile
+    container_name: thebox-guardian
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-thebox}:${POSTGRES_PASSWORD:-thebox_secret}@postgres:5432/${POSTGRES_DB:-thebox}
+      REDIS_URL: redis://redis:6379/0
+      QUARANTINE_VLAN: ${QUARANTINE_VLAN:-192.168.99.0/24}
+      TRUSTED_NETWORKS: ${TRUSTED_NETWORKS:-192.168.1.0/24}
+      AUTO_QUARANTINE: ${AUTO_QUARANTINE:-true}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    networks:
+      - thebox_internal
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      discovery:
+        condition: service_started
+
+  # ─── Honeypot Service ────────────────────────────────────────────────────────
+  # On macOS, ports are explicitly mapped so they are reachable from the Mac
+  # host.  On Linux these were implicitly bound by network_mode: host.
+  honeypot:
+    build:
+      context: ./services/honeypot
+      dockerfile: Dockerfile
+    container_name: thebox-honeypot
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-thebox}:${POSTGRES_PASSWORD:-thebox_secret}@postgres:5432/${POSTGRES_DB:-thebox}
+      REDIS_URL: redis://redis:6379/0
+      HONEYPOT_PORTS: ${HONEYPOT_PORTS:-21,22,23,25,80,110,143,443,445,3306,3389,8080}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    ports:
+      - "21:21"
+      - "22:22"
+      - "23:23"
+      - "25:25"
+      - "80:80"
+      - "110:110"
+      - "143:143"
+      - "443:443"
+      - "445:445"
+      - "3306:3306"
+      - "3389:3389"
+      - "8080:8080"
+    networks:
+      - thebox_internal
+      - thebox_external
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # ─── Web Dashboard ───────────────────────────────────────────────────────────
+  dashboard:
+    build:
+      context: ./services/dashboard
+      dockerfile: Dockerfile
+    container_name: thebox-dashboard
+    restart: unless-stopped
+    ports:
+      - "${DASHBOARD_PORT:-3000}:3000"
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-thebox}:${POSTGRES_PASSWORD:-thebox_secret}@postgres:5432/${POSTGRES_DB:-thebox}
+      REDIS_URL: redis://redis:6379/0
+      SECRET_KEY: ${SECRET_KEY:-change_me_in_production}
+      PIHOLE_URL: http://pihole:80
+      PIHOLE_PASSWORD: ${PIHOLE_PASSWORD:-thebox_pihole}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    networks:
+      - thebox_internal
+      - thebox_external
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+networks:
+  thebox_internal:
+    driver: bridge
+    internal: true
+  thebox_external:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
