@@ -1429,6 +1429,7 @@ def guess_device_type(
     open_ports: list[dict],
     os_guess: str | None,
     extra_info: str | None = None,
+    hostname: str | None = None,
 ) -> str:
     """Heuristic device-type classifier.
 
