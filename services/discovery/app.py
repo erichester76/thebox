@@ -807,6 +807,10 @@ def tls_cert_info(ip: str, port: int = 443, timeout: float = 3.0) -> dict:
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
+    # Explicitly require TLS 1.2 or above even though certificate verification
+    # is disabled.  This prevents negotiation of deprecated TLSv1/TLSv1.1
+    # ciphers that would be flagged as insecure.
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     try:
         with socket.create_connection((ip, port), timeout=timeout) as raw:
             with ctx.wrap_socket(raw, server_hostname=ip) as tls:
