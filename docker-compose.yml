@@ -85,11 +85,18 @@ services:
       SCAN_INTERVAL: ${SCAN_INTERVAL:-300}
       NETWORK_RANGES: ${NETWORK_RANGES:-192.168.1.0/24}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      PIHOLE_URL: http://pihole:80
+      PIHOLE_PASSWORD: ${PIHOLE_PASSWORD:-thebox_pihole}
+      DNS_SNIFF_ENABLED: ${DNS_SNIFF_ENABLED:-true}
+      DNS_SNIFF_IFACE: ${DNS_SNIFF_IFACE:-}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
     cap_add:
       - NET_ADMIN
       - NET_RAW
+    networks:
+      - thebox_internal
+      - default
     depends_on:
       postgres:
         condition: service_healthy

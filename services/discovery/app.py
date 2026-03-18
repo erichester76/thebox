@@ -5,12 +5,23 @@ Continuously scans the local network to discover devices, resolve hostnames,
 identify vendors via MAC OUI lookup, and attempt OS fingerprinting.  New
 devices are stored in PostgreSQL and a "new_device" event is published to
 Redis so that the guardian and dashboard services can react in real-time.
+
+Additional discovery methods:
+  - Pi-hole API: queries the Pi-hole FTL API for known network clients
+    (including MAC addresses when available).
+  - DNS packet sniffing: captures DNS query packets on the network interface
+    to discover devices that send queries to Pi-hole or the honeypot DNS
+    listener.  Newly seen source IPs are ARP-resolved to obtain their MAC
+    addresses and then upserted like any other discovered device.
 """
 
+import hashlib
 import json
 import logging
 import os
+import queue
 import socket
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -18,10 +29,11 @@ import nmap
 import psycopg2
 import psycopg2.extras
 import redis
+import requests
 import schedule
 import structlog
 from mac_vendor_lookup import MacLookup, VendorNotFoundError
-from scapy.all import ARP, Ether, srp  # noqa: F401
+from scapy.all import ARP, DNS, DNSQR, Ether, IP, UDP, srp, sniff  # noqa: F401
 
 # ─── Configuration ───────────────────────────────────────────────────────────
 DATABASE_URL = os.environ["DATABASE_URL"]
@@ -29,6 +41,14 @@ REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379/0")
 NETWORK_RANGES = [r.strip() for r in os.environ.get("NETWORK_RANGES", "192.168.1.0/24").split(",")]
 SCAN_INTERVAL = int(os.environ.get("SCAN_INTERVAL", "300"))
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+
+# Pi-hole integration
+PIHOLE_URL = os.environ.get("PIHOLE_URL", "").rstrip("/")
+PIHOLE_PASSWORD = os.environ.get("PIHOLE_PASSWORD", "")
+
+# DNS packet sniffing
+DNS_SNIFF_ENABLED = os.environ.get("DNS_SNIFF_ENABLED", "true").lower() == "true"
+DNS_SNIFF_IFACE = os.environ.get("DNS_SNIFF_IFACE") or None  # None → scapy auto-selects
 
 # ─── Logging ─────────────────────────────────────────────────────────────────
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
@@ -65,6 +85,185 @@ def arp_sweep(network: str) -> list[dict]:
         hosts.append({"ip": rcv.psrc, "mac": rcv.hwsrc.upper()})
     log.info("arp_sweep_done", network=network, found=len(hosts))
     return hosts
+
+
+def arp_resolve(ip: str) -> str | None:
+    """Send a single ARP request to *ip* and return its MAC address, or None."""
+    try:
+        pkt = Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=ip)
+        answered, _ = srp(pkt, timeout=2, verbose=False)
+        if answered:
+            return answered[0][1].hwsrc.upper()
+    except Exception as exc:
+        log.debug("arp_resolve_error", ip=ip, error=str(exc))
+    return None
+
+
+# ─── Pi-hole API integration ─────────────────────────────────────────────────
+
+def _compute_pihole_token(password: str) -> str:
+    """Return the Pi-hole v5 API token derived from the admin *password*.
+
+    Pi-hole stores WEBPASSWORD as ``md5(md5(password))``, which is also the
+    token expected by the ``?auth=`` query parameter.
+
+    Note: MD5 is used here solely because it is the algorithm Pi-hole itself
+    uses for its API token.  Ensure Pi-hole is only reachable on a trusted
+    internal network.
+    """
+    first = hashlib.md5(password.encode()).hexdigest()  # noqa: S324
+    return hashlib.md5(first.encode()).hexdigest()  # noqa: S324
+
+
+def query_pihole_clients() -> list[dict]:
+    """Query the Pi-hole FTL API for known network clients.
+
+    Returns a list of dicts with keys ``ip``, ``mac``, and optionally
+    ``hostname``.  Returns an empty list when Pi-hole is not configured or
+    unreachable.
+    """
+    if not PIHOLE_URL:
+        return []
+
+    token = _compute_pihole_token(PIHOLE_PASSWORD)
+    url = f"{PIHOLE_URL}/admin/api.php"
+    try:
+        resp = requests.get(url, params={"network": "", "auth": token}, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as exc:
+        log.warning("pihole_query_failed", error=str(exc))
+        return []
+
+    clients: list[dict] = []
+    for entry in data.get("network", []):
+        hwaddr = (entry.get("hwaddr") or "").upper()
+        # Skip placeholder / all-zero MACs
+        if not hwaddr or hwaddr in ("00:00:00:00:00:00", ""):
+            continue
+        hostname = entry.get("name") or None
+        for ip_addr in entry.get("ip", []):
+            if ip_addr:
+                clients.append({"ip": ip_addr, "mac": hwaddr, "hostname": hostname})
+
+    log.info("pihole_clients_fetched", count=len(clients))
+    return clients
+
+
+# ─── DNS packet sniffer ──────────────────────────────────────────────────────
+
+# Background thread posts newly-seen source IPs into this queue so that the
+# main scan loop can enrich and upsert them without racing with the sniffer.
+# Queue is thread-safe: the sniffer thread calls put() and the main thread
+# calls get_nowait() in process_dns_sniff_queue().  maxsize caps memory use
+# in high-traffic environments; excess items are dropped silently.
+_dns_sniff_queue: queue.Queue = queue.Queue(maxsize=10_000)
+
+
+def _dns_packet_handler(pkt) -> None:
+    """Scapy packet callback — enqueue the source IP of every DNS query."""
+    try:
+        if (
+            pkt.haslayer(IP)
+            and pkt.haslayer(UDP)
+            and pkt.haslayer(DNS)
+            and pkt[DNS].qr == 0  # query, not response
+            and pkt.haslayer(DNSQR)
+        ):
+            try:
+                _dns_sniff_queue.put_nowait(pkt[IP].src)
+            except queue.Full:
+                pass  # queue is bounded; drop the item rather than block
+    except Exception as exc:
+        log.debug("dns_packet_handler_error", error=str(exc))
+
+
+def start_dns_sniffer() -> threading.Thread:
+    """Start a daemon thread that sniffs DNS query packets.
+
+    The thread runs ``scapy.sniff()`` with ``filter="udp port 53"`` so that
+    every DNS query seen on the network interface triggers
+    :func:`_dns_packet_handler`.  The thread is a daemon so it is
+    automatically cleaned up when the main process exits.
+
+    Returns the :class:`threading.Thread` object (already started).
+    """
+    def _loop() -> None:
+        log.info("dns_sniffer_start", iface=DNS_SNIFF_IFACE or "auto")
+        try:
+            sniff(
+                filter="udp port 53",
+                prn=_dns_packet_handler,
+                store=False,
+                iface=DNS_SNIFF_IFACE,
+            )
+        except Exception as exc:
+            log.error("dns_sniffer_error", error=str(exc))
+
+    t = threading.Thread(target=_loop, name="dns-sniffer", daemon=True)
+    t.start()
+    return t
+
+
+def process_dns_sniff_queue(conn, rdb) -> int:
+    """Drain the DNS sniffer queue and upsert any newly discovered devices.
+
+    For each unique source IP found in the queue:
+
+    1. Skip if the IP is already recorded in the database.
+    2. Attempt to resolve the MAC address via a targeted ARP request.
+    3. Skip if no MAC can be resolved (device may be off-network or
+       the container lacks raw-socket access).
+    4. Enrich with vendor/hostname/nmap data and upsert.
+
+    Returns the number of new devices added.
+    """
+    # Drain the queue into a local set to deduplicate
+    pending: set[str] = set()
+    while True:
+        try:
+            pending.add(_dns_sniff_queue.get_nowait())
+        except queue.Empty:
+            break
+
+    if not pending:
+        return 0
+
+    log.info("dns_sniff_queue_drain", candidates=len(pending))
+    new_count = 0
+
+    # Only query the DB for the IPs we actually need to check.
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT ip_address FROM devices WHERE ip_address = ANY(%s)",
+            (list(pending),),
+        )
+        known_ips: set[str] = {row["ip_address"] for row in cur.fetchall() if row["ip_address"]}
+
+    for ip in pending:
+        if ip in known_ips:
+            continue
+
+        mac = arp_resolve(ip)
+        if not mac:
+            log.debug("dns_sniff_no_mac", ip=ip)
+            continue
+
+        host: dict = {"ip": ip, "mac": mac}
+        host["hostname"] = resolve_hostname(ip)
+        host["vendor"] = vendor_lookup(mac)
+        scan_data = nmap_scan(ip)
+        host.update(scan_data)
+        host["device_type"] = guess_device_type(
+            host.get("vendor"), host.get("open_ports", []), host.get("os_guess")
+        )
+
+        is_new = upsert_device(conn, rdb, host)
+        if is_new:
+            new_count += 1
+            log.info("dns_sniff_new_device", ip=ip, mac=mac, vendor=host.get("vendor"))
+
+    return new_count
 
 
 # ─── nmap port/OS scan ───────────────────────────────────────────────────────
@@ -229,12 +428,32 @@ def run_scan():
         conn.commit()
 
         hosts = arp_sweep(network)
+
+        # Merge Pi-hole network clients so devices that answered Pi-hole DNS
+        # queries (but didn't respond to ARP) are also discovered.
+        pihole_clients = query_pihole_clients()
+        if pihole_clients:
+            host_by_ip = {h["ip"]: h for h in hosts}
+            for client in pihole_clients:
+                if client["ip"] not in host_by_ip:
+                    hosts.append(client)
+                    host_by_ip[client["ip"]] = client
+                elif not host_by_ip[client["ip"]].get("mac"):
+                    # Back-fill MAC from Pi-hole if ARP didn't capture it
+                    host_by_ip[client["ip"]]["mac"] = client["mac"]
+            log.info("pihole_merge_done", total_after_merge=len(hosts))
+
         new_count = 0
 
         for host in hosts:
+            # Skip hosts still missing a MAC address (Pi-hole entries where
+            # the MAC was not available and ARP back-fill also failed)
+            if not host.get("mac"):
+                log.debug("skip_host_no_mac", ip=host.get("ip"))
+                continue
             # Enrich
-            host["hostname"] = resolve_hostname(host["ip"])
-            host["vendor"] = vendor_lookup(host["mac"])
+            host["hostname"] = host.get("hostname") or resolve_hostname(host["ip"])
+            host["vendor"] = host.get("vendor") or vendor_lookup(host["mac"])
             scan_data = nmap_scan(host["ip"])
             host.update(scan_data)
             host["device_type"] = guess_device_type(
@@ -244,6 +463,11 @@ def run_scan():
             is_new = upsert_device(conn, rdb, host)
             if is_new:
                 new_count += 1
+
+        # Process any devices discovered via DNS packet sniffing since the
+        # last scan cycle.
+        if DNS_SNIFF_ENABLED:
+            new_count += process_dns_sniff_queue(conn, rdb)
 
         # Update scan record
         with conn.cursor() as cur:
@@ -263,6 +487,12 @@ def run_scan():
 
 def main():
     log.info("discovery_service_start", networks=NETWORK_RANGES, interval=SCAN_INTERVAL)
+
+    # Start the background DNS-packet sniffer (requires NET_RAW capability).
+    if DNS_SNIFF_ENABLED:
+        start_dns_sniffer()
+    else:
+        log.info("dns_sniffer_disabled")
 
     # Run once immediately, then on schedule
     run_scan()
