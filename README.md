@@ -311,11 +311,15 @@ New device appears
 
 ## 🌱 IoT Learning Pipeline
 
-When you mark a device as **IoT** in the dashboard for the first time, it enters a 48-hour (configurable via `IOT_LEARNING_HOURS`) observation window:
+When you mark a device as **IoT** in the dashboard for the first time, it enters an observation window whose length is set by `IOT_LEARNING_HOURS` (default: **48 hours**):
 
 1. **Dashboard** sets the device status to `iot_learning` and publishes an `iot_learning_start_requested` event on Redis.
 2. **Discovery** creates a temporary Pi-hole group named `iot_<IP>_learning` and registers the device as a Pi-hole client in that group — allowing it unrestricted internet access so all DNS queries are visible.
-3. After `IOT_LEARNING_HOURS`, **Discovery** queries Pi-hole for every unique domain the device resolved, inserts them into the `iot_allowlist` table, registers the dashboard's `/iot-allowlist.txt` feed as a Pi-hole adlist for the permanent `PIHOLE_IOT_GROUP`, and moves the device into that group.
+3. After `IOT_LEARNING_HOURS` hours, **Discovery** finalises the session:
+   - Queries Pi-hole for every unique domain the device resolved during the window.
+   - Inserts those FQDNs into the `iot_allowlist` table.
+   - Registers the dashboard's `/iot-allowlist.txt` feed as a Pi-hole adlist for the permanent `PIHOLE_IOT_GROUP`.
+   - Moves the device into that Pi-hole group and removes the temporary learning group.
 4. **Guardian** detects the status change to `iot` and enforces the restricted ipset policy, dropping all DNS queries to FQDNs not in the allow-list.
 
 The `/iot-allowlist.txt` endpoint served by the dashboard is a plain-text feed (one FQDN per line) containing both globally-shared entries and any per-device overrides added manually.
