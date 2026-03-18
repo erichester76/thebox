@@ -541,7 +541,7 @@ def log_event(
                 src_ip,
                 src_port,
                 dst_port,
-                payload_preview[:MAX_PAYLOAD_PREVIEW_LENGTH] if payload_preview else None,
+                payload_preview.replace("\x00", "")[:MAX_PAYLOAD_PREVIEW_LENGTH] if payload_preview else None,
                 severity,
                 interaction_level,
                 intent,
