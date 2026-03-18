@@ -274,9 +274,13 @@ def query_pihole_clients() -> list[dict]:
     clients: list[dict] = []
     for entry in data.get("devices", []):
         hwaddr = (entry.get("hwaddr") or "").upper()
-        # Skip placeholder / all-zero MACs
-        if not hwaddr or hwaddr in ("00:00:00:00:00:00", ""):
-            continue
+        # Normalise invalid/placeholder MACs to empty string so the IPs are
+        # still added to the discovery pipeline and will receive proper ARP /
+        # nmap enrichment later.
+        #   - "00:00:00:00:00:00"  → unknown MAC (no DHCP lease)
+        #   - "IP-x.x.x.x"        → Pi-hole placeholder for DNS-only devices
+        if hwaddr in ("", "00:00:00:00:00:00") or hwaddr.startswith("IP-"):
+            hwaddr = ""
         # Pi-hole v6: each IP entry carries its own name (hostname is per-IP)
         for ip_entry in entry.get("ips", []):
             ip_addr = ip_entry.get("ip") if isinstance(ip_entry, dict) else ip_entry
@@ -284,7 +288,10 @@ def query_pihole_clients() -> list[dict]:
                 ip_entry.get("name") if isinstance(ip_entry, dict) else None
             ) or None
             if ip_addr:
-                clients.append({"ip": ip_addr, "mac": hwaddr, "hostname": hostname})
+                client: dict = {"ip": ip_addr, "hostname": hostname}
+                if hwaddr:
+                    client["mac"] = hwaddr
+                clients.append(client)
 
     log.info("pihole_clients_fetched", count=len(clients))
     return clients
