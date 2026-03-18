@@ -1,0 +1,8 @@
+flask==3.0.3
+psycopg2-binary==2.9.9
+redis==5.0.3
+structlog==24.1.0
+requests==2.31.0
+flask-socketio==5.3.6
+gevent==23.9.1
+gevent-websocket==0.10.1

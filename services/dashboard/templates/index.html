@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>TheBox — Network Command Centre</title>
+  <style>
+    /* ── Reset & base ───────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --bg:       #0d1117;
+      --surface:  #161b22;
+      --border:   #30363d;
+      --accent:   #58a6ff;
+      --success:  #3fb950;
+      --warning:  #d29922;
+      --danger:   #f85149;
+      --muted:    #8b949e;
+      --text:     #c9d1d9;
+      --radius:   8px;
+    }
+    body { background: var(--bg); color: var(--text); font-family: system-ui, sans-serif; font-size: 14px; min-height: 100vh; }
+
+    /* ── Layout ────────────────────────────────────── */
+    header { background: var(--surface); border-bottom: 1px solid var(--border); padding: 12px 24px; display: flex; align-items: center; gap: 12px; }
+    header h1 { font-size: 18px; font-weight: 700; color: var(--accent); }
+    header .pill { background: var(--bg); border: 1px solid var(--border); border-radius: 99px; padding: 2px 10px; font-size: 12px; color: var(--muted); }
+    #live-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); display: inline-block; margin-right: 4px; }
+    #live-dot.online { background: var(--success); animation: pulse 2s infinite; }
+    @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:0.4; } }
+
+    main { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; padding: 20px 24px; max-width: 1400px; margin: auto; }
+    @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+
+    /* ── Cards ─────────────────────────────────────── */
+    .card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
+    .card-header { padding: 12px 16px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--border); }
+    .card-header h2 { font-size: 14px; font-weight: 600; color: var(--text); }
+    .card-body { padding: 16px; }
+    .card.full { grid-column: 1 / -1; }
+
+    /* ── Stats row ──────────────────────────────────── */
+    #stats-row { display: flex; gap: 12px; flex-wrap: wrap; }
+    .stat { flex: 1; min-width: 100px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius); padding: 12px 16px; text-align: center; }
+    .stat .val { font-size: 28px; font-weight: 700; }
+    .stat .lbl { font-size: 11px; color: var(--muted); margin-top: 2px; text-transform: uppercase; letter-spacing: .05em; }
+    .stat.trusted   .val { color: var(--success); }
+    .stat.quarantine .val { color: var(--warning); }
+    .stat.blocked   .val { color: var(--danger);  }
+    .stat.iot       .val { color: var(--accent);  }
+
+    /* ── Tables ─────────────────────────────────────── */
+    table { width: 100%; border-collapse: collapse; }
+    th { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); padding: 6px 8px; text-align: left; border-bottom: 1px solid var(--border); }
+    td { padding: 8px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+    tr:last-child td { border-bottom: none; }
+    tr:hover td { background: rgba(88,166,255,0.05); }
+
+    /* ── Status badges ──────────────────────────────── */
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 99px; font-size: 11px; font-weight: 600; }
+    .badge-trusted    { background: rgba(63,185,80,.15);  color: var(--success); }
+    .badge-quarantine { background: rgba(210,153,34,.15); color: var(--warning); }
+    .badge-blocked    { background: rgba(248,81,73,.15);  color: var(--danger);  }
+    .badge-iot        { background: rgba(88,166,255,.15); color: var(--accent);  }
+    .badge-new        { background: rgba(139,148,158,.15);color: var(--muted);   }
+    .badge-low        { background: rgba(63,185,80,.15);  color: var(--success); }
+    .badge-high       { background: rgba(210,153,34,.15); color: var(--warning); }
+    .badge-critical   { background: rgba(248,81,73,.15);  color: var(--danger);  }
+
+    /* ── Buttons ────────────────────────────────────── */
+    .btn { border: none; border-radius: 6px; padding: 4px 10px; font-size: 12px; cursor: pointer; font-weight: 600; }
+    .btn-trust  { background: rgba(63,185,80,.15);  color: var(--success); }
+    .btn-block  { background: rgba(248,81,73,.15);  color: var(--danger);  }
+    .btn-iot    { background: rgba(88,166,255,.15); color: var(--accent);  }
+    .btn-ack    { background: rgba(139,148,158,.15);color: var(--muted);   }
+    .btn:hover  { opacity: .8; }
+
+    /* ── Alert list ─────────────────────────────────── */
+    .alert-item { padding: 10px 12px; border-left: 3px solid var(--muted); margin-bottom: 8px; background: var(--bg); border-radius: 0 6px 6px 0; }
+    .alert-item.warning  { border-left-color: var(--warning); }
+    .alert-item.critical { border-left-color: var(--danger); }
+    .alert-item.info     { border-left-color: var(--accent); }
+    .alert-title { font-weight: 600; margin-bottom: 2px; }
+    .alert-meta  { font-size: 11px; color: var(--muted); }
+
+    /* ── Empty state ────────────────────────────────── */
+    .empty { text-align: center; padding: 32px; color: var(--muted); }
+
+    /* ── Scrollable panel ───────────────────────────── */
+    .scrollable { max-height: 380px; overflow-y: auto; }
+
+    /* ── Honeypot mini-feed ─────────────────────────── */
+    #hp-feed { font-family: monospace; font-size: 12px; }
+    #hp-feed .row { padding: 4px 8px; border-bottom: 1px solid var(--border); display: flex; gap: 8px; }
+    #hp-feed .row:hover { background: rgba(255,255,255,.03); }
+    #hp-feed .src { flex: 1; color: var(--danger); }
+    #hp-feed .port { color: var(--warning); width: 50px; }
+    #hp-feed .time { color: var(--muted); width: 160px; text-align: right; }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>🛡 TheBox</h1>
+  <span class="pill">Network Command Centre</span>
+  <span style="margin-left:auto;display:flex;align-items:center;font-size:12px;color:var(--muted)">
+    <span id="live-dot"></span><span id="live-label">Connecting…</span>
+  </span>
+</header>
+
+<main>
+
+  <!-- Stats row (full width) -->
+  <div class="card full">
+    <div class="card-header"><h2>Network Overview</h2><button class="btn btn-ack" onclick="loadStats()">Refresh</button></div>
+    <div class="card-body">
+      <div id="stats-row">
+        <div class="stat trusted">   <div class="val" id="s-trusted">–</div>   <div class="lbl">Trusted</div></div>
+        <div class="stat quarantine"><div class="val" id="s-quarantine">–</div><div class="lbl">Quarantined</div></div>
+        <div class="stat blocked">   <div class="val" id="s-blocked">–</div>   <div class="lbl">Blocked</div></div>
+        <div class="stat iot">       <div class="val" id="s-iot">–</div>       <div class="lbl">IoT</div></div>
+        <div class="stat">           <div class="val" id="s-total">–</div>     <div class="lbl">Total Devices</div></div>
+        <div class="stat">           <div class="val" id="s-honeypot">–</div>  <div class="lbl">Honeypot Hits</div></div>
+        <div class="stat">           <div class="val" id="s-alerts" style="color:var(--warning)">–</div><div class="lbl">Open Alerts</div></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Devices table -->
+  <div class="card full">
+    <div class="card-header"><h2>Devices</h2><button class="btn btn-ack" onclick="loadDevices()">Refresh</button></div>
+    <div class="card-body">
+      <div class="scrollable">
+        <table id="devices-table">
+          <thead><tr>
+            <th>IP</th><th>MAC</th><th>Hostname</th><th>Vendor</th>
+            <th>Type</th><th>OS</th><th>Status</th><th>Last Seen</th><th>Actions</th>
+          </tr></thead>
+          <tbody id="devices-body"><tr><td colspan="9" class="empty">Loading…</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- Alerts panel -->
+  <div class="card">
+    <div class="card-header"><h2>Recent Alerts</h2><button class="btn btn-ack" onclick="loadAlerts()">Refresh</button></div>
+    <div class="card-body scrollable" id="alerts-list"><div class="empty">Loading…</div></div>
+  </div>
+
+  <!-- Honeypot feed -->
+  <div class="card">
+    <div class="card-header"><h2>Honeypot Activity</h2><button class="btn btn-ack" onclick="loadHoneypot()">Refresh</button></div>
+    <div class="card-body scrollable" id="hp-feed"><div class="empty">Loading…</div></div>
+  </div>
+
+</main>
+
+<script>
+// ── API helpers ──────────────────────────────────────────────────────────────
+async function api(path, opts={}) {
+  const r = await fetch(path, opts);
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+function fmtDate(iso) {
+  if (!iso) return '–';
+  return new Date(iso).toLocaleString();
+}
+
+function statusBadge(s) {
+  const map = { trusted:'trusted', quarantined:'quarantine', blocked:'blocked', iot:'iot', new:'new' };
+  return `<span class="badge badge-${map[s]||'new'}">${s}</span>`;
+}
+
+function severityBadge(s) {
+  return `<span class="badge badge-${s||'low'}">${s||'low'}</span>`;
+}
+
+// ── Stats ────────────────────────────────────────────────────────────────────
+async function loadStats() {
+  const d = await api('/api/stats');
+  document.getElementById('s-trusted').textContent    = d.devices.trusted;
+  document.getElementById('s-quarantine').textContent = d.devices.quarantined;
+  document.getElementById('s-blocked').textContent    = d.devices.blocked;
+  document.getElementById('s-iot').textContent        = d.devices.iot;
+  document.getElementById('s-total').textContent      = d.devices.total;
+  document.getElementById('s-honeypot').textContent   = d.honeypot_hits;
+  document.getElementById('s-alerts').textContent     = d.unacked_alerts;
+}
+
+// ── Devices ──────────────────────────────────────────────────────────────────
+async function loadDevices() {
+  const devices = await api('/api/devices');
+  const tbody = document.getElementById('devices-body');
+  if (!devices.length) { tbody.innerHTML = '<tr><td colspan="9" class="empty">No devices yet</td></tr>'; return; }
+  tbody.innerHTML = devices.map(d => `
+    <tr>
+      <td>${d.ip_address||'–'}</td>
+      <td style="font-family:monospace">${d.mac_address}</td>
+      <td>${d.hostname||'–'}</td>
+      <td>${d.vendor||'–'}</td>
+      <td>${d.device_type||'–'}</td>
+      <td>${d.os_guess||'–'}</td>
+      <td>${statusBadge(d.status)}</td>
+      <td>${fmtDate(d.last_seen)}</td>
+      <td>
+        <button class="btn btn-trust" onclick="setStatus(${d.id},'trusted')">Trust</button>
+        <button class="btn btn-block" onclick="setStatus(${d.id},'blocked')">Block</button>
+        <button class="btn btn-iot"   onclick="setStatus(${d.id},'iot')">IoT</button>
+      </td>
+    </tr>`).join('');
+}
+
+async function setStatus(id, status) {
+  await api(`/api/devices/${id}/status`, {
+    method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify({status})
+  });
+  loadDevices(); loadStats();
+}
+
+// ── Alerts ───────────────────────────────────────────────────────────────────
+async function loadAlerts() {
+  const alerts = await api('/api/alerts');
+  const el = document.getElementById('alerts-list');
+  if (!alerts.length) { el.innerHTML = '<div class="empty">No alerts</div>'; return; }
+  el.innerHTML = alerts.slice(0,50).map(a => `
+    <div class="alert-item ${a.level}">
+      <div class="alert-title">${a.title}</div>
+      <div class="alert-meta">${fmtDate(a.created_at)} · ${a.source}
+        ${a.acknowledged ? '' : `<button class="btn btn-ack" style="margin-left:8px" onclick="ackAlert(${a.id})">Ack</button>`}
+      </div>
+    </div>`).join('');
+}
+
+async function ackAlert(id) {
+  await api(`/api/alerts/${id}/acknowledge`, {method:'PUT'});
+  loadAlerts(); loadStats();
+}
+
+// ── Honeypot ─────────────────────────────────────────────────────────────────
+async function loadHoneypot() {
+  const rows = await api('/api/honeypot');
+  const el = document.getElementById('hp-feed');
+  if (!rows.length) { el.innerHTML = '<div class="empty">No honeypot activity</div>'; return; }
+  el.innerHTML = rows.slice(0,50).map(r => `
+    <div class="row">
+      <span class="src">${r.src_ip}</span>
+      <span class="port">:${r.dst_port}</span>
+      <span>${severityBadge(r.severity)}</span>
+      <span class="time">${fmtDate(r.created_at)}</span>
+    </div>`).join('');
+}
+
+// ── SSE live updates ──────────────────────────────────────────────────────────
+function connectSSE() {
+  const es = new EventSource('/api/events');
+  const dot = document.getElementById('live-dot');
+  const lbl = document.getElementById('live-label');
+
+  es.onopen = () => { dot.classList.add('online'); lbl.textContent = 'Live'; };
+  es.onerror = () => { dot.classList.remove('online'); lbl.textContent = 'Reconnecting…'; };
+  es.onmessage = (e) => {
+    try {
+      const ev = JSON.parse(e.data);
+      if (ev.type === 'new_device') { loadDevices(); loadStats(); loadAlerts(); }
+      if (ev.type === 'device_status_changed') { loadDevices(); loadStats(); }
+    } catch (_) {}
+  };
+}
+
+// ── Bootstrap ────────────────────────────────────────────────────────────────
+(async () => {
+  await Promise.all([loadStats(), loadDevices(), loadAlerts(), loadHoneypot()]);
+  connectSSE();
+  // Periodic refresh
+  setInterval(() => { loadStats(); loadAlerts(); loadHoneypot(); }, 30000);
+})();
+</script>
+</body>
+</html>
