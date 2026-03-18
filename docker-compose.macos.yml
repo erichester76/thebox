@@ -1,0 +1,40 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# docker-compose.macos.yml — macOS (Docker Desktop) overlay for TheBox
+# ─────────────────────────────────────────────────────────────────────────────
+# Docker Desktop ≥ 4.29 supports network_mode: host on macOS via the
+# "Enable host networking" setting.  When enabled, containers share the
+# Docker Desktop Linux VM's host network namespace, binding ports directly
+# on the Mac host's interfaces — no explicit port mappings needed.
+#
+# Before running TheBox on macOS you must enable host networking in Docker
+# Desktop:
+#   1. Open Docker Desktop → Settings (⚙) → Resources → Network
+#   2. Enable "Enable host networking"
+#   3. Click "Apply & Restart"
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.macos.yml up -d
+#
+# The setup script (scripts/setup.sh) applies this overlay automatically
+# when it detects macOS.
+#
+# ⚠  Limitations on macOS even with host networking enabled:
+#    • ARP sweeps (discovery): the "host" is the Docker Desktop Linux VM,
+#      not the Mac's physical interface.  ARP packets may not reach LAN
+#      devices depending on the VM's network attachment.  Discovery will
+#      start without errors but scanning real LAN hosts may be limited.
+#    • iptables/ipset (guardian): these are Linux kernel features that
+#      apply to the Linux VM's network stack, not the Mac host.  Guardian
+#      starts and manages database state normally, but rules will not
+#      enforce quarantine on physical LAN devices.
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+  discovery:
+    network_mode: host
+
+  guardian:
+    network_mode: host
+
+  honeypot:
+    network_mode: host
