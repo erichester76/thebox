@@ -78,6 +78,13 @@ SWEEP_WINDOW = 60  # seconds
 # Interaction recv timeout (seconds)
 RECV_TIMEOUT = 4
 
+# Maximum characters stored for payload_preview per event
+MAX_PAYLOAD_PREVIEW_LENGTH = 2000
+
+# Credential attempts are tracked across a wider window to detect slow brute-force.
+# This multiplier × THRESHOLD_WINDOW gives the credential tracking window (seconds).
+CREDENTIAL_WINDOW_MULTIPLIER = 5
+
 # ─── Logging ─────────────────────────────────────────────────────────────────
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
 structlog.configure(
@@ -267,7 +274,7 @@ def _interact_redis_proto(sock: socket.socket, conv: list[str]) -> str:
         return "banner"
     conv.append(f"C: {data.strip()}")
     upper = data.strip().upper()
-    if upper.startswith("AUTH") or upper.startswith("*2") and "AUTH" in upper:
+    if upper.startswith("AUTH") or (upper.startswith("*2") and "AUTH" in upper):
         sock.sendall(b"-ERR invalid password\r\n")
         return "credentials"
     if upper.startswith("CONFIG") or upper.startswith("SLAVEOF") or upper.startswith("REPLICAOF"):
@@ -489,7 +496,7 @@ def infer_intent(
         # Check if this IP has attempted credentials multiple times recently
         cred_key = f"thebox:honeypot:creds:{src_ip}"
         cred_count = rdb.incr(cred_key)
-        rdb.expire(cred_key, THRESHOLD_WINDOW * 5)
+        rdb.expire(cred_key, THRESHOLD_WINDOW * CREDENTIAL_WINDOW_MULTIPLIER)
         if cred_count >= 3:
             return "brute_force"
         return "credentials"
@@ -533,7 +540,7 @@ def log_event(
                 src_ip,
                 src_port,
                 dst_port,
-                payload_preview[:2000] if payload_preview else None,
+                payload_preview[:MAX_PAYLOAD_PREVIEW_LENGTH] if payload_preview else None,
                 severity,
                 interaction_level,
                 intent,

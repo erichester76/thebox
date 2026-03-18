@@ -622,9 +622,12 @@ async function openHpEventModal(eventId) {
   let ev;
   try { ev = await api(`/api/honeypot/${eventId}`); } catch(_) { return; }
 
-  const portsSel = ev.ports_scanned
-    ? (typeof ev.ports_scanned === 'string' ? JSON.parse(ev.ports_scanned) : ev.ports_scanned)
-    : null;
+  let portsSel = null;
+  if (ev.ports_scanned) {
+    portsSel = typeof ev.ports_scanned === 'string'
+      ? JSON.parse(ev.ports_scanned)
+      : ev.ports_scanned;
+  }
 
   document.getElementById('hp-event-grid').innerHTML = `
     <div>
