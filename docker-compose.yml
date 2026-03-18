@@ -90,6 +90,12 @@ services:
       PIHOLE_PASSWORD: ${PIHOLE_PASSWORD:-thebox_pihole}
       DNS_SNIFF_ENABLED: ${DNS_SNIFF_ENABLED:-true}
       DNS_SNIFF_IFACE: ${DNS_SNIFF_IFACE:-}
+      SSDP_ENABLED: ${SSDP_ENABLED:-true}
+      SSDP_TIMEOUT: ${SSDP_TIMEOUT:-5}
+      MDNS_ENABLED: ${MDNS_ENABLED:-true}
+      NETBIOS_ENABLED: ${NETBIOS_ENABLED:-true}
+      BANNER_GRAB_ENABLED: ${BANNER_GRAB_ENABLED:-true}
+      BANNER_GRAB_TIMEOUT: ${BANNER_GRAB_TIMEOUT:-3}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
     cap_add:
