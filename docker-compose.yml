@@ -94,9 +94,6 @@ services:
     cap_add:
       - NET_ADMIN
       - NET_RAW
-    networks:
-      - thebox_internal
-      - default
     depends_on:
       postgres:
         condition: service_healthy
