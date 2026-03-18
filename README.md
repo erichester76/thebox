@@ -89,10 +89,10 @@ sudo bash scripts/setup.sh
 Or start manually:
 
 ```bash
-# Linux
-docker compose up -d
+# Linux (full capabilities — ARP scanning + iptables enforcement)
+docker compose -f docker-compose.yml -f docker-compose.linux.yml up -d
 
-# macOS
+# macOS (Docker Desktop)
 docker compose -f docker-compose.yml -f docker-compose.macos.yml up -d
 ```
 
@@ -112,17 +112,24 @@ all devices use Pi-hole for DNS resolution.
 ## 🍎 macOS Notes
 
 TheBox runs on macOS using [Docker Desktop](https://www.docker.com/products/docker-desktop/).
-The setup script automatically applies `docker-compose.macos.yml` as an overlay,
-which switches the `discovery`, `guardian`, and `honeypot` services from
-`network_mode: host` to user-defined bridge networks so all services can reach
-each other by container-name DNS.
+The base `docker-compose.yml` uses bridge networking so all services start on macOS without modification.
+The `docker-compose.macos.yml` overlay adds explicit port mappings for the honeypot so its listener ports are reachable from the Mac host.
+The setup script automatically applies the correct overlay for each platform.
+
+**How the compose files fit together:**
+
+| File | Purpose |
+|------|---------|
+| `docker-compose.yml` | Base — works on all platforms (bridge networking, no `network_mode: host`) |
+| `docker-compose.linux.yml` | Linux overlay — adds `network_mode: host` to discovery, guardian, honeypot for full LAN capabilities |
+| `docker-compose.macos.yml` | macOS overlay — adds explicit honeypot port mappings for Docker Desktop |
 
 **Feature availability on macOS:**
 
 | Feature | Status | Notes |
 |---------|--------|-------|
 | Dashboard, Pi-hole, PostgreSQL, Redis | ✅ Full | Bridge networking works normally |
-| Honeypot (port listeners) | ✅ Full | Ports are explicitly mapped in `docker-compose.macos.yml` |
+| Honeypot (port listeners) | ✅ Full | Ports are explicitly mapped via `docker-compose.macos.yml` |
 | ARP-based LAN scanning | ⚠️ Limited | Docker Desktop runs inside a Linux VM; containers cannot reach the Mac's physical LAN segment via ARP. The discovery service starts without errors but will only see Docker-internal traffic. |
 | iptables quarantine / IoT allow-lists | ⚠️ Limited | iptables rules apply within the container's network namespace, not the Mac host. The guardian service starts without errors but will not enforce rules on the physical LAN. |
 

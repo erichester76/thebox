@@ -1,0 +1,35 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# docker-compose.linux.yml — Linux overlay for TheBox
+# ─────────────────────────────────────────────────────────────────────────────
+# On Linux, the discovery, guardian, and honeypot services gain full
+# capabilities by running with network_mode: host:
+#
+#   • discovery  — ARP sweeps can reach the physical LAN segment (raw socket
+#                  access to the host's network interfaces via Scapy/nmap).
+#   • guardian   — iptables/ipset rules are applied to the host kernel's
+#                  network stack, enforcing quarantine and IoT allow-lists
+#                  for real devices on the LAN.
+#   • honeypot   — ports are bound directly on the host interface so any
+#                  device on the LAN can reach them without Docker port-
+#                  forwarding overhead.
+#
+# Docker's embedded DNS (127.0.0.11) is still available to host-mode
+# containers, so service-name hostnames (postgres, redis) continue to
+# resolve correctly.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.linux.yml up -d
+#
+# The setup script (scripts/setup.sh) applies this overlay automatically
+# when it detects Linux.
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+  discovery:
+    network_mode: host
+
+  guardian:
+    network_mode: host
+
+  honeypot:
+    network_mode: host

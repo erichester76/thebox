@@ -16,7 +16,7 @@ echo
 
 # ── Prerequisite checks ──────────────────────────────────────────────────────
 # docker compose v2 (plugin) is preferred; fall back to docker-compose v1.
-if docker compose version &>/dev/null 2>&1; then
+if docker compose version &>/dev/null; then
   COMPOSE_CMD="docker compose"
 elif command -v docker-compose &>/dev/null; then
   COMPOSE_CMD="docker-compose"
@@ -88,13 +88,15 @@ else
 fi
 
 # ── Select compose files ─────────────────────────────────────────────────────
-# On macOS, use the dedicated docker-compose.macos.yml which replaces
-# network_mode: host with bridge networking so all services can communicate
-# by container-name DNS and ports are explicitly mapped to the Mac host.
-# On Linux, use the standard docker-compose.yml with host networking for
-# full ARP scanning and iptables enforcement capability.
+# On Linux, overlay docker-compose.linux.yml which adds network_mode: host to
+# discovery, guardian, and honeypot for full ARP scanning and iptables
+# enforcement on the physical LAN.
+# On macOS, overlay docker-compose.macos.yml which adds explicit port mappings
+# for the honeypot so its listener ports are reachable from the Mac host.
 if [ "$OS" = "Darwin" ] && [ -f "$REPO_DIR/docker-compose.macos.yml" ]; then
-  COMPOSE_FILES="-f $REPO_DIR/docker-compose.macos.yml"
+  COMPOSE_FILES="-f $REPO_DIR/docker-compose.yml -f $REPO_DIR/docker-compose.macos.yml"
+elif [ "$OS" = "Linux" ] && [ -f "$REPO_DIR/docker-compose.linux.yml" ]; then
+  COMPOSE_FILES="-f $REPO_DIR/docker-compose.yml -f $REPO_DIR/docker-compose.linux.yml"
 else
   COMPOSE_FILES="-f $REPO_DIR/docker-compose.yml"
 fi
