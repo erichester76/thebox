@@ -146,6 +146,40 @@ services:
       redis:
         condition: service_healthy
 
+  # ─── Redirector Service ─────────────────────────────────────────────────────
+  # Redirects DNS and DHCP traffic to Pi-hole using increasingly intrusive
+  # methods and enforces per-device quarantine via ARP spoofing.
+  # On Linux, docker-compose.linux.yml overrides this with network_mode: host
+  # for full ARP/iptables access to the physical LAN.
+  redirector:
+    build:
+      context: ./services/redirector
+      dockerfile: Dockerfile
+    container_name: thebox-redirector
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-thebox}:${POSTGRES_PASSWORD:-thebox_secret}@postgres:5432/${POSTGRES_DB:-thebox}
+      REDIS_URL: redis://redis:6379/0
+      REDIRECT_MODE: ${REDIRECT_MODE:-passive}
+      NETWORK_INTERFACE: ${NETWORK_INTERFACE:-eth0}
+      GATEWAY_IP: ${GATEWAY_IP:-}
+      NETWORK_RANGES: ${NETWORK_RANGES:-192.168.1.0/24}
+      PIHOLE_IP: ${PIHOLE_IP:-}
+      BOX_IP: ${BOX_IP:-}
+      BLACKHOLE_QUARANTINED: ${BLACKHOLE_QUARANTINED:-false}
+      ARP_REFRESH_INTERVAL: ${ARP_REFRESH_INTERVAL:-10}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      guardian:
+        condition: service_started
+
   # ─── Web Dashboard ───────────────────────────────────────────────────────────
   dashboard:
     build:
