@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 import psycopg2
 import psycopg2.extras
 import redis
+import requests
 import structlog
 from flask import Flask, Response, jsonify, render_template, request
 
@@ -24,6 +25,8 @@ DATABASE_URL = os.environ["DATABASE_URL"]
 REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379/0")
 SECRET_KEY = os.environ.get("SECRET_KEY", "")
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+PIHOLE_URL = os.environ.get("PIHOLE_URL", "").rstrip("/")
+PIHOLE_PASSWORD = os.environ.get("PIHOLE_PASSWORD", "")
 
 # ─── Logging ─────────────────────────────────────────────────────────────────
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
@@ -538,6 +541,82 @@ def api_honeypot():
     )
     conn.close()
     return Response(json.dumps(rows, default=serialize), mimetype="application/json")
+
+
+# --- Pi-hole helpers ---------------------------------------------------------
+
+def _pihole_authenticate() -> str | None:
+    """Authenticate with the Pi-hole v6 API and return a session ID.
+
+    Returns ``None`` when Pi-hole is not configured, the password is empty, or
+    authentication fails.
+    """
+    if not PIHOLE_URL or not PIHOLE_PASSWORD:
+        return None
+    try:
+        resp = requests.post(
+            f"{PIHOLE_URL}/api/auth",
+            json={"password": PIHOLE_PASSWORD},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        sid = data.get("session", {}).get("sid")
+        if not sid:
+            log.warning("pihole_auth_no_sid", response=data)
+        return sid
+    except Exception as exc:
+        log.warning("pihole_auth_failed", error=str(exc))
+        return None
+
+
+def get_pihole_stats() -> dict:
+    """Fetch summary statistics from the Pi-hole v6 API.
+
+    Returns a dict with DNS query counts, blocking ratio, gravity list size,
+    and client counts.  Returns an empty dict when Pi-hole is unreachable or
+    not configured.
+    """
+    if not PIHOLE_URL:
+        return {}
+
+    sid = _pihole_authenticate()
+    params = {"sid": sid} if sid else {}
+    try:
+        resp = requests.get(
+            f"{PIHOLE_URL}/api/stats/summary",
+            params=params,
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as exc:
+        log.warning("pihole_stats_failed", error=str(exc))
+        return {}
+
+    queries = data.get("queries", {})
+    gravity = data.get("gravity", {})
+    clients = data.get("clients", {})
+
+    return {
+        "queries_total": queries.get("total", 0),
+        "queries_blocked": queries.get("blocked", 0),
+        "percent_blocked": round(queries.get("percent_blocked", 0.0), 1),
+        "domains_blocked": gravity.get("domains_being_blocked", 0),
+        "clients_active": clients.get("active", 0),
+        "clients_total": clients.get("total", 0),
+        "status": data.get("status", "unknown"),
+    }
+
+
+# --- API: Pi-hole statistics ---
+
+@app.route("/api/pihole")
+def api_pihole():
+    stats = get_pihole_stats()
+    if not stats:
+        return jsonify({"error": "Pi-hole unavailable or not configured"}), 503
+    return jsonify(stats)
 
 
 # --- API: Stats summary ---

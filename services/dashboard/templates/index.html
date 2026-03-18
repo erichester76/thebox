@@ -120,6 +120,19 @@
     #hp-feed .src { flex: 1; color: var(--danger); }
     #hp-feed .port { color: var(--warning); width: 50px; }
     #hp-feed .time { color: var(--muted); width: 160px; text-align: right; }
+
+    /* ── Pi-hole stats ──────────────────────────────────────── */
+    #pihole-stats { display: flex; gap: 12px; flex-wrap: wrap; }
+    .ph-stat { flex: 1; min-width: 100px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius); padding: 12px 16px; text-align: center; }
+    .ph-stat .val { font-size: 24px; font-weight: 700; color: var(--accent); }
+    .ph-stat .lbl { font-size: 11px; color: var(--muted); margin-top: 2px; text-transform: uppercase; letter-spacing: .05em; }
+    .ph-stat.blocked-stat .val { color: var(--danger); }
+    .ph-stat.pct-stat     .val { color: var(--warning); }
+    .ph-stat.gravity-stat .val { color: var(--success); }
+    #pihole-status-badge { font-size: 11px; padding: 2px 8px; border-radius: 99px; font-weight: 600; }
+    #pihole-status-badge.enabled  { background: rgba(63,185,80,.15);  color: var(--success); }
+    #pihole-status-badge.disabled { background: rgba(248,81,73,.15);  color: var(--danger); }
+    #pihole-status-badge.unknown  { background: rgba(139,148,158,.15); color: var(--muted); }
   </style>
 </head>
 <body>
@@ -146,6 +159,24 @@
         <div class="stat">           <div class="val" id="s-total">–</div>     <div class="lbl">Total Devices</div></div>
         <div class="stat">           <div class="val" id="s-honeypot">–</div>  <div class="lbl">Honeypot Hits</div></div>
         <div class="stat">           <div class="val" id="s-alerts" style="color:var(--warning)">–</div><div class="lbl">Open Alerts</div></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Pi-hole statistics -->
+  <div class="card full">
+    <div class="card-header">
+      <h2>Pi-hole DNS Statistics</h2>
+      <span id="pihole-status-badge" class="unknown">unknown</span>
+      <button class="btn btn-ack" style="margin-left:auto" onclick="loadPihole()">Refresh</button>
+    </div>
+    <div class="card-body">
+      <div id="pihole-stats">
+        <div class="ph-stat">           <div class="val" id="ph-total">–</div>    <div class="lbl">Total Queries</div></div>
+        <div class="ph-stat blocked-stat"><div class="val" id="ph-blocked">–</div> <div class="lbl">Queries Blocked</div></div>
+        <div class="ph-stat pct-stat">   <div class="val" id="ph-pct">–</div>     <div class="lbl">% Blocked</div></div>
+        <div class="ph-stat gravity-stat"><div class="val" id="ph-gravity">–</div> <div class="lbl">Domains Blocked</div></div>
+        <div class="ph-stat">           <div class="val" id="ph-clients">–</div>  <div class="lbl">Active Clients</div></div>
       </div>
     </div>
   </div>
@@ -329,6 +360,26 @@ async function loadStats() {
   document.getElementById('s-total').textContent      = d.devices.total;
   document.getElementById('s-honeypot').textContent   = d.honeypot_hits;
   document.getElementById('s-alerts').textContent     = d.unacked_alerts;
+}
+
+// ── Pi-hole ──────────────────────────────────────────────────────────────────
+async function loadPihole() {
+  const badge = document.getElementById('pihole-status-badge');
+  try {
+    const d = await api('/api/pihole');
+    document.getElementById('ph-total').textContent   = d.queries_total.toLocaleString();
+    document.getElementById('ph-blocked').textContent = d.queries_blocked.toLocaleString();
+    document.getElementById('ph-pct').textContent     = d.percent_blocked + '%';
+    document.getElementById('ph-gravity').textContent = d.domains_blocked.toLocaleString();
+    document.getElementById('ph-clients').textContent = d.clients_active;
+    const status = (d.status || 'unknown').toLowerCase();
+    badge.textContent = status;
+    badge.className = '';
+    badge.classList.add(status === 'enabled' ? 'enabled' : status === 'disabled' ? 'disabled' : 'unknown');
+  } catch (_) {
+    badge.textContent = 'unavailable';
+    badge.className = 'unknown';
+  }
 }
 
 // ── Devices ──────────────────────────────────────────────────────────────────
@@ -772,10 +823,10 @@ document.getElementById('manage-group-modal').addEventListener('click', function
 
 // ── Bootstrap ────────────────────────────────────────────────────────────────
 (async () => {
-  await Promise.all([loadStats(), loadDevices(), loadAlerts(), loadHoneypot(), loadUsers(), loadGroups()]);
+  await Promise.all([loadStats(), loadPihole(), loadDevices(), loadAlerts(), loadHoneypot(), loadUsers(), loadGroups()]);
   connectSSE();
   // Periodic refresh
-  setInterval(() => { loadStats(); loadAlerts(); loadHoneypot(); }, 30000);
+  setInterval(() => { loadStats(); loadPihole(); loadAlerts(); loadHoneypot(); }, 30000);
 })();
 </script>
 </body>
