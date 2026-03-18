@@ -493,7 +493,32 @@ def ssdp_discover(timeout: int = 5) -> dict[str, dict]:
         log.warning("ssdp_send_error", error=str(exc))
         return {}
 
-    responses: dict[str, dict] = {}
+_SSDP_LOCATION_RE = re.compile(r"^https?://", re.IGNORECASE)
+
+
+def _validate_ssdp_location(location: str, responding_ip: str) -> bool:
+    """Return True only when *location* is safe to fetch.
+
+    Accepts only ``http://`` and ``https://`` URLs whose host component is an
+    IP address that matches the device's responding IP.  This prevents an
+    attacker on the LAN from injecting SSDP responses that point to cloud
+    metadata endpoints (e.g. ``169.254.169.254``) or internal services.
+    """
+    if not _SSDP_LOCATION_RE.match(location):
+        return False
+    try:
+        from urllib.parse import urlparse  # stdlib — no extra dep
+        parsed = urlparse(location)
+        host = parsed.hostname or ""
+        # Reject any non-IP host (hostnames could resolve to unexpected addresses)
+        # and reject mismatches with the responding IP.
+        socket.inet_aton(host)  # raises OSError if not a valid IPv4 address
+        return host == responding_ip
+    except OSError:
+        return False
+    except Exception:
+        return False
+
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
@@ -508,7 +533,7 @@ def ssdp_discover(timeout: int = 5) -> dict[str, dict]:
                     location = line.split(":", 1)[1].strip()
                     break
             entry: dict = {}
-            if location:
+            if location and _validate_ssdp_location(location, ip):
                 entry["upnp_location"] = location
                 try:
                     with urlopen(location, timeout=3) as resp:  # noqa: S310
@@ -638,7 +663,10 @@ def start_mdns_discovery() -> threading.Thread:
         try:
             zc = Zeroconf()
             listener = _MdnsListener()
-            browsers = [ServiceBrowser(zc, stype, listener) for stype in _MDNS_SERVICE_TYPES]  # noqa: F841
+            # Keep a reference to the browsers so they are not garbage-collected;
+            # each ServiceBrowser runs background threads that stay alive as long
+            # as the object is referenced.
+            _active_browsers = [ServiceBrowser(zc, stype, listener) for stype in _MDNS_SERVICE_TYPES]
             while True:
                 time.sleep(60)
         except Exception as exc:
@@ -758,9 +786,16 @@ def http_banner(ip: str, port: int = 80, timeout: float = 3.0) -> str | None:
 def tls_cert_info(ip: str, port: int = 443, timeout: float = 3.0) -> dict:
     """Extract subject and SAN info from the TLS certificate at *ip*:*port*.
 
-    Establishes a TLS connection with hostname verification disabled so that
-    self-signed certificates (common on home-network devices) can still be
-    read.
+    Establishes a TLS connection with hostname verification and certificate
+    chain validation **disabled** (``ssl.CERT_NONE``).  This is intentional:
+    the vast majority of home-network devices (NAS boxes, IP cameras, routers,
+    smart-home hubs) use self-signed certificates that would cause a verified
+    connection to fail.
+
+    **Security note**: Because the certificate is not verified, the data
+    returned reflects what the device *claims* rather than what a trusted CA
+    has vouched for.  The extracted fields are stored as discovery metadata
+    only and must not be used for authentication or access-control decisions.
 
     Returns a dict that may contain:
 
