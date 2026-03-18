@@ -49,6 +49,9 @@ PIHOLE_PASSWORD = os.environ.get("PIHOLE_PASSWORD", "")
 # IoT learning period
 IOT_LEARNING_HOURS = int(os.environ.get("IOT_LEARNING_HOURS", "48"))
 PIHOLE_IOT_GROUP = os.environ.get("PIHOLE_IOT_GROUP", "iot")
+# URL of the dashboard service as reachable from within the Docker network.
+# Used to tell Pi-hole where to fetch the IoT allow-list as an adlist URL.
+DASHBOARD_URL = os.environ.get("DASHBOARD_URL", "").rstrip("/")
 
 # DNS packet sniffing
 DNS_SNIFF_ENABLED = os.environ.get("DNS_SNIFF_ENABLED", "true").lower() == "true"
@@ -454,6 +457,50 @@ def pihole_add_domain_to_allowlist(sid: str, domain: str, group_ids: list[int]) 
     return "domain" in data
 
 
+def pihole_register_iot_allowlist(sid: str, url: str, group_ids: list[int]) -> bool:
+    """Register the IoT allow-list URL as a Pi-hole ``allow`` type adlist.
+
+    Idempotent: if the URL already exists as an adlist it is updated in-place
+    (groups, enabled state) rather than creating a duplicate.  Pi-hole will
+    fetch the URL on the next gravity update and apply the domains as an
+    exact allow-list for the assigned groups.
+
+    Returns True when the adlist was successfully created or updated.
+    """
+    # Check for an existing adlist with the same address
+    data = _pihole_request("GET", "/lists", sid, params={"type": "allow"})
+    existing_id: int | None = None
+    for lst in data.get("lists", []):
+        if lst.get("address") == url:
+            existing_id = lst.get("id")
+            break
+
+    if existing_id is not None:
+        result = _pihole_request(
+            "PUT", f"/lists/{existing_id}", sid,
+            json={"groups": group_ids, "enabled": True},
+        )
+        ok = "list" in result
+    else:
+        result = _pihole_request(
+            "POST", "/lists", sid,
+            json={
+                "address": url,
+                "comment": "IoT allow-list managed by TheBox",
+                "type": "allow",
+                "enabled": True,
+                "groups": group_ids,
+            },
+        )
+        ok = "list" in result
+
+    if ok:
+        log.info("pihole_iot_allowlist_registered", url=url, groups=group_ids)
+    else:
+        log.warning("pihole_iot_allowlist_register_failed", url=url)
+    return ok
+
+
 # ─── IoT learning session management ────────────────────────────────────────
 
 def start_iot_learning(conn, rdb, device_id: int, ip: str) -> bool:
@@ -614,8 +661,17 @@ def process_completed_learnings(conn, rdb) -> int:
                         )
                 conn.commit()
 
-                # ── 3. Add domains to Pi-hole allow-list for the iot group ───
+                # ── 3. Register the allow-list URL with Pi-hole and add domains ──
                 if sid and iot_group_id is not None:
+                    # Register the dashboard URL as a Pi-hole adlist (idempotent).
+                    # Pi-hole will fetch it on the next gravity update so it serves
+                    # as the durable, URL-based source of truth for the allow-list.
+                    if DASHBOARD_URL:
+                        allowlist_url = f"{DASHBOARD_URL}/iot-allowlist.txt"
+                        pihole_register_iot_allowlist(sid, allowlist_url, [iot_group_id])
+
+                    # Also insert domains individually for immediate effect
+                    # (adlist requires a gravity update before it takes effect).
                     for fqdn in domains:
                         pihole_add_domain_to_allowlist(sid, fqdn, [iot_group_id])
 
@@ -775,7 +831,8 @@ def process_dns_sniff_queue(conn, rdb) -> int:
         scan_data = nmap_scan(ip)
         host.update(scan_data)
         host["device_type"] = guess_device_type(
-            host.get("vendor"), host.get("open_ports", []), host.get("os_guess")
+            host.get("vendor"), host.get("open_ports", []), host.get("os_guess"),
+            host.get("hostname"),
         )
 
         is_new = upsert_device(conn, rdb, host)
@@ -839,25 +896,123 @@ def vendor_lookup(mac: str) -> str | None:
         return None
 
 
-def guess_device_type(vendor: str | None, open_ports: list[dict], os_guess: str | None) -> str:
-    """Heuristic device-type classifier."""
+# ─── Device-type classification signal tables ────────────────────────────────
+# All sets below are used as case-insensitive substring matches against the
+# relevant field (vendor OUI string, OS fingerprint, hostname, etc.).  A broad
+# prefix like "espressif" therefore matches "Espressif Systems", "ESPRESSIF
+# INC.", and any future variant reported by MAC-vendor databases.
+
+# OUI vendor strings that reliably identify IoT hardware.
+_IOT_VENDOR_KEYWORDS: frozenset[str] = frozenset({
+    # Microcontroller / embedded-SoC manufacturers
+    "espressif", "espressif systems", "raspberry pi", "raspberrypi",
+    "microchip technology", "nordic semiconductor", "silicon labs", "silabs",
+    "texas instruments", "stmicroelectronics", "nxp semiconductors",
+    # Smart-home protocols / hubs
+    "z-wave", "zigbee", "insteon", "lutron", "leviton", "ge lighting",
+    "smartthings", "samsung smarthings", "hubitat",
+    # Smart lighting
+    "signify", "philips lighting", "lifx", "osram", "sylvania", "sengled",
+    "innr", "yeelight", "milight", "nanoleaf",
+    # Smart plugs / switches / automation
+    "tuya", "ewelink", "shelly", "sonoff", "tasmota", "esphome", "meross",
+    "wemo", "belkin", "kasa", "tp-link", "tp link", "tplink",
+    # Thermostats / HVAC
+    "nest", "ecobee", "honeywell", "tado", "thermosmart",
+    # IP cameras / doorbells / security
+    "ring", "arlo", "blink", "eufy", "amcrest", "foscam", "reolink",
+    "hikvision", "dahua", "axis communications", "hanwha", "vivotek",
+    "pelco", "mobotix",
+    # Smart speakers / streaming
+    "sonos", "roku", "chromecast",
+    # Consumer IoT / misc
+    "wyze", "anker innovations", "xiaomi", "aqara", "miio",
+    "d-link", "dlink", "vizio", "tcl", "hisense",
+})
+
+# OS / firmware fingerprint substrings that indicate embedded systems.
+_IOT_OS_KEYWORDS: frozenset[str] = frozenset({
+    "embedded linux", "uclinux", "openwrt", "lede", "dd-wrt", "buildroot",
+    "vxworks", "freertos", "threadx", "nucleus rtos", "contiki", "tinyos",
+    "busybox", "yocto", "openwrt", "ddwrt",
+})
+
+# TCP/UDP port numbers whose presence strongly hints at an IoT device.
+_IOT_PORT_SIGNALS: frozenset[int] = frozenset({
+    1883,   # MQTT
+    8883,   # MQTT over TLS
+    5683,   # CoAP
+    5684,   # CoAP over DTLS
+    554,    # RTSP (IP cameras / NVR)
+    8554,   # RTSP alternate
+    47808,  # BACnet/IP (building automation)
+    502,    # Modbus TCP (industrial sensors)
+    44818,  # EtherNet/IP (industrial)
+    4840,   # OPC-UA (industrial IoT)
+    9293,   # Zigbee TCP gateway (some hubs)
+})
+
+# Hostname substrings that indicate IoT devices.
+_IOT_HOSTNAME_KEYWORDS: frozenset[str] = frozenset({
+    "esp-", "esp8266", "esp32", "shelly", "tasmota", "sonoff",
+    "tuya-", "wemos", "lifx", "miio-", "ring-", "arlo-", "wyze-",
+    "cam-", "nvr-", "dvr-", "ipcam", "hue-bridge", "philips-hue",
+    "ecobee", "nest-", "tado-", "octoprint", "homebridge",
+    "hassio", "homeassistant", "ha-",
+})
+
+
+def guess_device_type(
+    vendor: str | None,
+    open_ports: list[dict],
+    os_guess: str | None,
+    hostname: str | None = None,
+) -> str:
+    """Heuristic device-type classifier.
+
+    Evaluates vendor OUI string, open ports, OS fingerprint, and hostname
+    against curated signal tables to assign the most specific device type.
+
+    Returns one of: ``iot``, ``desktop``, ``server``, ``mobile``,
+    ``printer``, ``network_device``, or ``unknown``.
+    """
     vendor_l = (vendor or "").lower()
     os_l = (os_guess or "").lower()
+    hostname_l = (hostname or "").lower()
     ports = {p["port"] for p in open_ports}
 
-    iot_vendors = {"tuya", "espressif", "shelly", "philips", "sonos", "ring", "nest", "ecobee", "tp-link"}
-    if any(v in vendor_l for v in iot_vendors):
+    # ── IoT signals — checked first; most specific ────────────────────────────
+    if any(kw in vendor_l for kw in _IOT_VENDOR_KEYWORDS):
         return "iot"
+    if any(kw in os_l for kw in _IOT_OS_KEYWORDS):
+        return "iot"
+    if ports & _IOT_PORT_SIGNALS:
+        return "iot"
+    if any(kw in hostname_l for kw in _IOT_HOSTNAME_KEYWORDS):
+        return "iot"
+
+    # ── Desktop / workstation ─────────────────────────────────────────────────
     if "windows" in os_l:
         return "desktop"
+    if "macos" in os_l or "mac os" in os_l:
+        return "desktop"
+
+    # ── Server ────────────────────────────────────────────────────────────────
     if "linux" in os_l and 22 in ports:
         return "server"
-    if "android" in os_l or "apple" in vendor_l:
+
+    # ── Mobile ───────────────────────────────────────────────────────────────
+    if "android" in os_l or "apple" in vendor_l or "ios" in os_l:
         return "mobile"
+
+    # ── Printer ──────────────────────────────────────────────────────────────
     if 9100 in ports or "print" in vendor_l:
         return "printer"
+
+    # ── Network device ────────────────────────────────────────────────────────
     if 80 in ports or 443 in ports or 8080 in ports:
         return "network_device"
+
     return "unknown"
 
 
@@ -1033,7 +1188,8 @@ def run_scan():
             scan_data = nmap_scan(host["ip"])
             host.update(scan_data)
             host["device_type"] = guess_device_type(
-                host.get("vendor"), host.get("open_ports", []), host.get("os_guess")
+                host.get("vendor"), host.get("open_ports", []), host.get("os_guess"),
+                host.get("hostname"),
             )
 
             is_new = upsert_device(conn, rdb, host)
@@ -1064,6 +1220,60 @@ def run_scan():
     conn.close()
 
 
+# ─── Redis subscriber (dashboard-triggered events) ───────────────────────────
+
+def _handle_iot_learning_start_requested(event: dict) -> None:
+    """React to a user manually assigning a device to IoT status for the first time.
+
+    The dashboard sets the device status to ``iot_learning`` and publishes
+    this event.  Discovery handles it here by calling :func:`start_iot_learning`
+    to create the Pi-hole learning group and record the session.
+
+    The handler is intentionally conservative: if anything goes wrong the
+    error is logged and the session the dashboard already wrote to the DB
+    remains intact so that the learning window still runs.
+    """
+    device_id = event.get("device_id")
+    ip = event.get("ip")
+
+    if not device_id or not ip:
+        log.warning("iot_learning_start_requested_missing_fields", event=event)
+        return
+
+    log.info("iot_learning_start_requested", device_id=device_id, ip=ip)
+    conn = get_db()
+    rdb = get_redis()
+    try:
+        start_iot_learning(conn, rdb, device_id, ip)
+    except Exception as exc:
+        log.error("iot_learning_start_failed", device_id=device_id, ip=ip, error=str(exc))
+    finally:
+        conn.close()
+
+
+def _discovery_subscribe_loop() -> None:
+    """Subscribe to ``thebox:events`` and dispatch dashboard-triggered events.
+
+    Runs as a daemon thread so the process exits cleanly when the main thread
+    finishes.  Only ``iot_learning_start_requested`` events are handled here;
+    all other event types are ignored.
+    """
+    rdb = get_redis()
+    pubsub = rdb.pubsub()
+    pubsub.subscribe("thebox:events")
+    log.info("discovery_subscribed_to_events")
+
+    for message in pubsub.listen():
+        if message["type"] != "message":
+            continue
+        try:
+            event = json.loads(message["data"])
+            if event.get("type") == "iot_learning_start_requested":
+                _handle_iot_learning_start_requested(event)
+        except Exception as exc:
+            log.error("discovery_event_handling_error", error=str(exc))
+
+
 def main():
     log.info(
         "discovery_service_start",
@@ -1080,6 +1290,10 @@ def main():
         start_dns_sniffer()
     else:
         log.info("dns_sniffer_disabled")
+
+    # Subscribe to Redis events so we can react to dashboard-triggered actions
+    # (e.g. a user manually assigning a device to IoT status for the first time).
+    threading.Thread(target=_discovery_subscribe_loop, name="discovery-redis-sub", daemon=True).start()
 
     # Run once immediately, then on schedule
     run_scan()

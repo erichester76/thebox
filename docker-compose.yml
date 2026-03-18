@@ -90,6 +90,9 @@ services:
       PIHOLE_PASSWORD: ${PIHOLE_PASSWORD:-thebox_pihole}
       DNS_SNIFF_ENABLED: ${DNS_SNIFF_ENABLED:-true}
       DNS_SNIFF_IFACE: ${DNS_SNIFF_IFACE:-}
+      IOT_LEARNING_HOURS: ${IOT_LEARNING_HOURS:-48}
+      PIHOLE_IOT_GROUP: ${PIHOLE_IOT_GROUP:-iot}
+      DASHBOARD_URL: http://dashboard:3000
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
     cap_add:

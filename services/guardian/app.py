@@ -425,6 +425,28 @@ def handle_new_device_event(event: dict):
 
 # ─── Redis subscriber thread ─────────────────────────────────────────────────
 
+def _apply_policy_from_db(device_id: int, status_override: str | None = None) -> None:
+    """Look up a device by ID and apply the correct iptables policy.
+
+    When *status_override* is provided it is used instead of the DB value
+    (useful when the DB hasn't been updated yet, e.g. during event handlers).
+    """
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute("SELECT mac_address, ip_address, status FROM devices WHERE id=%s", (device_id,))
+        row = cur.fetchone()
+    conn.close()
+
+    if not row:
+        log.warning("policy_apply_device_not_found", device_id=device_id)
+        return
+
+    mac = row["mac_address"]
+    ip = row["ip_address"] or ""
+    effective_status = status_override if status_override is not None else row["status"]
+    apply_device_policy(mac, ip, effective_status)
+
+
 def subscribe_loop():
     """Block and process events published by the discovery service."""
     rdb = get_redis()
@@ -440,6 +462,24 @@ def subscribe_loop():
             etype = event.get("type")
             if etype == "new_device":
                 handle_new_device_event(event)
+            elif etype == "iot_learning_started":
+                # Discovery has set the device status to 'iot_learning' in the
+                # DB; apply unrestricted policy immediately so Pi-hole can see
+                # all the device's DNS traffic during the learning window.
+                device_id = event.get("device_id")
+                if device_id:
+                    _apply_policy_from_db(device_id, status_override="iot_learning")
+                    log.info("iot_learning_policy_applied", device_id=device_id)
+            elif etype == "device_status_changed":
+                # A dashboard user changed a device's status directly; apply
+                # the corresponding iptables policy without waiting for the
+                # 10-minute sync cycle.
+                device_id = event.get("device_id")
+                new_status = event.get("status")
+                if device_id and new_status:
+                    _apply_policy_from_db(device_id, status_override=new_status)
+                    log.info("device_policy_updated_from_event",
+                             device_id=device_id, status=new_status)
         except Exception as exc:
             log.error("event_handling_error", error=str(exc))
 
