@@ -52,6 +52,12 @@
     /* ── Tables ─────────────────────────────────────── */
     table { width: 100%; border-collapse: collapse; }
     th { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); padding: 6px 8px; text-align: left; border-bottom: 1px solid var(--border); }
+    th.sortable { cursor: pointer; user-select: none; white-space: nowrap; }
+    th.sortable:hover { color: var(--text); }
+    th.sortable::after { content: ' ⇅'; opacity: .4; font-size: 10px; }
+    th.sort-asc::after  { content: ' ↑'; opacity: 1; color: var(--accent); }
+    th.sort-desc::after { content: ' ↓'; opacity: 1; color: var(--accent); }
+    th.sort-asc, th.sort-desc { color: var(--accent); }
     td { padding: 8px; border-bottom: 1px solid var(--border); vertical-align: middle; }
     tr:last-child td { border-bottom: none; }
     tr:hover td { background: rgba(88,166,255,0.05); }
@@ -139,7 +145,7 @@
 
 <header>
   <h1>🛡 TheBox</h1>
-  <span class="pill">Network Command Centre</span>
+  <span class="pill">Network Command Center</span>
   <span style="margin-left:auto;display:flex;align-items:center;font-size:12px;color:var(--muted)">
     <span id="live-dot"></span><span id="live-label">Connecting…</span>
   </span>
@@ -188,8 +194,17 @@
       <div class="scrollable">
         <table id="devices-table">
           <thead><tr>
-            <th>IP</th><th>MAC</th><th>Hostname</th><th>Vendor</th>
-            <th>Type</th><th>OS</th><th>Owner</th><th>Groups</th><th>Status</th><th>Last Seen</th><th>Actions</th>
+            <th class="sortable" onclick="sortDevices('ip_address')">IP</th>
+            <th class="sortable" onclick="sortDevices('mac_address')">MAC</th>
+            <th class="sortable" onclick="sortDevices('hostname')">Hostname</th>
+            <th class="sortable" onclick="sortDevices('vendor')">Vendor</th>
+            <th class="sortable" onclick="sortDevices('device_type')">Type</th>
+            <th class="sortable" onclick="sortDevices('os_guess')">OS</th>
+            <th class="sortable" onclick="sortDevices('owner')">Owner</th>
+            <th class="sortable" onclick="sortDevices('groups')">Groups</th>
+            <th class="sortable" onclick="sortDevices('status')">Status</th>
+            <th class="sortable" onclick="sortDevices('last_seen')">Last Seen</th>
+            <th>Actions</th>
           </tr></thead>
           <tbody id="devices-body"><tr><td colspan="11" class="empty">Loading…</td></tr></tbody>
         </table>
@@ -383,11 +398,56 @@ async function loadPihole() {
 }
 
 // ── Devices ──────────────────────────────────────────────────────────────────
-async function loadDevices() {
-  const devices = await api('/api/devices');
+let _devices = [];
+let _sortCol = 'last_seen';
+let _sortDir = -1; // -1 = desc (newest first default), 1 = asc
+
+function sortDevices(col) {
+  if (_sortCol === col) {
+    _sortDir *= -1;
+  } else {
+    _sortCol = col;
+    _sortDir = 1;
+  }
+  renderDevices();
+}
+
+function renderDevices() {
   const tbody = document.getElementById('devices-body');
-  if (!devices.length) { tbody.innerHTML = '<tr><td colspan="11" class="empty">No devices yet</td></tr>'; return; }
-  tbody.innerHTML = devices.map(d => {
+  if (!_devices.length) { tbody.innerHTML = '<tr><td colspan="11" class="empty">No devices yet</td></tr>'; return; }
+
+  // Update sort indicators on headers
+  document.querySelectorAll('#devices-table thead th').forEach(th => {
+    th.classList.remove('sort-asc', 'sort-desc');
+  });
+  const allThs = document.querySelectorAll('#devices-table thead th');
+  const colNames = ['ip_address','mac_address','hostname','vendor','device_type','os_guess','owner','groups','status','last_seen'];
+  const idx = colNames.indexOf(_sortCol);
+  if (idx >= 0) {
+    allThs[idx].classList.add(_sortDir === 1 ? 'sort-asc' : 'sort-desc');
+  }
+
+  const sorted = [..._devices].sort((a, b) => {
+    let av, bv;
+    if (_sortCol === 'owner') {
+      av = (a.owner_display_name || a.owner_username || '').toLowerCase();
+      bv = (b.owner_display_name || b.owner_username || '').toLowerCase();
+    } else if (_sortCol === 'groups') {
+      av = (a.groups || []).length;
+      bv = (b.groups || []).length;
+    } else if (_sortCol === 'last_seen') {
+      av = a.last_seen ? new Date(a.last_seen).getTime() : 0;
+      bv = b.last_seen ? new Date(b.last_seen).getTime() : 0;
+    } else {
+      av = (a[_sortCol] || '').toString().toLowerCase();
+      bv = (b[_sortCol] || '').toString().toLowerCase();
+    }
+    if (av < bv) return -1 * _sortDir;
+    if (av > bv) return  1 * _sortDir;
+    return 0;
+  });
+
+  tbody.innerHTML = sorted.map(d => {
     const ownerLabel = d.owner_display_name || d.owner_username
       ? `<span style="color:var(--accent)">${escHtml(d.owner_display_name || d.owner_username)}</span>`
       : `<span style="color:var(--muted)">–</span>`;
@@ -416,6 +476,11 @@ async function loadDevices() {
       </td>
     </tr>`;
   }).join('');
+}
+
+async function loadDevices() {
+  _devices = await api('/api/devices');
+  renderDevices();
 }
 
 async function setStatus(id, status) {
