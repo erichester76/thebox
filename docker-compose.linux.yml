@@ -33,3 +33,6 @@ services:
 
   honeypot:
     network_mode: host
+
+  redirector:
+    network_mode: host

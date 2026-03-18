@@ -120,3 +120,18 @@ CREATE TABLE IF NOT EXISTS device_groups (
 
 CREATE INDEX IF NOT EXISTS idx_user_groups_group    ON user_groups(group_id);
 CREATE INDEX IF NOT EXISTS idx_device_groups_group  ON device_groups(group_id);
+
+-- Redirector events: actions taken by the redirector service
+CREATE TABLE IF NOT EXISTS redirect_events (
+    id          SERIAL PRIMARY KEY,
+    action      VARCHAR(64)  NOT NULL,   -- quarantine_start, quarantine_stop, dns_redirect, …
+    target_ip   VARCHAR(45)  NOT NULL,
+    target_mac  VARCHAR(17),
+    mode        VARCHAR(64)  NOT NULL,   -- arp_spoof, redirect_dns, dhcp_advertise, …
+    detail      TEXT,
+    device_id   INTEGER REFERENCES devices(id),
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_redirect_target_ip  ON redirect_events(target_ip);
+CREATE INDEX IF NOT EXISTS idx_redirect_created    ON redirect_events(created_at);
