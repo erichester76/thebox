@@ -101,7 +101,22 @@ def index():
 @app.route("/api/devices")
 def api_devices():
     conn = get_db()
-    rows = rows_to_list(conn, "SELECT * FROM devices ORDER BY last_seen DESC")
+    rows = rows_to_list(
+        conn,
+        """
+        SELECT d.*, u.username AS owner_username, u.display_name AS owner_display_name,
+               COALESCE(
+                   json_agg(json_build_object('id', g.id, 'name', g.name, 'pihole_group_name', g.pihole_group_name))
+                   FILTER (WHERE g.id IS NOT NULL), '[]'
+               ) AS groups
+        FROM devices d
+        LEFT JOIN users u ON u.id = d.owner_id
+        LEFT JOIN device_groups dg ON dg.device_id = d.id
+        LEFT JOIN groups g ON g.id = dg.group_id
+        GROUP BY d.id, u.username, u.display_name
+        ORDER BY d.last_seen DESC
+        """,
+    )
     conn.close()
     return Response(json.dumps(rows, default=serialize), mimetype="application/json")
 
@@ -109,7 +124,16 @@ def api_devices():
 @app.route("/api/devices/<int:device_id>", methods=["GET"])
 def api_device(device_id: int):
     conn = get_db()
-    rows = rows_to_list(conn, "SELECT * FROM devices WHERE id=%s", (device_id,))
+    rows = rows_to_list(
+        conn,
+        """
+        SELECT d.*, u.username AS owner_username, u.display_name AS owner_display_name
+        FROM devices d
+        LEFT JOIN users u ON u.id = d.owner_id
+        WHERE d.id=%s
+        """,
+        (device_id,),
+    )
     conn.close()
     if not rows:
         return jsonify({"error": "not found"}), 404
@@ -118,13 +142,27 @@ def api_device(device_id: int):
 
 @app.route("/api/devices/<int:device_id>/status", methods=["PUT"])
 def api_set_device_status(device_id: int):
-    """Allow the UI to trust / quarantine / block a device."""
+    """Allow the UI to trust / quarantine / block a device.
+
+    Devices leaving quarantine must be assigned as IoT or have an owner assigned.
+    """
     body = request.get_json(force=True)
     new_status = body.get("status")
     if new_status not in ("trusted", "quarantined", "blocked", "iot"):
         return jsonify({"error": "invalid status"}), 400
 
     conn = get_db()
+
+    # Enforce: devices can only become 'trusted' when they have an owner assigned
+    if new_status == "trusted":
+        rows = rows_to_list(conn, "SELECT owner_id, status FROM devices WHERE id=%s", (device_id,))
+        if not rows:
+            conn.close()
+            return jsonify({"error": "not found"}), 404
+        if rows[0]["owner_id"] is None:
+            conn.close()
+            return jsonify({"error": "device must be assigned to a user before it can be trusted"}), 422
+
     with conn.cursor() as cur:
         cur.execute("UPDATE devices SET status=%s WHERE id=%s RETURNING id", (new_status, device_id))
         if cur.rowcount == 0:
@@ -172,6 +210,295 @@ def api_iot_allowlist_remove(device_id: int, entry_id: int):
     conn = get_db()
     with conn.cursor() as cur:
         cur.execute("DELETE FROM iot_allowlist WHERE id=%s AND device_id=%s", (entry_id, device_id))
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/devices/<int:device_id>/owner", methods=["PUT"])
+def api_set_device_owner(device_id: int):
+    """Assign or unassign a user as the owner of a device."""
+    body = request.get_json(force=True)
+    user_id = body.get("user_id")  # None / null to unassign
+
+    conn = get_db()
+
+    if user_id is not None:
+        # Verify user exists
+        rows = rows_to_list(conn, "SELECT id FROM users WHERE id=%s", (user_id,))
+        if not rows:
+            conn.close()
+            return jsonify({"error": "user not found"}), 404
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE devices SET owner_id=%s WHERE id=%s RETURNING id",
+            (user_id, device_id),
+        )
+        if cur.rowcount == 0:
+            conn.close()
+            return jsonify({"error": "device not found"}), 404
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True})
+
+
+# --- API: Users ---
+
+@app.route("/api/users")
+def api_users():
+    conn = get_db()
+    rows = rows_to_list(
+        conn,
+        """
+        SELECT u.*, COUNT(DISTINCT d.id) AS device_count,
+               COALESCE(
+                   json_agg(json_build_object('id', g.id, 'name', g.name))
+                   FILTER (WHERE g.id IS NOT NULL), '[]'
+               ) AS groups
+        FROM users u
+        LEFT JOIN devices d ON d.owner_id = u.id
+        LEFT JOIN user_groups ug ON ug.user_id = u.id
+        LEFT JOIN groups g ON g.id = ug.group_id
+        GROUP BY u.id
+        ORDER BY u.username
+        """,
+    )
+    conn.close()
+    return Response(json.dumps(rows, default=serialize), mimetype="application/json")
+
+
+@app.route("/api/users/<int:user_id>", methods=["GET"])
+def api_user(user_id: int):
+    conn = get_db()
+    rows = rows_to_list(conn, "SELECT * FROM users WHERE id=%s", (user_id,))
+    conn.close()
+    if not rows:
+        return jsonify({"error": "not found"}), 404
+    return Response(json.dumps(rows[0], default=serialize), mimetype="application/json")
+
+
+@app.route("/api/users", methods=["POST"])
+def api_create_user():
+    body = request.get_json(force=True)
+    username = (body.get("username") or "").strip()
+    display_name = (body.get("display_name") or "").strip() or None
+    email = (body.get("email") or "").strip() or None
+
+    if not username:
+        return jsonify({"error": "username required"}), 400
+
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO users (username, display_name, email) VALUES (%s,%s,%s) RETURNING id",
+                (username, display_name, email),
+            )
+            new_id = cur.fetchone()["id"]
+        conn.commit()
+    except psycopg2.errors.UniqueViolation:
+        conn.rollback()
+        return jsonify({"error": "username already exists"}), 409
+    finally:
+        conn.close()
+    return jsonify({"ok": True, "id": new_id}), 201
+
+
+@app.route("/api/users/<int:user_id>", methods=["PUT"])
+def api_update_user(user_id: int):
+    body = request.get_json(force=True)
+    display_name = (body.get("display_name") or "").strip() or None
+    email = (body.get("email") or "").strip() or None
+
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE users SET display_name=%s, email=%s, updated_at=NOW() WHERE id=%s RETURNING id",
+            (display_name, email, user_id),
+        )
+        if cur.rowcount == 0:
+            conn.close()
+            return jsonify({"error": "not found"}), 404
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/users/<int:user_id>", methods=["DELETE"])
+def api_delete_user(user_id: int):
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM users WHERE id=%s RETURNING id", (user_id,))
+        if cur.rowcount == 0:
+            conn.close()
+            return jsonify({"error": "not found"}), 404
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True})
+
+
+# --- API: Groups ---
+
+@app.route("/api/groups")
+def api_groups():
+    conn = get_db()
+    rows = rows_to_list(
+        conn,
+        """
+        SELECT g.*,
+               COUNT(DISTINCT ug.user_id)   AS user_count,
+               COUNT(DISTINCT dg.device_id) AS device_count
+        FROM groups g
+        LEFT JOIN user_groups  ug ON ug.group_id = g.id
+        LEFT JOIN device_groups dg ON dg.group_id = g.id
+        GROUP BY g.id
+        ORDER BY g.name
+        """,
+    )
+    conn.close()
+    return Response(json.dumps(rows, default=serialize), mimetype="application/json")
+
+
+@app.route("/api/groups/<int:group_id>", methods=["GET"])
+def api_group(group_id: int):
+    conn = get_db()
+    rows = rows_to_list(conn, "SELECT * FROM groups WHERE id=%s", (group_id,))
+    conn.close()
+    if not rows:
+        return jsonify({"error": "not found"}), 404
+    return Response(json.dumps(rows[0], default=serialize), mimetype="application/json")
+
+
+@app.route("/api/groups", methods=["POST"])
+def api_create_group():
+    body = request.get_json(force=True)
+    name = (body.get("name") or "").strip()
+    description = (body.get("description") or "").strip() or None
+    pihole_group_name = (body.get("pihole_group_name") or "").strip() or None
+
+    if not name:
+        return jsonify({"error": "name required"}), 400
+
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO groups (name, description, pihole_group_name) VALUES (%s,%s,%s) RETURNING id",
+                (name, description, pihole_group_name),
+            )
+            new_id = cur.fetchone()["id"]
+        conn.commit()
+    except psycopg2.errors.UniqueViolation:
+        conn.rollback()
+        return jsonify({"error": "group name already exists"}), 409
+    finally:
+        conn.close()
+    return jsonify({"ok": True, "id": new_id}), 201
+
+
+@app.route("/api/groups/<int:group_id>", methods=["PUT"])
+def api_update_group(group_id: int):
+    body = request.get_json(force=True)
+    description = (body.get("description") or "").strip() or None
+    pihole_group_name = (body.get("pihole_group_name") or "").strip() or None
+
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE groups SET description=%s, pihole_group_name=%s, updated_at=NOW() WHERE id=%s RETURNING id",
+            (description, pihole_group_name, group_id),
+        )
+        if cur.rowcount == 0:
+            conn.close()
+            return jsonify({"error": "not found"}), 404
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/groups/<int:group_id>", methods=["DELETE"])
+def api_delete_group(group_id: int):
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM groups WHERE id=%s RETURNING id", (group_id,))
+        if cur.rowcount == 0:
+            conn.close()
+            return jsonify({"error": "not found"}), 404
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/groups/<int:group_id>/users", methods=["GET"])
+def api_group_users(group_id: int):
+    conn = get_db()
+    rows = rows_to_list(
+        conn,
+        """
+        SELECT u.* FROM users u
+        JOIN user_groups ug ON ug.user_id = u.id
+        WHERE ug.group_id = %s
+        ORDER BY u.username
+        """,
+        (group_id,),
+    )
+    conn.close()
+    return Response(json.dumps(rows, default=serialize), mimetype="application/json")
+
+
+@app.route("/api/groups/<int:group_id>/users/<int:user_id>", methods=["PUT"])
+def api_group_add_user(group_id: int, user_id: int):
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute("INSERT INTO user_groups (user_id, group_id) VALUES (%s,%s) ON CONFLICT DO NOTHING", (user_id, group_id))
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/groups/<int:group_id>/users/<int:user_id>", methods=["DELETE"])
+def api_group_remove_user(group_id: int, user_id: int):
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM user_groups WHERE user_id=%s AND group_id=%s", (user_id, group_id))
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/groups/<int:group_id>/devices", methods=["GET"])
+def api_group_devices(group_id: int):
+    conn = get_db()
+    rows = rows_to_list(
+        conn,
+        """
+        SELECT d.* FROM devices d
+        JOIN device_groups dg ON dg.device_id = d.id
+        WHERE dg.group_id = %s
+        ORDER BY d.ip_address
+        """,
+        (group_id,),
+    )
+    conn.close()
+    return Response(json.dumps(rows, default=serialize), mimetype="application/json")
+
+
+@app.route("/api/groups/<int:group_id>/devices/<int:device_id>", methods=["PUT"])
+def api_group_add_device(group_id: int, device_id: int):
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute("INSERT INTO device_groups (device_id, group_id) VALUES (%s,%s) ON CONFLICT DO NOTHING", (device_id, group_id))
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/groups/<int:group_id>/devices/<int:device_id>", methods=["DELETE"])
+def api_group_remove_device(group_id: int, device_id: int):
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM device_groups WHERE device_id=%s AND group_id=%s", (device_id, group_id))
     conn.commit()
     conn.close()
     return jsonify({"ok": True})

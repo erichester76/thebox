@@ -1,5 +1,15 @@
 -- TheBox database schema
 
+-- Users table: people who own or are responsible for devices
+CREATE TABLE IF NOT EXISTS users (
+    id              SERIAL PRIMARY KEY,
+    username        VARCHAR(64) NOT NULL UNIQUE,
+    display_name    VARCHAR(255),
+    email           VARCHAR(255),
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 -- Devices table: tracks every device seen on the network
 CREATE TABLE IF NOT EXISTS devices (
     id              SERIAL PRIMARY KEY,
@@ -11,10 +21,11 @@ CREATE TABLE IF NOT EXISTS devices (
     os_guess        VARCHAR(255),
     first_seen      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     last_seen       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    status          VARCHAR(32)  NOT NULL DEFAULT 'new',  -- new, trusted, quarantined, blocked
+    status          VARCHAR(32)  NOT NULL DEFAULT 'new',  -- new, trusted, quarantined, blocked, iot
     notes           TEXT,
     open_ports      JSONB DEFAULT '[]',
-    extra_info      JSONB DEFAULT '{}'
+    extra_info      JSONB DEFAULT '{}',
+    owner_id        INTEGER REFERENCES users(id) ON DELETE SET NULL
 );
 
 -- IoT allow-list: FQDNs an IoT device is permitted to reach
@@ -77,7 +88,35 @@ CREATE TABLE IF NOT EXISTS alerts (
 CREATE INDEX IF NOT EXISTS idx_devices_mac        ON devices(mac_address);
 CREATE INDEX IF NOT EXISTS idx_devices_ip         ON devices(ip_address);
 CREATE INDEX IF NOT EXISTS idx_devices_status     ON devices(status);
+CREATE INDEX IF NOT EXISTS idx_devices_owner      ON devices(owner_id);
 CREATE INDEX IF NOT EXISTS idx_honeypot_src_ip    ON honeypot_events(src_ip);
 CREATE INDEX IF NOT EXISTS idx_honeypot_created   ON honeypot_events(created_at);
 CREATE INDEX IF NOT EXISTS idx_alerts_level       ON alerts(level);
 CREATE INDEX IF NOT EXISTS idx_alerts_created     ON alerts(created_at);
+
+-- Groups table: named groups that map to Pi-hole groups for DNS policy management
+CREATE TABLE IF NOT EXISTS groups (
+    id                SERIAL PRIMARY KEY,
+    name              VARCHAR(64) NOT NULL UNIQUE,
+    description       TEXT,
+    pihole_group_name VARCHAR(64),   -- name of the corresponding Pi-hole group
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- User-group memberships: users can belong to multiple groups
+CREATE TABLE IF NOT EXISTS user_groups (
+    user_id   INTEGER NOT NULL REFERENCES users(id)  ON DELETE CASCADE,
+    group_id  INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+    PRIMARY KEY (user_id, group_id)
+);
+
+-- Device-group memberships: devices can belong to multiple groups
+CREATE TABLE IF NOT EXISTS device_groups (
+    device_id INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+    group_id  INTEGER NOT NULL REFERENCES groups(id)  ON DELETE CASCADE,
+    PRIMARY KEY (device_id, group_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_groups_group    ON user_groups(group_id);
+CREATE INDEX IF NOT EXISTS idx_device_groups_group  ON device_groups(group_id);
