@@ -6,3 +6,4 @@ requests==2.31.0
 mac-vendor-lookup==0.1.12
 schedule==1.2.1
 structlog==24.1.0
+zeroconf==0.131.0

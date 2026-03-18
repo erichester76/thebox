@@ -13,6 +13,15 @@ Additional discovery methods:
     to discover devices that send queries to Pi-hole or the honeypot DNS
     listener.  Newly seen source IPs are ARP-resolved to obtain their MAC
     addresses and then upserted like any other discovered device.
+  - SSDP/UPnP: sends multicast M-SEARCH probes and fetches UPnP device
+    description XML to extract manufacturer, model, and friendly name.
+  - mDNS/Zeroconf: browses common DNS-SD service types (Bonjour/Avahi) to
+    discover Apple, Chromecast, printer, HomeKit, and other smart-home devices.
+  - NetBIOS: runs nmap's nbstat NSE script across the subnet to retrieve
+    NetBIOS hostnames and workgroup info for Windows/Samba hosts.
+  - HTTP/HTTPS banners: grabs the Server header from open HTTP ports and
+    reads TLS certificate subject/SAN fields from open HTTPS ports to derive
+    hostnames, vendor, and model information.
 """
 
 import json
@@ -20,10 +29,14 @@ import hashlib
 import logging
 import os
 import queue
+import re
 import socket
+import ssl
 import threading
 import time
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
+from urllib.request import urlopen
 
 import nmap
 import psycopg2
@@ -34,6 +47,7 @@ import schedule
 import structlog
 from mac_vendor_lookup import MacLookup, VendorNotFoundError
 from scapy.all import ARP, DNS, DNSQR, Ether, IP, UDP, srp, sniff  # noqa: F401
+from zeroconf import ServiceBrowser, Zeroconf
 
 # ─── Configuration ───────────────────────────────────────────────────────────
 DATABASE_URL = os.environ["DATABASE_URL"]
@@ -49,6 +63,20 @@ PIHOLE_PASSWORD = os.environ.get("PIHOLE_PASSWORD", "")
 # DNS packet sniffing
 DNS_SNIFF_ENABLED = os.environ.get("DNS_SNIFF_ENABLED", "true").lower() == "true"
 DNS_SNIFF_IFACE = os.environ.get("DNS_SNIFF_IFACE") or None  # None → scapy auto-selects
+
+# SSDP/UPnP discovery
+SSDP_ENABLED = os.environ.get("SSDP_ENABLED", "true").lower() == "true"
+SSDP_TIMEOUT = int(os.environ.get("SSDP_TIMEOUT", "5"))
+
+# mDNS/Zeroconf discovery
+MDNS_ENABLED = os.environ.get("MDNS_ENABLED", "true").lower() == "true"
+
+# NetBIOS/NBNS discovery via nmap nbstat script
+NETBIOS_ENABLED = os.environ.get("NETBIOS_ENABLED", "true").lower() == "true"
+
+# HTTP/HTTPS banner grabbing
+BANNER_GRAB_ENABLED = os.environ.get("BANNER_GRAB_ENABLED", "true").lower() == "true"
+BANNER_GRAB_TIMEOUT = float(os.environ.get("BANNER_GRAB_TIMEOUT", "3"))
 
 # ─── Logging ─────────────────────────────────────────────────────────────────
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
@@ -401,8 +429,12 @@ def process_dns_sniff_queue(conn, rdb) -> int:
         host["vendor"] = vendor_lookup(mac)
         scan_data = nmap_scan(ip)
         host.update(scan_data)
+        extra_info: dict = enrich_from_banners(ip, host.get("open_ports", []))
+        if extra_info.get("tls_cn") and not host.get("hostname"):
+            host["hostname"] = extra_info["tls_cn"]
+        host["extra_info"] = extra_info
         host["device_type"] = guess_device_type(
-            host.get("vendor"), host.get("open_ports", []), host.get("os_guess")
+            host.get("vendor"), host.get("open_ports", []), host.get("os_guess"), extra_info
         )
 
         is_new = upsert_device(conn, rdb, host)
@@ -411,6 +443,433 @@ def process_dns_sniff_queue(conn, rdb) -> int:
             log.info("dns_sniff_new_device", ip=ip, mac=mac, vendor=host.get("vendor"))
 
     return new_count
+
+
+# ─── SSDP / UPnP discovery ───────────────────────────────────────────────────
+
+_SSDP_MULTICAST_ADDR = "239.255.255.250"
+_SSDP_PORT = 1900
+_SSDP_MX = 3
+
+
+def _xml_text(element, tag: str, ns: dict) -> str | None:
+    """Return the text of a child XML element, or None if absent."""
+    child = element.find(tag, ns)
+    return child.text.strip() if child is not None and child.text else None
+
+
+def ssdp_discover(timeout: int = 5) -> dict[str, dict]:
+    """Discover UPnP/SSDP devices on the LAN via multicast M-SEARCH.
+
+    Sends an ``ssdp:all`` M-SEARCH request to the UPnP multicast group
+    (239.255.255.250:1900) and waits *timeout* seconds for responses.
+    For each unique responding IP the LOCATION header URL is fetched and
+    the UPnP device description XML is parsed to extract manufacturer,
+    model name, friendly name, and device type.
+
+    Returns a dict mapping IP address → enrichment dict.  Runs silently
+    on error so that a missing or blocked multicast path doesn't abort the
+    scan cycle.
+    """
+    if not SSDP_ENABLED:
+        return {}
+
+    msg = (
+        "M-SEARCH * HTTP/1.1\r\n"
+        f"HOST: {_SSDP_MULTICAST_ADDR}:{_SSDP_PORT}\r\n"
+        'MAN: "ssdp:discover"\r\n'
+        f"MX: {_SSDP_MX}\r\n"
+        "ST: ssdp:all\r\n"
+        "\r\n"
+    ).encode()
+
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+        sock.settimeout(timeout)
+        sock.sendto(msg, (_SSDP_MULTICAST_ADDR, _SSDP_PORT))
+    except Exception as exc:
+        log.warning("ssdp_send_error", error=str(exc))
+        return {}
+
+_SSDP_LOCATION_RE = re.compile(r"^https?://", re.IGNORECASE)
+
+
+def _validate_ssdp_location(location: str, responding_ip: str) -> bool:
+    """Return True only when *location* is safe to fetch.
+
+    Accepts only ``http://`` and ``https://`` URLs whose host component is an
+    IP address that matches the device's responding IP.  This prevents an
+    attacker on the LAN from injecting SSDP responses that point to cloud
+    metadata endpoints (e.g. ``169.254.169.254``) or internal services.
+    """
+    if not _SSDP_LOCATION_RE.match(location):
+        return False
+    try:
+        from urllib.parse import urlparse  # stdlib — no extra dep
+        parsed = urlparse(location)
+        host = parsed.hostname or ""
+        # Reject any non-IP host (hostnames could resolve to unexpected addresses)
+        # and reject mismatches with the responding IP.
+        socket.inet_aton(host)  # raises OSError if not a valid IPv4 address
+        return host == responding_ip
+    except OSError:
+        return False
+    except Exception:
+        return False
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            data, addr = sock.recvfrom(65507)
+            ip = addr[0]
+            if ip in responses:
+                continue
+            response_text = data.decode("utf-8", errors="replace")
+            location: str | None = None
+            for line in response_text.split("\r\n"):
+                if line.upper().startswith("LOCATION:"):
+                    location = line.split(":", 1)[1].strip()
+                    break
+            entry: dict = {}
+            if location and _validate_ssdp_location(location, ip):
+                entry["upnp_location"] = location
+                try:
+                    with urlopen(location, timeout=3) as resp:  # noqa: S310
+                        xml_data = resp.read()
+                    root = ET.fromstring(xml_data)
+                    ns = {"d": "urn:schemas-upnp-org:device-1-0"}
+                    device_el = root.find(".//d:device", ns)
+                    if device_el is not None:
+                        for attr, tag in (
+                            ("upnp_friendly_name", "d:friendlyName"),
+                            ("upnp_manufacturer", "d:manufacturer"),
+                            ("upnp_manufacturer_url", "d:manufacturerURL"),
+                            ("upnp_model_name", "d:modelName"),
+                            ("upnp_model_number", "d:modelNumber"),
+                            ("upnp_model_description", "d:modelDescription"),
+                            ("upnp_serial_number", "d:serialNumber"),
+                            ("upnp_device_type", "d:deviceType"),
+                            ("upnp_udn", "d:UDN"),
+                        ):
+                            val = _xml_text(device_el, tag, ns)
+                            if val:
+                                entry[attr] = val
+                except ET.ParseError as exc:
+                    log.debug("ssdp_xml_parse_error", ip=ip, error=str(exc))
+                except Exception as exc:
+                    log.debug("ssdp_description_fetch_error", ip=ip, location=location, error=str(exc))
+            if entry:
+                responses[ip] = entry
+        except TimeoutError:
+            break
+        except OSError:
+            break
+        except Exception as exc:
+            log.debug("ssdp_recv_error", error=str(exc))
+            break
+
+    sock.close()
+    log.info("ssdp_discover_done", found=len(responses))
+    return responses
+
+
+# ─── mDNS / Zeroconf discovery ───────────────────────────────────────────────
+
+# Common DNS-SD service types that reveal useful device information.
+_MDNS_SERVICE_TYPES = [
+    "_http._tcp.local.",
+    "_https._tcp.local.",
+    "_ssh._tcp.local.",
+    "_sftp-ssh._tcp.local.",
+    "_smb._tcp.local.",
+    "_afpovertcp._tcp.local.",
+    "_nfs._tcp.local.",
+    "_ftp._tcp.local.",
+    "_telnet._tcp.local.",
+    "_workstation._tcp.local.",
+    "_googlecast._tcp.local.",
+    "_airplay._tcp.local.",
+    "_raop._tcp.local.",
+    "_companion-link._tcp.local.",
+    "_homekit._tcp.local.",
+    "_hap._tcp.local.",
+    "_matter._tcp.local.",
+    "_printer._tcp.local.",
+    "_ipp._tcp.local.",
+    "_ipps._tcp.local.",
+    "_pdl-datastream._tcp.local.",
+    "_scanner._tcp.local.",
+    "_device-info._tcp.local.",
+    "_daap._tcp.local.",
+    "_sleep-proxy._udp.local.",
+    "_spotify-connect._tcp.local.",
+]
+
+# Background thread pushes raw service entries here; main thread drains it.
+_mdns_queue: queue.Queue = queue.Queue(maxsize=10_000)
+
+
+class _MdnsListener:
+    """Minimal zeroconf ServiceBrowser listener that enqueues service info."""
+
+    def add_service(self, zc: Zeroconf, type_: str, name: str) -> None:
+        try:
+            info = zc.get_service_info(type_, name, timeout=3000)
+            if not info:
+                return
+            for addr in info.parsed_addresses():
+                entry = {
+                    "ip": addr,
+                    "service_type": type_.rstrip("."),
+                    "service_name": name,
+                    "hostname": info.server.rstrip(".") if info.server else None,
+                    "port": info.port,
+                    "properties": {
+                        (k.decode() if isinstance(k, bytes) else k): (
+                            v.decode("utf-8", errors="replace") if isinstance(v, bytes) else (v or "")
+                        )
+                        for k, v in (info.properties or {}).items()
+                    },
+                }
+                try:
+                    _mdns_queue.put_nowait(entry)
+                except queue.Full:
+                    pass
+        except Exception as exc:
+            log.debug("mdns_service_info_error", name=name, error=str(exc))
+
+    def remove_service(self, zc: Zeroconf, type_: str, name: str) -> None:
+        pass
+
+    def update_service(self, zc: Zeroconf, type_: str, name: str) -> None:
+        self.add_service(zc, type_, name)
+
+
+def start_mdns_discovery() -> threading.Thread:
+    """Start a background daemon thread that browses mDNS/DNS-SD services.
+
+    Creates a :class:`zeroconf.Zeroconf` instance and registers a
+    :class:`ServiceBrowser` for each service type in ``_MDNS_SERVICE_TYPES``.
+    The browser runs indefinitely; discovered service entries are pushed into
+    ``_mdns_queue`` and consumed by :func:`process_mdns_queue` during each
+    scan cycle.
+
+    Returns the :class:`threading.Thread` object (already started).
+    """
+    def _loop() -> None:
+        log.info("mdns_discovery_start", service_types=len(_MDNS_SERVICE_TYPES))
+        try:
+            zc = Zeroconf()
+            listener = _MdnsListener()
+            # Keep a reference to the browsers so they are not garbage-collected;
+            # each ServiceBrowser runs background threads that stay alive as long
+            # as the object is referenced.
+            _active_browsers = [ServiceBrowser(zc, stype, listener) for stype in _MDNS_SERVICE_TYPES]
+            while True:
+                time.sleep(60)
+        except Exception as exc:
+            log.error("mdns_discovery_error", error=str(exc))
+
+    t = threading.Thread(target=_loop, name="mdns-discovery", daemon=True)
+    t.start()
+    return t
+
+
+def process_mdns_queue() -> dict[str, dict]:
+    """Drain the mDNS queue and return per-IP enrichment data.
+
+    Returns a dict mapping IP address → enrichment dict with keys:
+
+    - ``mdns_services``: list of service entry dicts
+    - ``mdns_hostname``: the ``.local`` hostname from the first entry that
+      provides one
+    """
+    enrichment: dict[str, dict] = {}
+    while True:
+        try:
+            entry = _mdns_queue.get_nowait()
+        except queue.Empty:
+            break
+        ip = entry["ip"]
+        if ip not in enrichment:
+            enrichment[ip] = {"mdns_services": [], "mdns_hostname": None}
+        enrichment[ip]["mdns_services"].append(
+            {
+                "service_type": entry["service_type"],
+                "service_name": entry["service_name"],
+                "port": entry.get("port"),
+                "properties": entry.get("properties", {}),
+            }
+        )
+        if entry.get("hostname") and not enrichment[ip]["mdns_hostname"]:
+            enrichment[ip]["mdns_hostname"] = entry["hostname"]
+    return enrichment
+
+
+# ─── NetBIOS / NBNS discovery ────────────────────────────────────────────────
+
+def netbios_scan(network: str) -> dict[str, dict]:
+    """Run nmap's ``nbstat`` NSE script to collect NetBIOS names for a subnet.
+
+    Scans UDP port 137 across *network* and parses the ``nbstat`` script
+    output to extract each host's NetBIOS computer name and workgroup.
+    Returns a dict mapping IP address → ``{"netbios_name": ..., "workgroup": ...}``.
+    Falls back silently to an empty dict if nmap is unavailable or the scan
+    fails (e.g. the container lacks raw-socket access).
+    """
+    if not NETBIOS_ENABLED:
+        return {}
+
+    log.info("netbios_scan_start", network=network)
+    nm = nmap.PortScanner()
+    try:
+        nm.scan(
+            hosts=network,
+            arguments="-p 137 -sU --script nbstat.nse -T4 --host-timeout 5s",
+        )
+    except Exception as exc:
+        log.warning("netbios_scan_error", error=str(exc))
+        return {}
+
+    results: dict[str, dict] = {}
+    for ip in nm.all_hosts():
+        host = nm[ip]
+        for script in host.get("hostscript", []):
+            if script.get("id") != "nbstat":
+                continue
+            output = script.get("output", "")
+            name_match = re.search(r"NetBIOS name:\s*([^\s,]+)", output)
+            wg_match = re.search(r"(?:workgroup|domain):\s*([^\s,<]+)", output, re.IGNORECASE)
+            entry: dict = {}
+            if name_match:
+                entry["netbios_name"] = name_match.group(1)
+            if wg_match:
+                entry["workgroup"] = wg_match.group(1)
+            if entry:
+                results[ip] = entry
+
+    log.info("netbios_scan_done", network=network, found=len(results))
+    return results
+
+
+# ─── HTTP / HTTPS banner grabbing ────────────────────────────────────────────
+
+def http_banner(ip: str, port: int = 80, timeout: float = 3.0) -> str | None:
+    """Return the ``Server`` header value from an HTTP service, or ``None``.
+
+    Sends a minimal ``HEAD /`` request over a plain TCP socket so that the
+    probe works against any HTTP/1.x server regardless of hostname.  The
+    server banner (e.g. ``"Apache/2.4.54 (Debian)"``) is extracted from the
+    ``Server:`` response header.
+    """
+    try:
+        with socket.create_connection((ip, port), timeout=timeout) as sock:
+            sock.sendall(f"HEAD / HTTP/1.0\r\nHost: {ip}\r\n\r\n".encode())
+            response = b""
+            while True:
+                chunk = sock.recv(2048)
+                if not chunk:
+                    break
+                response += chunk
+                if b"\r\n\r\n" in response:
+                    break
+        for line in response.decode("utf-8", errors="replace").split("\r\n"):
+            if line.lower().startswith("server:"):
+                return line.split(":", 1)[1].strip()
+    except Exception:
+        pass
+    return None
+
+
+def tls_cert_info(ip: str, port: int = 443, timeout: float = 3.0) -> dict:
+    """Extract subject and SAN info from the TLS certificate at *ip*:*port*.
+
+    Establishes a TLS connection with hostname verification and certificate
+    chain validation **disabled** (``ssl.CERT_NONE``).  This is intentional:
+    the vast majority of home-network devices (NAS boxes, IP cameras, routers,
+    smart-home hubs) use self-signed certificates that would cause a verified
+    connection to fail.
+
+    **Security note**: Because the certificate is not verified, the data
+    returned reflects what the device *claims* rather than what a trusted CA
+    has vouched for.  The extracted fields are stored as discovery metadata
+    only and must not be used for authentication or access-control decisions.
+
+    Returns a dict that may contain:
+
+    - ``tls_cn``: certificate subject Common Name
+    - ``tls_org``: certificate subject Organisation
+    - ``tls_issuer_cn``: issuer Common Name
+    - ``tls_sans``: list of DNS Subject Alternative Names
+    """
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    # Explicitly require TLS 1.2 or above even though certificate verification
+    # is disabled.  This prevents negotiation of deprecated TLSv1/TLSv1.1
+    # ciphers that would be flagged as insecure.
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    try:
+        with socket.create_connection((ip, port), timeout=timeout) as raw:
+            with ctx.wrap_socket(raw, server_hostname=ip) as tls:
+                cert = tls.getpeercert()
+                if not cert:
+                    return {}
+                subject = dict(x[0] for x in cert.get("subject", []))
+                issuer = dict(x[0] for x in cert.get("issuer", []))
+                sans = [v for t, v in cert.get("subjectAltName", []) if t == "DNS"]
+                result: dict = {}
+                if subject.get("commonName"):
+                    result["tls_cn"] = subject["commonName"]
+                if subject.get("organizationName"):
+                    result["tls_org"] = subject["organizationName"]
+                if issuer.get("commonName"):
+                    result["tls_issuer_cn"] = issuer["commonName"]
+                if sans:
+                    result["tls_sans"] = sans
+                return result
+    except Exception:
+        pass
+    return {}
+
+
+def enrich_from_banners(ip: str, open_ports: list[dict]) -> dict:
+    """Grab HTTP server banners and TLS certificate info for *ip*.
+
+    Iterates over *open_ports* and:
+    - Calls :func:`http_banner` for any port with service ``http`` or common
+      HTTP port numbers (80, 8080, 8443).
+    - Calls :func:`tls_cert_info` for any port with service ``https`` or
+      common HTTPS port numbers (443, 8443).
+
+    Returns a (possibly empty) dict of banner/cert enrichment fields.
+    """
+    if not BANNER_GRAB_ENABLED or not open_ports:
+        return {}
+
+    result: dict = {}
+    http_ports = {p["port"] for p in open_ports if p.get("service") in ("http",) or p["port"] in (80, 8080)}
+    https_ports = {p["port"] for p in open_ports if p.get("service") in ("https", "ssl") or p["port"] in (443, 8443)}
+
+    for port in http_ports:
+        banner = http_banner(ip, port, timeout=BANNER_GRAB_TIMEOUT)
+        if banner:
+            result["http_server"] = banner
+            break  # first successful banner is sufficient
+
+    for port in https_ports:
+        cert = tls_cert_info(ip, port, timeout=BANNER_GRAB_TIMEOUT)
+        if cert:
+            result.update(cert)
+            if not result.get("http_server"):
+                banner = http_banner(ip, port, timeout=BANNER_GRAB_TIMEOUT)
+                if banner:
+                    result["http_server"] = banner
+            break
+
+    return result
 
 
 # ─── nmap port/OS scan ───────────────────────────────────────────────────────
@@ -466,21 +925,62 @@ def vendor_lookup(mac: str) -> str | None:
         return None
 
 
-def guess_device_type(vendor: str | None, open_ports: list[dict], os_guess: str | None) -> str:
-    """Heuristic device-type classifier."""
+def guess_device_type(vendor: str | None, open_ports: list[dict], os_guess: str | None, extra_info: dict | None = None) -> str:
+    """Heuristic device-type classifier.
+
+    Uses MAC vendor string, nmap OS fingerprint, open port set, mDNS service
+    types, and UPnP device type to produce a best-effort device category.
+    """
     vendor_l = (vendor or "").lower()
     os_l = (os_guess or "").lower()
     ports = {p["port"] for p in open_ports}
+    extra = extra_info or {}
 
+    # ── mDNS service-type hints (highest specificity) ─────────────────────────
+    for svc in extra.get("mdns_services", []):
+        stype = svc.get("service_type", "")
+        if "_googlecast._tcp" in stype or "_cast._tcp" in stype:
+            return "iot"
+        if "_airplay._tcp" in stype or "_raop._tcp" in stype or "_companion-link._tcp" in stype:
+            return "mobile"
+        if "_homekit._tcp" in stype or "_hap._tcp" in stype or "_matter._tcp" in stype:
+            return "iot"
+        if "_printer._tcp" in stype or "_ipp._tcp" in stype or "_ipps._tcp" in stype:
+            return "printer"
+        if "_workstation._tcp" in stype:
+            return "desktop"
+        if "_smb._tcp" in stype or "_afpovertcp._tcp" in stype:
+            return "desktop"
+
+    # ── UPnP device-type hints ────────────────────────────────────────────────
+    upnp_type = extra.get("upnp_device_type", "")
+    upnp_mfr = extra.get("upnp_manufacturer", "").lower()
+    if "InternetGatewayDevice" in upnp_type:
+        return "network_device"
+    if "MediaRenderer" in upnp_type or "MediaServer" in upnp_type:
+        return "iot"
+    if "printer" in upnp_type.lower():
+        return "printer"
+    if "WLANAccessPoint" in upnp_type or "WANDevice" in upnp_type:
+        return "network_device"
+    _iot_upnp_mfrs = {"tuya", "espressif", "shelly", "philips", "sonos", "ring", "nest", "ecobee"}
+    if any(v in upnp_mfr for v in _iot_upnp_mfrs):
+        return "iot"
+
+    # ── MAC vendor heuristics ─────────────────────────────────────────────────
     iot_vendors = {"tuya", "espressif", "shelly", "philips", "sonos", "ring", "nest", "ecobee", "tp-link"}
     if any(v in vendor_l for v in iot_vendors):
         return "iot"
+
+    # ── OS fingerprint heuristics ─────────────────────────────────────────────
     if "windows" in os_l:
         return "desktop"
     if "linux" in os_l and 22 in ports:
         return "server"
     if "android" in os_l or "apple" in vendor_l:
         return "mobile"
+
+    # ── Open-port heuristics ──────────────────────────────────────────────────
     if 9100 in ports or "print" in vendor_l:
         return "printer"
     if 80 in ports or 443 in ports or 8080 in ports:
@@ -501,8 +1001,8 @@ def upsert_device(conn, rdb, device: dict) -> bool:
                 """
                 INSERT INTO devices
                     (mac_address, ip_address, hostname, vendor, device_type, os_guess,
-                     open_ports, status, first_seen, last_seen)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,'new',NOW(),NOW())
+                     open_ports, extra_info, status, first_seen, last_seen)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'new',NOW(),NOW())
                 RETURNING id
                 """,
                 (
@@ -513,6 +1013,7 @@ def upsert_device(conn, rdb, device: dict) -> bool:
                     device.get("device_type", "unknown"),
                     device.get("os_guess"),
                     json.dumps(device.get("open_ports", [])),
+                    json.dumps(device.get("extra_info", {})),
                 ),
             )
             device_id = cur.fetchone()["id"]
@@ -540,7 +1041,7 @@ def upsert_device(conn, rdb, device: dict) -> bool:
                 """
                 UPDATE devices
                 SET ip_address=%s, hostname=%s, vendor=%s, device_type=%s,
-                    os_guess=%s, open_ports=%s, last_seen=NOW()
+                    os_guess=%s, open_ports=%s, extra_info=%s, last_seen=NOW()
                 WHERE mac_address=%s
                 """,
                 (
@@ -550,6 +1051,7 @@ def upsert_device(conn, rdb, device: dict) -> bool:
                     device.get("device_type", "unknown"),
                     device.get("os_guess"),
                     json.dumps(device.get("open_ports", [])),
+                    json.dumps(device.get("extra_info", {})),
                     device["mac"],
                 ),
             )
@@ -563,6 +1065,13 @@ def run_scan():
     log.info("scan_cycle_start", networks=NETWORK_RANGES)
     conn = get_db()
     rdb = get_redis()
+
+    # ── Cycle-level enrichment passes (run once per scan, not per host) ───────
+    # SSDP/UPnP — send M-SEARCH multicast and fetch device descriptions.
+    ssdp_data: dict[str, dict] = ssdp_discover(timeout=SSDP_TIMEOUT) if SSDP_ENABLED else {}
+
+    # mDNS — drain whatever announcements arrived since the last scan.
+    mdns_data: dict[str, dict] = process_mdns_queue() if MDNS_ENABLED else {}
 
     for network in NETWORK_RANGES:
         # Record scan start
@@ -621,6 +1130,16 @@ def run_scan():
         else:
             log.info("arp_sweep_empty", network=network, note="continuing with layer3 results only")
 
+        # ── Step 4: SSDP/UPnP — add any IPs only found via SSDP ─────────────
+        for ip, ssdp_entry in ssdp_data.items():
+            if ip not in host_by_ip:
+                host: dict = {"ip": ip}
+                hosts.append(host)
+                host_by_ip[ip] = host
+
+        # ── Step 5: NetBIOS/NBNS subnet scan ─────────────────────────────────
+        netbios_data: dict[str, dict] = netbios_scan(network) if NETBIOS_ENABLED else {}
+
         new_count = 0
 
         for host in hosts:
@@ -640,13 +1159,50 @@ def run_scan():
                         mac=host["mac"],
                         reason="arp_unavailable",
                     )
-            # Enrich
+
+            # ── Per-host enrichment ───────────────────────────────────────────
+            # Build the extra_info dict from all enrichment sources.
+            extra_info: dict = host.get("extra_info") or {}
+
+            # Merge SSDP/UPnP data for this host's IP.
+            if host["ip"] in ssdp_data:
+                extra_info.update(ssdp_data[host["ip"]])
+
+            # Merge mDNS data for this host's IP.
+            if host["ip"] in mdns_data:
+                mdns_entry = mdns_data[host["ip"]]
+                extra_info["mdns_services"] = mdns_entry.get("mdns_services", [])
+                # Prefer mDNS .local hostname over reverse-DNS if not already set.
+                if mdns_entry.get("mdns_hostname") and not host.get("hostname"):
+                    host["hostname"] = mdns_entry["mdns_hostname"]
+                    extra_info["mdns_hostname"] = mdns_entry["mdns_hostname"]
+
+            # Merge NetBIOS data for this host's IP.
+            if host["ip"] in netbios_data:
+                nb_entry = netbios_data[host["ip"]]
+                extra_info.update(nb_entry)
+                # Use NetBIOS name as hostname if nothing better is available.
+                if nb_entry.get("netbios_name") and not host.get("hostname"):
+                    host["hostname"] = nb_entry["netbios_name"]
+
             host["hostname"] = host.get("hostname") or resolve_hostname(host["ip"])
             host["vendor"] = host.get("vendor") or vendor_lookup(host["mac"])
+
+            # nmap port/OS scan
             scan_data = nmap_scan(host["ip"])
             host.update(scan_data)
+
+            # HTTP/HTTPS banner grabbing
+            banner_data = enrich_from_banners(host["ip"], host.get("open_ports", []))
+            if banner_data:
+                extra_info.update(banner_data)
+                # TLS cert CN can serve as a more accurate hostname.
+                if banner_data.get("tls_cn") and not host.get("hostname"):
+                    host["hostname"] = banner_data["tls_cn"]
+
+            host["extra_info"] = extra_info
             host["device_type"] = guess_device_type(
-                host.get("vendor"), host.get("open_ports", []), host.get("os_guess")
+                host.get("vendor"), host.get("open_ports", []), host.get("os_guess"), extra_info
             )
 
             is_new = upsert_device(conn, rdb, host)
@@ -684,6 +1240,12 @@ def main():
         start_dns_sniffer()
     else:
         log.info("dns_sniffer_disabled")
+
+    # Start the background mDNS/Zeroconf service browser.
+    if MDNS_ENABLED:
+        start_mdns_discovery()
+    else:
+        log.info("mdns_discovery_disabled")
 
     # Run once immediately, then on schedule
     run_scan()
