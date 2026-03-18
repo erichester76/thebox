@@ -32,9 +32,11 @@ CREATE TABLE IF NOT EXISTS devices (
 );
 
 -- IoT allow-list
+-- device_id is nullable: NULL marks a globally-shared entry that applies to
+-- all IoT devices; a non-NULL value ties the FQDN to a specific device.
 CREATE TABLE IF NOT EXISTS iot_allowlist (
     id          SERIAL PRIMARY KEY,
-    device_id   INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+    device_id   INTEGER REFERENCES devices(id) ON DELETE CASCADE,
     fqdn        VARCHAR(255) NOT NULL,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     UNIQUE(device_id, fqdn)

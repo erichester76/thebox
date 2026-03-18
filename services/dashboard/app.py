@@ -92,13 +92,26 @@ def ensure_schema():
             extra_info      JSONB DEFAULT '{}',
             owner_id        INTEGER REFERENCES users(id) ON DELETE SET NULL
         )""",
-        # iot_allowlist — dashboard manages per-device IoT FQDN allow-lists
+        # iot_allowlist — FQDNs that IoT devices are permitted to reach.
+        # device_id is nullable: NULL marks a globally-shared entry added by
+        # the learning engine; a non-NULL value ties the FQDN to a specific device.
         """CREATE TABLE IF NOT EXISTS iot_allowlist (
             id          SERIAL PRIMARY KEY,
-            device_id   INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+            device_id   INTEGER REFERENCES devices(id) ON DELETE CASCADE,
             fqdn        VARCHAR(255) NOT NULL,
             created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             UNIQUE(device_id, fqdn)
+        )""",
+        # iot_learning_sessions — tracks the 48-hour observation window for each
+        # newly discovered or user-assigned IoT device.
+        """CREATE TABLE IF NOT EXISTS iot_learning_sessions (
+            id                    SERIAL PRIMARY KEY,
+            device_id             INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+            pihole_group_name     VARCHAR(64) NOT NULL,
+            learning_started_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            learning_completed_at TIMESTAMPTZ,
+            status                VARCHAR(32) NOT NULL DEFAULT 'active',
+            UNIQUE(device_id)
         )""",
         # groups — dashboard manages Pi-hole groups
         """CREATE TABLE IF NOT EXISTS groups (
@@ -158,6 +171,16 @@ def ensure_schema():
         "CREATE INDEX IF NOT EXISTS idx_honeypot_created    ON honeypot_events(created_at)",
         "CREATE INDEX IF NOT EXISTS idx_user_groups_group   ON user_groups(group_id)",
         "CREATE INDEX IF NOT EXISTS idx_device_groups_group ON device_groups(group_id)",
+        "CREATE INDEX IF NOT EXISTS idx_iot_learning_status  ON iot_learning_sessions(status)",
+        "CREATE INDEX IF NOT EXISTS idx_iot_learning_started ON iot_learning_sessions(learning_started_at)",
+        # Partial unique index for globally-shared allow-list entries (device_id IS NULL).
+        """CREATE UNIQUE INDEX IF NOT EXISTS idx_iot_allowlist_global_fqdn
+            ON iot_allowlist(fqdn) WHERE device_id IS NULL""",
+        # Upgrade safety: allow NULL device_id on installs created before migration 0002.
+        # In PostgreSQL, DROP NOT NULL on an already-nullable column is a no-op,
+        # so this statement is safe to execute on both old (NOT NULL) and new (nullable)
+        # schemas without needing additional conditional logic.
+        "ALTER TABLE iot_allowlist ALTER COLUMN device_id DROP NOT NULL",
         # Migration: add new honeypot columns to existing deployments
         "ALTER TABLE honeypot_events ADD COLUMN IF NOT EXISTS interaction_level VARCHAR(16) NOT NULL DEFAULT 'none'",
         "ALTER TABLE honeypot_events ADD COLUMN IF NOT EXISTS intent VARCHAR(32) NOT NULL DEFAULT 'scan'",
@@ -269,9 +292,14 @@ def api_device(device_id: int):
 
 @app.route("/api/devices/<int:device_id>/status", methods=["PUT"])
 def api_set_device_status(device_id: int):
-    """Allow the UI to trust / quarantine / block a device.
+    """Allow the UI to trust / quarantine / block / promote-to-IoT a device.
 
-    Devices leaving quarantine must be assigned as IoT or have an owner assigned.
+    When a device is set to ``iot`` for the *first time* (no prior learning
+    session exists) the status is changed to ``iot_learning`` instead and an
+    ``iot_learning_start_requested`` event is published so the discovery
+    service can create the Pi-hole learning group and record the session.
+
+    Devices that have already completed learning are moved to ``iot`` directly.
     """
     body = request.get_json(force=True)
     new_status = body.get("status")
@@ -280,15 +308,52 @@ def api_set_device_status(device_id: int):
 
     conn = get_db()
 
+    # Fetch the device in one query — needed for owner check, IP, and MAC.
+    rows = rows_to_list(
+        conn,
+        "SELECT id, owner_id, status, ip_address, mac_address FROM devices WHERE id=%s",
+        (device_id,),
+    )
+    if not rows:
+        conn.close()
+        return jsonify({"error": "not found"}), 404
+    device = rows[0]
+
     # Enforce: devices can only become 'trusted' when they have an owner assigned
-    if new_status == "trusted":
-        rows = rows_to_list(conn, "SELECT owner_id, status FROM devices WHERE id=%s", (device_id,))
-        if not rows:
+    if new_status == "trusted" and device["owner_id"] is None:
+        conn.close()
+        return jsonify({"error": "device must be assigned to a user before it can be trusted"}), 422
+
+    # ── IoT first-time promotion: start learning period instead ──────────────
+    if new_status == "iot":
+        session_rows = rows_to_list(
+            conn,
+            "SELECT id FROM iot_learning_sessions WHERE device_id=%s",
+            (device_id,),
+        )
+        if not session_rows:
+            # No prior learning session — set status to iot_learning immediately
+            # and let the discovery service handle Pi-hole setup asynchronously.
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE devices SET status='iot_learning' WHERE id=%s",
+                    (device_id,),
+                )
+            conn.commit()
             conn.close()
-            return jsonify({"error": "not found"}), 404
-        if rows[0]["owner_id"] is None:
-            conn.close()
-            return jsonify({"error": "device must be assigned to a user before it can be trusted"}), 422
+
+            rdb = get_redis()
+            rdb.publish(
+                "thebox:events",
+                json.dumps({
+                    "type": "iot_learning_start_requested",
+                    "device_id": device_id,
+                    "ip": device["ip_address"],
+                    "mac": device["mac_address"],
+                }),
+            )
+            return jsonify({"ok": True, "learning": True})
+        # else: device already has/had a learning session — apply iot directly
 
     with conn.cursor() as cur:
         cur.execute("UPDATE devices SET status=%s WHERE id=%s RETURNING id", (new_status, device_id))
@@ -667,6 +732,28 @@ def api_honeypot():
     return Response(json.dumps(rows, default=serialize), mimetype="application/json")
 
 
+# --- IoT allow-list plaintext feed ---
+
+@app.route("/iot-allowlist.txt")
+def iot_allowlist_txt():
+    """Serve the IoT allow-list as plain text — one FQDN per line.
+
+    Pi-hole should be configured to fetch this URL as an ``allow`` type adlist
+    for the IoT group.  The list contains every FQDN stored in the
+    ``iot_allowlist`` table (both globally-shared entries with ``device_id IS
+    NULL`` and any per-device entries added manually), deduplicated and sorted
+    alphabetically so Pi-hole's gravity update sees a stable, diff-friendly file.
+
+    The endpoint requires no authentication because Pi-hole must be able to
+    fetch it internally without credentials.  It is not reachable from outside
+    the ``thebox_internal`` Docker network.
+    """
+    conn = get_db()
+    rows = rows_to_list(conn, "SELECT DISTINCT fqdn FROM iot_allowlist ORDER BY fqdn")
+    conn.close()
+    text = "\n".join(r["fqdn"] for r in rows)
+    return Response(text, mimetype="text/plain")
+  
 @app.route("/api/honeypot/<int:event_id>")
 def api_honeypot_event(event_id: int):
     conn = get_db()
