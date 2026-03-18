@@ -403,7 +403,8 @@ def pihole_ensure_group(sid: str, name: str, comment: str = "") -> int | None:
         "POST", "/groups", sid,
         json={"name": name, "comment": comment, "enabled": True},
     )
-    gid = (data.get("group") or {}).get("id")
+    groups = data.get("groups") or []
+    gid = groups[0].get("id") if groups else None
     if gid is None:
         log.warning("pihole_group_create_failed", name=name)
     else:
@@ -421,18 +422,18 @@ def pihole_assign_client_to_groups(sid: str, client_ip: str, group_ids: list[int
     """Assign a Pi-hole client (by IP address) to a set of groups.
 
     Tries to update an existing client first; creates a new client record if
-    the update returns no ``client`` key (which Pi-hole does for unknown IPs).
+    the update returns no ``clients`` key (which Pi-hole does for unknown IPs).
     Returns True when the assignment succeeded.
     """
     body = {"groups": group_ids, "comment": "IoT device managed by TheBox"}
     data = _pihole_request("PUT", f"/clients/{client_ip}", sid, json=body)
-    if "client" in data:
+    if "clients" in data:
         return True
 
     # Client doesn't exist yet — create it
     create_body = {"client": client_ip, "comment": "IoT device managed by TheBox", "groups": group_ids}
     data = _pihole_request("POST", "/clients", sid, json=create_body)
-    if "client" not in data:
+    if "clients" not in data:
         log.warning("pihole_client_assign_failed", ip=client_ip, groups=group_ids)
         return False
     return True
@@ -483,7 +484,7 @@ def pihole_add_domain_to_allowlist(sid: str, domain: str, group_ids: list[int]) 
     """
     body = {"domain": domain, "comment": "IoT learned domain", "groups": group_ids, "enabled": True}
     data = _pihole_request("POST", "/domains/allow/exact", sid, json=body)
-    return "domain" in data
+    return "domains" in data
 
 
 def pihole_register_iot_allowlist(sid: str, url: str, group_ids: list[int]) -> bool:
@@ -509,7 +510,7 @@ def pihole_register_iot_allowlist(sid: str, url: str, group_ids: list[int]) -> b
             "PUT", f"/lists/{existing_id}", sid,
             json={"groups": group_ids, "enabled": True},
         )
-        ok = "list" in result
+        ok = "lists" in result
     else:
         result = _pihole_request(
             "POST", "/lists", sid,
@@ -521,7 +522,7 @@ def pihole_register_iot_allowlist(sid: str, url: str, group_ids: list[int]) -> b
                 "groups": group_ids,
             },
         )
-        ok = "list" in result
+        ok = "lists" in result
 
     if ok:
         log.info("pihole_iot_allowlist_registered", url=url, groups=group_ids)
