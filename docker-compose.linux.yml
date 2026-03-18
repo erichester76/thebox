@@ -1,8 +1,8 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # docker-compose.linux.yml — Linux overlay for TheBox
 # ─────────────────────────────────────────────────────────────────────────────
-# On Linux, the discovery, guardian, and honeypot services gain full
-# capabilities by running with network_mode: host:
+# On Linux, the discovery, guardian, honeypot, and redirector services gain
+# full capabilities by running with network_mode: host:
 #
 #   • discovery  — ARP sweeps can reach the physical LAN segment (raw socket
 #                  access to the host's network interfaces via Scapy/nmap).
@@ -12,10 +12,18 @@
 #   • honeypot   — ports are bound directly on the host interface so any
 #                  device on the LAN can reach them without Docker port-
 #                  forwarding overhead.
+#   • redirector — ARP spoofing and iptables rules operate on the physical
+#                  host network stack.
 #
-# Docker's embedded DNS (127.0.0.11) is still available to host-mode
-# containers, so service-name hostnames (postgres, redis) continue to
-# resolve correctly.
+# IMPORTANT: host-mode containers bypass Docker's virtual network entirely.
+# Docker's embedded DNS (127.0.0.11) is NOT accessible to host-mode
+# containers, so service-name hostnames (postgres, redis, pihole) cannot
+# be resolved via Docker DNS.  To work around this:
+#
+#   • postgres and redis are bound to 127.0.0.1 on the host so that
+#     host-mode containers can reach them via localhost.
+#   • DATABASE_URL, REDIS_URL, and PIHOLE_URL are overridden here to
+#     use 127.0.0.1 / localhost instead of container-name hostnames.
 #
 # Usage:
 #   docker compose -f docker-compose.yml -f docker-compose.linux.yml up -d
@@ -24,15 +32,41 @@
 # when it detects Linux.
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Shared environment overrides for all host-mode services: resolve postgres
+# and redis via 127.0.0.1 since Docker DNS is unavailable in host network mode.
+x-host-db-env: &host-db-env
+  DATABASE_URL: postgresql://${POSTGRES_USER:-thebox}:${POSTGRES_PASSWORD:-thebox_secret}@127.0.0.1:5432/${POSTGRES_DB:-thebox}
+  REDIS_URL: redis://127.0.0.1:6379/0
+
 services:
+  # Expose postgres and redis on the host's loopback interface so that
+  # host-mode containers (discovery, guardian, honeypot, redirector) can
+  # reach them via 127.0.0.1 without relying on Docker's bridge DNS.
+  postgres:
+    ports:
+      - "127.0.0.1:5432:5432"
+
+  redis:
+    ports:
+      - "127.0.0.1:6379:6379"
+
   discovery:
     network_mode: host
+    environment:
+      <<: *host-db-env
+      PIHOLE_URL: http://127.0.0.1:${PIHOLE_WEB_PORT:-8080}
 
   guardian:
     network_mode: host
+    environment:
+      <<: *host-db-env
 
   honeypot:
     network_mode: host
+    environment:
+      <<: *host-db-env
 
   redirector:
     network_mode: host
+    environment:
+      <<: *host-db-env

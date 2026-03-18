@@ -15,7 +15,7 @@ services:
       - ./config/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     networks:
       - thebox_internal
-      - default   # also on default so host-mode services can reach it by name
+      - default   # also on default so bridge-networked services (discovery, guardian, etc.) can reach it by name
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-thebox}"]
       interval: 10s
@@ -32,7 +32,7 @@ services:
       - ./config/redis/redis.conf:/etc/redis/redis.conf:ro
     networks:
       - thebox_internal
-      - default   # also on default so host-mode services can reach it by name
+      - default   # also on default so bridge-networked services (discovery, guardian, etc.) can reach it by name
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -68,11 +68,12 @@ services:
       - 1.1.1.1
 
   # ─── Network Discovery Service ──────────────────────────────────────────────
-  # No explicit networks: — uses the default project network, which postgres
-  # and redis are also joined to.  This allows the service to run on macOS
-  # Docker Desktop without network_mode: host.
+  # No explicit networks: — uses the default project network on macOS/default,
+  # allowing the service to reach postgres and redis by container name.
   # On Linux, docker-compose.linux.yml overrides this with network_mode: host
-  # for full ARP scanning of the physical LAN.
+  # for full ARP scanning of the physical LAN; the DATABASE_URL and REDIS_URL
+  # are also overridden there to use 127.0.0.1 (localhost) instead of
+  # container-name hostnames, which are unreachable from host-mode containers.
   discovery:
     build:
       context: ./services/discovery
@@ -101,9 +102,10 @@ services:
         condition: service_healthy
 
   # ─── Device Guardian (Quarantine + IoT Manager) ─────────────────────────────
-  # No explicit networks: — uses the default project network.
+  # No explicit networks: — uses the default project network on macOS/default.
   # On Linux, docker-compose.linux.yml overrides with network_mode: host for
-  # full iptables/ipset enforcement on the physical LAN.
+  # full iptables/ipset enforcement on the physical LAN; DATABASE_URL and
+  # REDIS_URL are overridden there to use 127.0.0.1.
   guardian:
     build:
       context: ./services/guardian
@@ -129,8 +131,9 @@ services:
         condition: service_started
 
   # ─── Honeypot Service ────────────────────────────────────────────────────────
-  # No explicit networks: — uses the default project network.
-  # On Linux, docker-compose.linux.yml overrides with network_mode: host.
+  # No explicit networks: — uses the default project network on macOS/default.
+  # On Linux, docker-compose.linux.yml overrides with network_mode: host;
+  # DATABASE_URL and REDIS_URL are also overridden there to use 127.0.0.1.
   # On macOS, docker-compose.macos.yml adds explicit port mappings and network
   # membership so the honeypot ports are reachable from the Mac host.
   honeypot:
@@ -155,7 +158,8 @@ services:
   # Redirects DNS and DHCP traffic to Pi-hole using increasingly intrusive
   # methods and enforces per-device quarantine via ARP spoofing.
   # On Linux, docker-compose.linux.yml overrides this with network_mode: host
-  # for full ARP/iptables access to the physical LAN.
+  # for full ARP/iptables access to the physical LAN; DATABASE_URL and
+  # REDIS_URL are also overridden there to use 127.0.0.1.
   redirector:
     build:
       context: ./services/redirector
