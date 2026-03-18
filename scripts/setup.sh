@@ -34,17 +34,10 @@ done
 
 # ── macOS-specific prerequisite hint ────────────────────────────────────────
 if [ "$OS" = "Darwin" ]; then
-  echo "  ℹ  macOS detected — checking Docker Desktop host networking."
-  echo "     TheBox uses network_mode: host so that the discovery, guardian,"
-  echo "     and honeypot services can access the Mac's network interfaces."
-  echo "     This requires Docker Desktop ≥ 4.29 with 'Enable host networking'"
-  echo "     turned on:"
-  echo "       Docker Desktop → Settings → Resources → Network"
-  echo "       → Enable 'Enable host networking' → Apply & Restart"
-  echo
-  echo "     If host networking is not enabled, start with the base compose"
-  echo "     file only (bridge networking, limited scanning capability):"
-  echo "       docker compose up -d"
+  echo "  ℹ  macOS detected — using bridge networking with port mappings."
+  echo "     The macOS overlay keeps all services on Docker's bridge network"
+  echo "     so that container name resolution (postgres, redis) works correctly."
+  echo "     No special Docker Desktop settings are required."
   echo
 fi
 
@@ -96,9 +89,9 @@ fi
 # On Linux, overlay docker-compose.linux.yml which adds network_mode: host to
 # discovery, guardian, and honeypot for full ARP scanning and iptables
 # enforcement on the physical LAN.
-# On macOS, overlay docker-compose.macos.yml which adds network_mode: host to
-# discovery, guardian, and honeypot — requires Docker Desktop ≥ 4.29 with
-# "Enable host networking" turned on (Settings → Resources → Network).
+# On macOS, overlay docker-compose.macos.yml which keeps services on the
+# default bridge network (so Docker DNS resolves postgres/redis correctly)
+# and exposes honeypot ports via explicit port mappings.
 if [ "$OS" = "Darwin" ] && [ -f "$REPO_DIR/docker-compose.macos.yml" ]; then
   COMPOSE_FILES="-f $REPO_DIR/docker-compose.yml -f $REPO_DIR/docker-compose.macos.yml"
 elif [ "$OS" = "Linux" ] && [ -f "$REPO_DIR/docker-compose.linux.yml" ]; then

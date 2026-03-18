@@ -1,16 +1,12 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # docker-compose.macos.yml — macOS (Docker Desktop) overlay for TheBox
 # ─────────────────────────────────────────────────────────────────────────────
-# Docker Desktop ≥ 4.29 supports network_mode: host on macOS via the
-# "Enable host networking" setting.  When enabled, containers share the
-# Docker Desktop Linux VM's host network namespace, binding ports directly
-# on the Mac host's interfaces — no explicit port mappings needed.
-#
-# Before running TheBox on macOS you must enable host networking in Docker
-# Desktop:
-#   1. Open Docker Desktop → Settings (⚙) → Resources → Network
-#   2. Enable "Enable host networking"
-#   3. Click "Apply & Restart"
+# On macOS, Docker Desktop's network_mode: host does not expose Docker's
+# embedded DNS (127.0.0.11) to host-mode containers, so service-name
+# hostnames such as "postgres" and "redis" cannot be resolved.  To avoid
+# this, the macOS overlay keeps all services on the default bridge network
+# (where Docker DNS works correctly) and exposes the honeypot ports via
+# explicit port mappings instead.
 #
 # Usage:
 #   docker compose -f docker-compose.yml -f docker-compose.macos.yml up -d
@@ -18,23 +14,33 @@
 # The setup script (scripts/setup.sh) applies this overlay automatically
 # when it detects macOS.
 #
-# ⚠  Limitations on macOS even with host networking enabled:
-#    • ARP sweeps (discovery): the "host" is the Docker Desktop Linux VM,
-#      not the Mac's physical interface.  ARP packets may not reach LAN
-#      devices depending on the VM's network attachment.  Discovery will
-#      start without errors but scanning real LAN hosts may be limited.
+# ⚠  Limitations on macOS:
+#    • ARP sweeps (discovery): the Docker Desktop Linux VM's network
+#      namespace is used, not the Mac's physical interface.  ARP packets
+#      may not reach LAN devices depending on the VM's network attachment.
+#      Discovery will start without errors but scanning real LAN hosts may
+#      be limited.
 #    • iptables/ipset (guardian): these are Linux kernel features that
 #      apply to the Linux VM's network stack, not the Mac host.  Guardian
 #      starts and manages database state normally, but rules will not
 #      enforce quarantine on physical LAN devices.
+#
+# For full network enforcement capabilities, run TheBox on a dedicated
+# Linux host (Raspberry Pi, mini-PC, VM, etc.) on your LAN.
 # ─────────────────────────────────────────────────────────────────────────────
 
 services:
-  discovery:
-    network_mode: host
-
-  guardian:
-    network_mode: host
-
   honeypot:
-    network_mode: host
+    ports:
+      - "21:21"
+      - "22:22"
+      - "23:23"
+      - "25:25"
+      - "80:80"
+      - "110:110"
+      - "143:143"
+      - "443:443"
+      - "445:445"
+      - "3306:3306"
+      - "3389:3389"
+      - "8080:8080"
