@@ -23,7 +23,7 @@ import queue
 import socket
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import nmap
 import psycopg2
@@ -45,6 +45,10 @@ LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 # Pi-hole integration
 PIHOLE_URL = os.environ.get("PIHOLE_URL", "").rstrip("/")
 PIHOLE_PASSWORD = os.environ.get("PIHOLE_PASSWORD", "")
+
+# IoT learning period
+IOT_LEARNING_HOURS = int(os.environ.get("IOT_LEARNING_HOURS", "48"))
+PIHOLE_IOT_GROUP = os.environ.get("PIHOLE_IOT_GROUP", "iot")
 
 # DNS packet sniffing
 DNS_SNIFF_ENABLED = os.environ.get("DNS_SNIFF_ENABLED", "true").lower() == "true"
@@ -79,8 +83,8 @@ def ensure_schema():
     """Create tables this service reads from or writes to.
 
     Scoped to: ``users`` (FK dependency for devices), ``devices``,
-    ``scan_runs``.  All DDL uses ``IF NOT EXISTS`` so this is safe to call
-    on every startup.
+    ``scan_runs``, ``iot_allowlist``, ``iot_learning_sessions``.
+    All DDL uses ``IF NOT EXISTS`` so this is safe to call on every startup.
     """
     statements = [
         # users — FK dependency for devices.owner_id
@@ -119,9 +123,36 @@ def ensure_schema():
             new_devices     INTEGER NOT NULL DEFAULT 0,
             status          VARCHAR(32) NOT NULL DEFAULT 'running'
         )""",
-        "CREATE INDEX IF NOT EXISTS idx_devices_mac    ON devices(mac_address)",
-        "CREATE INDEX IF NOT EXISTS idx_devices_ip     ON devices(ip_address)",
-        "CREATE INDEX IF NOT EXISTS idx_devices_status ON devices(status)",
+        # iot_allowlist — FQDNs permitted for IoT devices.
+        # device_id is nullable: NULL means the entry is global (shared across
+        # all IoT devices); a non-NULL value ties the entry to a specific device.
+        """CREATE TABLE IF NOT EXISTS iot_allowlist (
+            id          SERIAL PRIMARY KEY,
+            device_id   INTEGER REFERENCES devices(id) ON DELETE CASCADE,
+            fqdn        VARCHAR(255) NOT NULL,
+            created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE(device_id, fqdn)
+        )""",
+        # iot_learning_sessions — tracks the 48-hour observation window for
+        # each newly-discovered IoT device.
+        """CREATE TABLE IF NOT EXISTS iot_learning_sessions (
+            id                    SERIAL PRIMARY KEY,
+            device_id             INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+            pihole_group_name     VARCHAR(64) NOT NULL,
+            learning_started_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            learning_completed_at TIMESTAMPTZ,
+            status                VARCHAR(32) NOT NULL DEFAULT 'active',
+            UNIQUE(device_id)
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_devices_mac        ON devices(mac_address)",
+        "CREATE INDEX IF NOT EXISTS idx_devices_ip         ON devices(ip_address)",
+        "CREATE INDEX IF NOT EXISTS idx_devices_status     ON devices(status)",
+        "CREATE INDEX IF NOT EXISTS idx_iot_learning_status  ON iot_learning_sessions(status)",
+        "CREATE INDEX IF NOT EXISTS idx_iot_learning_started ON iot_learning_sessions(learning_started_at)",
+        # Partial unique index: only one global entry (device_id IS NULL) per FQDN.
+        # The UNIQUE(device_id, fqdn) constraint above allows multiple NULLs.
+        """CREATE UNIQUE INDEX IF NOT EXISTS idx_iot_allowlist_global_fqdn
+            ON iot_allowlist(fqdn) WHERE device_id IS NULL""",
     ]
     conn = get_db()
     try:
@@ -295,6 +326,348 @@ def query_pihole_clients() -> list[dict]:
 
     log.info("pihole_clients_fetched", count=len(clients))
     return clients
+
+
+# ─── Pi-hole group / client / domain management ──────────────────────────────
+
+def _pihole_request(method: str, path: str, sid: str, **kwargs) -> dict:
+    """Make an authenticated request to the Pi-hole v6 API.
+
+    Returns the parsed JSON response body on success, or an empty dict on
+    any error (network failure, non-2xx status, etc.).  All errors are logged
+    at WARNING level so callers can react without crashing.
+    """
+    url = f"{PIHOLE_URL}/api{path}"
+    params = dict(kwargs.pop("params", {}))
+    params["sid"] = sid
+    try:
+        resp = requests.request(method, url, params=params, timeout=10, **kwargs)
+        resp.raise_for_status()
+        return resp.json() if resp.content else {}
+    except Exception as exc:
+        log.warning("pihole_api_error", method=method, path=path, error=str(exc))
+        return {}
+
+
+def _pihole_get_group_id(sid: str, name: str) -> int | None:
+    """Return the Pi-hole group ID for *name*, or None if the group doesn't exist."""
+    data = _pihole_request("GET", "/groups", sid)
+    for group in data.get("groups", []):
+        if group.get("name") == name:
+            return group.get("id")
+    return None
+
+
+def pihole_ensure_group(sid: str, name: str, comment: str = "") -> int | None:
+    """Ensure a Pi-hole group named *name* exists, creating it when absent.
+
+    Returns the integer group ID on success, or None on failure.
+    """
+    gid = _pihole_get_group_id(sid, name)
+    if gid is not None:
+        return gid
+
+    data = _pihole_request(
+        "POST", "/groups", sid,
+        json={"name": name, "comment": comment, "enabled": True},
+    )
+    gid = (data.get("group") or {}).get("id")
+    if gid is None:
+        log.warning("pihole_group_create_failed", name=name)
+    else:
+        log.info("pihole_group_created", name=name, id=gid)
+    return gid
+
+
+def pihole_delete_group(sid: str, name: str) -> None:
+    """Delete a Pi-hole group by name (best-effort; errors are logged only)."""
+    _pihole_request("DELETE", f"/groups/{name}", sid)
+    log.info("pihole_group_deleted", name=name)
+
+
+def pihole_assign_client_to_groups(sid: str, client_ip: str, group_ids: list[int]) -> bool:
+    """Assign a Pi-hole client (by IP address) to a set of groups.
+
+    Tries to update an existing client first; creates a new client record if
+    the update returns no ``client`` key (which Pi-hole does for unknown IPs).
+    Returns True when the assignment succeeded.
+    """
+    body = {"groups": group_ids, "comment": "IoT device managed by TheBox"}
+    data = _pihole_request("PUT", f"/clients/{client_ip}", sid, json=body)
+    if "client" in data:
+        return True
+
+    # Client doesn't exist yet — create it
+    create_body = {"client": client_ip, "comment": "IoT device managed by TheBox", "groups": group_ids}
+    data = _pihole_request("POST", "/clients", sid, json=create_body)
+    if "client" not in data:
+        log.warning("pihole_client_assign_failed", ip=client_ip, groups=group_ids)
+        return False
+    return True
+
+
+def pihole_get_queries_for_client(
+    sid: str, client_ip: str, from_ts: float, until_ts: float
+) -> list[str]:
+    """Return all unique DNS query domains recorded for *client_ip* in the given time window.
+
+    Iterates through paginated results using the ``cursor`` field returned by
+    the Pi-hole v6 queries API.  Stops when Pi-hole returns an empty page or
+    no cursor.
+    """
+    domains: set[str] = set()
+    cursor: str | None = None
+
+    while True:
+        params: dict = {
+            "client": client_ip,
+            "from": int(from_ts),
+            "until": int(until_ts),
+            "length": 1000,
+        }
+        if cursor:
+            params["cursor"] = cursor
+
+        data = _pihole_request("GET", "/queries", sid, params=params)
+        page = data.get("queries", [])
+        for q in page:
+            domain = q.get("domain")
+            if domain:
+                domains.add(domain)
+
+        cursor = data.get("cursor")
+        if not cursor or not page:
+            break
+
+    log.info("pihole_queries_fetched", client=client_ip, count=len(domains))
+    return list(domains)
+
+
+def pihole_add_domain_to_allowlist(sid: str, domain: str, group_ids: list[int]) -> bool:
+    """Add *domain* to the Pi-hole exact allow-list and assign it to *group_ids*.
+
+    If the domain already exists on the allow-list the call is a no-op
+    (Pi-hole returns the existing entry).  Returns True on success.
+    """
+    body = {"domain": domain, "comment": "IoT learned domain", "groups": group_ids, "enabled": True}
+    data = _pihole_request("POST", "/domains/allow/exact", sid, json=body)
+    return "domain" in data
+
+
+# ─── IoT learning session management ────────────────────────────────────────
+
+def start_iot_learning(conn, rdb, device_id: int, ip: str) -> bool:
+    """Begin the 48-hour learning period for a newly discovered IoT device.
+
+    Steps:
+    1. Create an ``iot_<ip>_learning`` group in Pi-hole.
+    2. Register the device's IP as a Pi-hole client assigned to that group.
+    3. Record the session in ``iot_learning_sessions``.
+    4. Update the device status to ``iot_learning``.
+    5. Publish an ``iot_learning_started`` event on Redis.
+
+    When Pi-hole is not configured the function skips steps 1–2 but still
+    updates the DB so the device is marked as ``iot_learning`` and the
+    periodic completion check will collect Pi-hole queries once Pi-hole
+    becomes available.
+
+    Returns True when the learning session was successfully recorded.
+    """
+    # Sanitise IP for use in Pi-hole group name (replace dots with underscores)
+    group_name = f"iot_{ip.replace('.', '_')}_learning"
+
+    if PIHOLE_URL:
+        sid = _get_pihole_sid(PIHOLE_PASSWORD)
+        if sid:
+            try:
+                group_id = pihole_ensure_group(
+                    sid, group_name, f"IoT learning session for {ip}"
+                )
+                if group_id is not None:
+                    pihole_assign_client_to_groups(sid, ip, [group_id])
+                else:
+                    log.warning("iot_learning_group_unavailable", device_id=device_id, ip=ip)
+            finally:
+                _delete_pihole_sid(sid)
+        else:
+            log.warning("iot_learning_pihole_auth_failed", device_id=device_id, ip=ip)
+
+    # Record the session and update device status regardless of Pi-hole outcome
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO iot_learning_sessions (device_id, pihole_group_name, status)
+            VALUES (%s, %s, 'active')
+            ON CONFLICT (device_id) DO UPDATE
+                SET pihole_group_name     = EXCLUDED.pihole_group_name,
+                    learning_started_at   = NOW(),
+                    learning_completed_at = NULL,
+                    status                = 'active'
+            """,
+            (device_id, group_name),
+        )
+        cur.execute(
+            "UPDATE devices SET status = 'iot_learning' WHERE id = %s",
+            (device_id,),
+        )
+    conn.commit()
+
+    log.info("iot_learning_started", device_id=device_id, ip=ip, group=group_name)
+
+    rdb.publish(
+        "thebox:events",
+        json.dumps({
+            "type": "iot_learning_started",
+            "device_id": device_id,
+            "ip": ip,
+            "pihole_group": group_name,
+            "ts": datetime.now(timezone.utc).isoformat(),
+        }),
+    )
+    return True
+
+
+def process_completed_learnings(conn, rdb) -> int:
+    """Finalise IoT learning sessions whose observation window has elapsed.
+
+    For each active session whose ``learning_started_at`` is older than
+    ``IOT_LEARNING_HOURS`` hours:
+
+    1. Query Pi-hole for every DNS domain the device resolved during the
+       learning period.
+    2. Insert those FQDNs into ``iot_allowlist`` as globally-shared entries
+       (``device_id = NULL``) so all IoT devices in the ``iot`` Pi-hole group
+       benefit from the learned allow-list.
+    3. Add each domain to Pi-hole's exact allow-list for the ``iot`` group.
+    4. Reassign the Pi-hole client from the learning group to the ``iot`` group.
+    5. Delete the temporary learning group from Pi-hole.
+    6. Update the device status to ``iot`` and mark the session as completed.
+
+    Returns the number of sessions finalised in this invocation.
+    """
+    threshold = datetime.now(timezone.utc) - timedelta(hours=IOT_LEARNING_HOURS)
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT s.id, s.device_id, s.pihole_group_name, s.learning_started_at,
+                   d.ip_address
+            FROM iot_learning_sessions s
+            JOIN devices d ON d.id = s.device_id
+            WHERE s.status = 'active'
+              AND s.learning_started_at <= %s
+            """,
+            (threshold,),
+        )
+        sessions = cur.fetchall()
+
+    if not sessions:
+        return 0
+
+    log.info("iot_learning_sessions_due", count=len(sessions))
+
+    # Authenticate with Pi-hole once for the whole batch (if configured)
+    sid: str | None = None
+    iot_group_id: int | None = None
+    if PIHOLE_URL:
+        sid = _get_pihole_sid(PIHOLE_PASSWORD)
+        if sid:
+            iot_group_id = pihole_ensure_group(
+                sid, PIHOLE_IOT_GROUP, "IoT devices — post-learning allow-list"
+            )
+        else:
+            log.warning("iot_learning_complete_pihole_auth_failed")
+
+    completed = 0
+    try:
+        for session in sessions:
+            device_id: int = session["device_id"]
+            ip: str | None = session["ip_address"]
+            group_name: str = session["pihole_group_name"]
+            started_at = session["learning_started_at"]
+
+            if not ip:
+                log.warning("iot_learning_no_ip", device_id=device_id, session_id=session["id"])
+                continue
+
+            log.info("iot_learning_completing", device_id=device_id, ip=ip, group=group_name)
+
+            # ── 1. Collect DNS queries from Pi-hole ──────────────────────────
+            domains: list[str] = []
+            if sid:
+                from_ts = started_at.timestamp()
+                until_ts = datetime.now(timezone.utc).timestamp()
+                domains = pihole_get_queries_for_client(sid, ip, from_ts, until_ts)
+                log.info("iot_learning_domains_found", device_id=device_id, ip=ip, count=len(domains))
+
+            # ── 2. Store FQDNs in iot_allowlist as global entries ────────────
+            if domains:
+                with conn.cursor() as cur:
+                    for fqdn in domains:
+                        cur.execute(
+                            """
+                            INSERT INTO iot_allowlist (device_id, fqdn)
+                            VALUES (NULL, %s)
+                            ON CONFLICT (fqdn) WHERE device_id IS NULL DO NOTHING
+                            """,
+                            (fqdn,),
+                        )
+                conn.commit()
+
+                # ── 3. Add domains to Pi-hole allow-list for the iot group ───
+                if sid and iot_group_id is not None:
+                    for fqdn in domains:
+                        pihole_add_domain_to_allowlist(sid, fqdn, [iot_group_id])
+
+            # ── 4. Move Pi-hole client to the iot group ──────────────────────
+            if sid and iot_group_id is not None:
+                pihole_assign_client_to_groups(sid, ip, [iot_group_id])
+
+            # ── 5. Delete the temporary learning group ───────────────────────
+            if sid:
+                pihole_delete_group(sid, group_name)
+
+            # ── 6. Update device status and mark session complete ────────────
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE devices SET status = 'iot' WHERE id = %s",
+                    (device_id,),
+                )
+                cur.execute(
+                    """
+                    UPDATE iot_learning_sessions
+                    SET status = 'completed', learning_completed_at = NOW()
+                    WHERE id = %s
+                    """,
+                    (session["id"],),
+                )
+            conn.commit()
+
+            log.info(
+                "iot_learning_completed",
+                device_id=device_id,
+                ip=ip,
+                domains_learned=len(domains),
+            )
+
+            rdb.publish(
+                "thebox:events",
+                json.dumps({
+                    "type": "iot_learning_completed",
+                    "device_id": device_id,
+                    "ip": ip,
+                    "domains_learned": len(domains),
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                }),
+            )
+
+            completed += 1
+
+    finally:
+        if sid:
+            _delete_pihole_sid(sid)
+
+    return completed
 
 
 # ─── DNS packet sniffer ──────────────────────────────────────────────────────
@@ -491,7 +864,14 @@ def guess_device_type(vendor: str | None, open_ports: list[dict], os_guess: str 
 # ─── Persistence ─────────────────────────────────────────────────────────────
 
 def upsert_device(conn, rdb, device: dict) -> bool:
-    """Insert or update a device record.  Returns True if the device is new."""
+    """Insert or update a device record.  Returns True if the device is new.
+
+    For brand-new IoT devices the function also calls :func:`start_iot_learning`
+    to create a Pi-hole learning group and record the 48-hour observation
+    session.  The ``iot_learning_started`` event published by that function
+    replaces the standard ``new_device`` event for IoT devices so that the
+    guardian service does not attempt to quarantine them.
+    """
     with conn.cursor() as cur:
         cur.execute("SELECT id, status FROM devices WHERE mac_address = %s", (device["mac"],))
         row = cur.fetchone()
@@ -519,21 +899,28 @@ def upsert_device(conn, rdb, device: dict) -> bool:
             conn.commit()
             log.info("new_device", mac=device["mac"], ip=device["ip"], vendor=device.get("vendor"))
 
-            # Publish event so guardian / dashboard react immediately
-            rdb.publish(
-                "thebox:events",
-                json.dumps(
-                    {
-                        "type": "new_device",
-                        "device_id": device_id,
-                        "mac": device["mac"],
-                        "ip": device["ip"],
-                        "vendor": device.get("vendor"),
-                        "device_type": device.get("device_type", "unknown"),
-                        "ts": datetime.now(timezone.utc).isoformat(),
-                    }
-                ),
-            )
+            device_type = device.get("device_type", "unknown")
+            if device_type == "iot":
+                # For IoT devices start the learning period.  start_iot_learning
+                # updates the device status to 'iot_learning' and publishes its
+                # own event, so we do NOT publish a generic 'new_device' event.
+                start_iot_learning(conn, rdb, device_id, device["ip"])
+            else:
+                # Publish event so guardian / dashboard react immediately
+                rdb.publish(
+                    "thebox:events",
+                    json.dumps(
+                        {
+                            "type": "new_device",
+                            "device_id": device_id,
+                            "mac": device["mac"],
+                            "ip": device["ip"],
+                            "vendor": device.get("vendor"),
+                            "device_type": device_type,
+                            "ts": datetime.now(timezone.utc).isoformat(),
+                        }
+                    ),
+                )
             return True
         else:
             cur.execute(
@@ -658,6 +1045,9 @@ def run_scan():
         if DNS_SNIFF_ENABLED:
             new_count += process_dns_sniff_queue(conn, rdb)
 
+        # Check for IoT learning sessions that have passed the observation window.
+        process_completed_learnings(conn, rdb)
+
         # Update scan record
         with conn.cursor() as cur:
             cur.execute(
@@ -675,7 +1065,13 @@ def run_scan():
 
 
 def main():
-    log.info("discovery_service_start", networks=NETWORK_RANGES, interval=SCAN_INTERVAL)
+    log.info(
+        "discovery_service_start",
+        networks=NETWORK_RANGES,
+        interval=SCAN_INTERVAL,
+        iot_learning_hours=IOT_LEARNING_HOURS,
+        pihole_iot_group=PIHOLE_IOT_GROUP,
+    )
 
     ensure_schema()
 

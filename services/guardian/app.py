@@ -228,7 +228,7 @@ def _apply_iptables_ip_policy(ip: str, status: str):
             ["-A", _THEBOX_CHAIN, "-s", ip, "-j", "DROP"],
         ]
     else:
-        return  # trusted — no rules; unrestricted access
+        return  # trusted / iot_learning / new — no rules; unrestricted access
 
     for rule in rules:
         run_cmd(["iptables"] + rule)
@@ -293,6 +293,11 @@ def apply_device_policy(mac: str, ip: str, status: str):
 
     Uses MAC-based ipsets when available; falls back to per-IP iptables rules
     in the THEBOX_POLICY chain when the kernel does not support hash:mac.
+
+    ``iot_learning`` devices are granted unrestricted access so that all their
+    DNS queries (and the corresponding connections) are visible to Pi-hole
+    during the 48-hour observation window.  After learning completes the
+    device transitions to ``iot`` status which applies the restricted policy.
     """
     if _ipsets_available:
         # Preferred path: O(1) MAC-based ipset membership
@@ -309,6 +314,9 @@ def apply_device_policy(mac: str, ip: str, status: str):
         elif status == "iot":
             add_to_ipset("thebox_iot", mac)
             log.info("device_iot_restricted", mac=mac, ip=ip)
+        elif status == "iot_learning":
+            # No ipset entry — unrestricted access during the learning period
+            log.info("device_iot_learning_unrestricted", mac=mac, ip=ip)
         # new / trusted — no ipset entry; unrestricted access
     else:
         # Fallback: per-IP rules in THEBOX_POLICY chain
@@ -327,6 +335,8 @@ def apply_device_policy(mac: str, ip: str, status: str):
             log.info("device_blocked_ip_rules", mac=mac, ip=ip)
         elif status == "iot":
             log.info("device_iot_restricted_ip_rules", mac=mac, ip=ip)
+        elif status == "iot_learning":
+            log.info("device_iot_learning_unrestricted_ip_rules", mac=mac, ip=ip)
 
 
 def sync_all_policies():
@@ -348,6 +358,8 @@ def sync_all_policies():
             # When AUTO_QUARANTINE is enabled, treat any device still in "new"
             # state as "quarantined" so that unprocessed devices remain
             # restricted after a service restart.
+            # Devices in "iot_learning" status are intentionally left
+            # unrestricted so Pi-hole can observe their full DNS traffic.
             if AUTO_QUARANTINE and effective_status == "new":
                 effective_status = "quarantined"
             apply_device_policy(row["mac_address"], row["ip_address"] or "", effective_status)

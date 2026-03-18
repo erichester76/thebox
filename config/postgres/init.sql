@@ -28,13 +28,34 @@ CREATE TABLE IF NOT EXISTS devices (
     owner_id        INTEGER REFERENCES users(id) ON DELETE SET NULL
 );
 
--- IoT allow-list: FQDNs an IoT device is permitted to reach
+-- IoT allow-list: FQDNs an IoT device is permitted to reach.
+-- device_id is nullable: NULL marks a globally-shared entry (applies to all
+-- IoT devices in the iot Pi-hole group); a non-NULL value ties the entry to
+-- a specific device for record-keeping.
 CREATE TABLE IF NOT EXISTS iot_allowlist (
     id          SERIAL PRIMARY KEY,
-    device_id   INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+    device_id   INTEGER REFERENCES devices(id) ON DELETE CASCADE,
     fqdn        VARCHAR(255) NOT NULL,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     UNIQUE(device_id, fqdn)
+);
+
+-- Partial unique index for globally-shared entries (device_id IS NULL).
+-- The UNIQUE(device_id, fqdn) constraint above allows multiple NULLs in
+-- PostgreSQL, so we need a separate index to enforce uniqueness of global FQDNs.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_iot_allowlist_global_fqdn
+    ON iot_allowlist(fqdn) WHERE device_id IS NULL;
+
+-- IoT learning sessions: tracks the 48-hour observation window for newly
+-- discovered IoT devices.  One active session per device at a time.
+CREATE TABLE IF NOT EXISTS iot_learning_sessions (
+    id                    SERIAL PRIMARY KEY,
+    device_id             INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+    pihole_group_name     VARCHAR(64) NOT NULL,
+    learning_started_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    learning_completed_at TIMESTAMPTZ,
+    status                VARCHAR(32) NOT NULL DEFAULT 'active',
+    UNIQUE(device_id)
 );
 
 -- Honeypot events: connection attempts to the honeypot
