@@ -889,41 +889,6 @@ def _xml_text(element, tag: str, ns: dict) -> str | None:
     return child.text.strip() if child is not None and child.text else None
 
 
-def ssdp_discover(timeout: int = 5) -> dict[str, dict]:
-    """Discover UPnP/SSDP devices on the LAN via multicast M-SEARCH.
-
-    Sends an ``ssdp:all`` M-SEARCH request to the UPnP multicast group
-    (239.255.255.250:1900) and waits *timeout* seconds for responses.
-    For each unique responding IP the LOCATION header URL is fetched and
-    the UPnP device description XML is parsed to extract manufacturer,
-    model name, friendly name, and device type.
-
-    Returns a dict mapping IP address → enrichment dict.  Runs silently
-    on error so that a missing or blocked multicast path doesn't abort the
-    scan cycle.
-    """
-    if not SSDP_ENABLED:
-        return {}
-
-    msg = (
-        "M-SEARCH * HTTP/1.1\r\n"
-        f"HOST: {_SSDP_MULTICAST_ADDR}:{_SSDP_PORT}\r\n"
-        'MAN: "ssdp:discover"\r\n'
-        f"MX: {_SSDP_MX}\r\n"
-        "ST: ssdp:all\r\n"
-        "\r\n"
-    ).encode()
-
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
-        sock.settimeout(timeout)
-        sock.sendto(msg, (_SSDP_MULTICAST_ADDR, _SSDP_PORT))
-    except Exception as exc:
-        log.warning("ssdp_send_error", error=str(exc))
-        return {}
-
 _SSDP_LOCATION_RE = re.compile(r"^https?://", re.IGNORECASE)
 
 
@@ -949,6 +914,44 @@ def _validate_ssdp_location(location: str, responding_ip: str) -> bool:
         return False
     except Exception:
         return False
+
+
+def ssdp_discover(timeout: int = 5) -> dict[str, dict]:
+    """Discover UPnP/SSDP devices on the LAN via multicast M-SEARCH.
+
+    Sends an ``ssdp:all`` M-SEARCH request to the UPnP multicast group
+    (239.255.255.250:1900) and waits *timeout* seconds for responses.
+    For each unique responding IP the LOCATION header URL is fetched and
+    the UPnP device description XML is parsed to extract manufacturer,
+    model name, friendly name, and device type.
+
+    Returns a dict mapping IP address → enrichment dict.  Runs silently
+    on error so that a missing or blocked multicast path doesn't abort the
+    scan cycle.
+    """
+    if not SSDP_ENABLED:
+        return {}
+
+    msg = (
+        "M-SEARCH * HTTP/1.1\r\n"
+        f"HOST: {_SSDP_MULTICAST_ADDR}:{_SSDP_PORT}\r\n"
+        'MAN: "ssdp:discover"\r\n'
+        f"MX: {_SSDP_MX}\r\n"
+        "ST: ssdp:all\r\n"
+        "\r\n"
+    ).encode()
+
+    responses: dict[str, dict] = {}
+
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+        sock.settimeout(timeout)
+        sock.sendto(msg, (_SSDP_MULTICAST_ADDR, _SSDP_PORT))
+    except Exception as exc:
+        log.warning("ssdp_send_error", error=str(exc))
+        return {}
 
     deadline = time.time() + timeout
     while time.time() < deadline:
