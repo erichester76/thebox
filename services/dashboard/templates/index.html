@@ -73,7 +73,25 @@
     .btn-block  { background: rgba(248,81,73,.15);  color: var(--danger);  }
     .btn-iot    { background: rgba(88,166,255,.15); color: var(--accent);  }
     .btn-ack    { background: rgba(139,148,158,.15);color: var(--muted);   }
+    .btn-user   { background: rgba(139,148,158,.15);color: var(--text);    }
+    .btn-danger { background: rgba(248,81,73,.15);  color: var(--danger);  }
     .btn:hover  { opacity: .8; }
+
+    /* ── Modal ──────────────────────────────────────── */
+    .modal-backdrop { display:none; position:fixed; inset:0; background:rgba(0,0,0,.6); z-index:100; align-items:center; justify-content:center; }
+    .modal-backdrop.open { display:flex; }
+    .modal { background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); padding:24px; min-width:320px; max-width:480px; width:100%; }
+    .modal h3 { font-size:15px; font-weight:700; margin-bottom:16px; }
+    .modal label { display:block; font-size:12px; color:var(--muted); margin-bottom:4px; margin-top:12px; }
+    .modal input, .modal select { width:100%; background:var(--bg); border:1px solid var(--border); border-radius:6px; padding:6px 10px; color:var(--text); font-size:13px; }
+    .modal input:focus, .modal select:focus { outline:none; border-color:var(--accent); }
+    .modal-actions { display:flex; gap:8px; justify-content:flex-end; margin-top:20px; }
+    .btn-primary { background:var(--accent); color:#000; padding:6px 16px; font-size:13px; }
+
+    /* ── Form row ───────────────────────────────────── */
+    .form-row { display:flex; gap:8px; align-items:flex-end; flex-wrap:wrap; }
+    .form-row input { flex:1; min-width:120px; background:var(--bg); border:1px solid var(--border); border-radius:6px; padding:5px 10px; color:var(--text); font-size:12px; }
+    .form-row input:focus { outline:none; border-color:var(--accent); }
 
     /* ── Alert list ─────────────────────────────────── */
     .alert-item { padding: 10px 12px; border-left: 3px solid var(--muted); margin-bottom: 8px; background: var(--bg); border-radius: 0 6px 6px 0; }
@@ -134,9 +152,9 @@
         <table id="devices-table">
           <thead><tr>
             <th>IP</th><th>MAC</th><th>Hostname</th><th>Vendor</th>
-            <th>Type</th><th>OS</th><th>Status</th><th>Last Seen</th><th>Actions</th>
+            <th>Type</th><th>OS</th><th>Owner</th><th>Status</th><th>Last Seen</th><th>Actions</th>
           </tr></thead>
-          <tbody id="devices-body"><tr><td colspan="9" class="empty">Loading…</td></tr></tbody>
+          <tbody id="devices-body"><tr><td colspan="10" class="empty">Loading…</td></tr></tbody>
         </table>
       </div>
     </div>
@@ -154,7 +172,62 @@
     <div class="card-body scrollable" id="hp-feed"><div class="empty">Loading…</div></div>
   </div>
 
+  <!-- Users management -->
+  <div class="card full">
+    <div class="card-header">
+      <h2>Users</h2>
+      <button class="btn btn-ack" onclick="loadUsers()">Refresh</button>
+    </div>
+    <div class="card-body">
+      <div class="form-row" style="margin-bottom:16px">
+        <input id="new-username"     type="text" placeholder="Username *" />
+        <input id="new-displayname"  type="text" placeholder="Display name" />
+        <input id="new-email"        type="email" placeholder="Email" />
+        <button class="btn btn-primary" onclick="createUser()">Add User</button>
+      </div>
+      <div class="scrollable">
+        <table id="users-table">
+          <thead><tr>
+            <th>Username</th><th>Display Name</th><th>Email</th>
+            <th>Devices</th><th>Created</th><th>Actions</th>
+          </tr></thead>
+          <tbody id="users-body"><tr><td colspan="6" class="empty">Loading…</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
 </main>
+
+<!-- Assign User Modal -->
+<div class="modal-backdrop" id="assign-modal">
+  <div class="modal">
+    <h3>Assign Device Owner</h3>
+    <p style="font-size:12px;color:var(--muted);margin-bottom:4px">Select a user to assign as the owner of this device, or choose "Unassigned" to remove the current owner.</p>
+    <label>Owner</label>
+    <select id="assign-user-select"><option value="">— Unassigned —</option></select>
+    <div class="modal-actions">
+      <button class="btn btn-ack" onclick="closeAssignModal()">Cancel</button>
+      <button class="btn btn-primary" onclick="confirmAssign()">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- Edit User Modal -->
+<div class="modal-backdrop" id="edit-user-modal">
+  <div class="modal">
+    <h3>Edit User</h3>
+    <input type="hidden" id="edit-user-id" />
+    <label>Display Name</label>
+    <input id="edit-displayname" type="text" placeholder="Display name" />
+    <label>Email</label>
+    <input id="edit-email" type="email" placeholder="Email" />
+    <div class="modal-actions">
+      <button class="btn btn-ack" onclick="closeEditUserModal()">Cancel</button>
+      <button class="btn btn-primary" onclick="confirmEditUser()">Save</button>
+    </div>
+  </div>
+</div>
 
 <script>
 // ── API helpers ──────────────────────────────────────────────────────────────
@@ -194,8 +267,16 @@ async function loadStats() {
 async function loadDevices() {
   const devices = await api('/api/devices');
   const tbody = document.getElementById('devices-body');
-  if (!devices.length) { tbody.innerHTML = '<tr><td colspan="9" class="empty">No devices yet</td></tr>'; return; }
-  tbody.innerHTML = devices.map(d => `
+  if (!devices.length) { tbody.innerHTML = '<tr><td colspan="10" class="empty">No devices yet</td></tr>'; return; }
+  tbody.innerHTML = devices.map(d => {
+    const ownerLabel = d.owner_display_name || d.owner_username
+      ? `<span style="color:var(--accent)">${d.owner_display_name || d.owner_username}</span>`
+      : `<span style="color:var(--muted)">–</span>`;
+    const needsOwner = (d.status === 'quarantined' || d.status === 'new') && !d.owner_id;
+    const trustBtn = needsOwner
+      ? `<button class="btn btn-trust" title="Assign a user first" onclick="alert('Assign a user owner before trusting this device.')" style="opacity:.4;cursor:not-allowed">Trust</button>`
+      : `<button class="btn btn-trust" onclick="setStatus(${d.id},'trusted')">Trust</button>`;
+    return `
     <tr>
       <td>${d.ip_address||'–'}</td>
       <td style="font-family:monospace">${d.mac_address}</td>
@@ -203,21 +284,65 @@ async function loadDevices() {
       <td>${d.vendor||'–'}</td>
       <td>${d.device_type||'–'}</td>
       <td>${d.os_guess||'–'}</td>
+      <td>${ownerLabel}</td>
       <td>${statusBadge(d.status)}</td>
       <td>${fmtDate(d.last_seen)}</td>
       <td>
-        <button class="btn btn-trust" onclick="setStatus(${d.id},'trusted')">Trust</button>
+        ${trustBtn}
         <button class="btn btn-block" onclick="setStatus(${d.id},'blocked')">Block</button>
         <button class="btn btn-iot"   onclick="setStatus(${d.id},'iot')">IoT</button>
+        <button class="btn btn-user"  onclick="openAssignModal(${d.id}, ${d.owner_id||'null'})">👤</button>
       </td>
-    </tr>`).join('');
+    </tr>`;
+  }).join('');
 }
 
 async function setStatus(id, status) {
-  await api(`/api/devices/${id}/status`, {
-    method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify({status})
-  });
+  try {
+    await api(`/api/devices/${id}/status`, {
+      method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify({status})
+    });
+  } catch(e) {
+    let msg = 'Failed to update status.';
+    try { msg = JSON.parse(e.message).error || msg; } catch(_) {}
+    alert(msg);
+    return;
+  }
   loadDevices(); loadStats();
+}
+
+// ── Assign user modal ─────────────────────────────────────────────────────────
+let _assignDeviceId = null;
+
+async function openAssignModal(deviceId, currentUserId) {
+  _assignDeviceId = deviceId;
+  const users = await api('/api/users');
+  const sel = document.getElementById('assign-user-select');
+  sel.innerHTML = '<option value="">— Unassigned —</option>' +
+    users.map(u => `<option value="${u.id}"${u.id===currentUserId?' selected':''}>${u.display_name||u.username} (@${u.username})</option>`).join('');
+  document.getElementById('assign-modal').classList.add('open');
+}
+
+function closeAssignModal() {
+  document.getElementById('assign-modal').classList.remove('open');
+  _assignDeviceId = null;
+}
+
+async function confirmAssign() {
+  const sel = document.getElementById('assign-user-select');
+  const userId = sel.value ? parseInt(sel.value) : null;
+  try {
+    await api(`/api/devices/${_assignDeviceId}/owner`, {
+      method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify({user_id: userId})
+    });
+  } catch(e) {
+    let msg = 'Failed to assign owner.';
+    try { msg = JSON.parse(e.message).error || msg; } catch(_) {}
+    alert(msg);
+    return;
+  }
+  closeAssignModal();
+  loadDevices();
 }
 
 // ── Alerts ───────────────────────────────────────────────────────────────────
@@ -253,6 +378,90 @@ async function loadHoneypot() {
     </div>`).join('');
 }
 
+// ── Users ────────────────────────────────────────────────────────────────────
+async function loadUsers() {
+  const users = await api('/api/users');
+  const tbody = document.getElementById('users-body');
+  if (!users.length) { tbody.innerHTML = '<tr><td colspan="6" class="empty">No users yet</td></tr>'; return; }
+  tbody.innerHTML = users.map(u => `
+    <tr>
+      <td style="font-weight:600">${u.username}</td>
+      <td>${u.display_name||'–'}</td>
+      <td>${u.email||'–'}</td>
+      <td>${u.device_count}</td>
+      <td>${fmtDate(u.created_at)}</td>
+      <td>
+        <button class="btn btn-user" onclick="openEditUserModal(${u.id},'${(u.display_name||'').replace(/'/g,"\\'")}','${(u.email||'').replace(/'/g,"\\'")}')">Edit</button>
+        <button class="btn btn-danger" onclick="deleteUser(${u.id},'${u.username.replace(/'/g,"\\'")}')">Delete</button>
+      </td>
+    </tr>`).join('');
+}
+
+async function createUser() {
+  const username    = document.getElementById('new-username').value.trim();
+  const displayName = document.getElementById('new-displayname').value.trim();
+  const email       = document.getElementById('new-email').value.trim();
+  if (!username) { alert('Username is required.'); return; }
+  try {
+    await api('/api/users', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({username, display_name: displayName||null, email: email||null})
+    });
+  } catch(e) {
+    let msg = 'Failed to create user.';
+    try { msg = JSON.parse(e.message).error || msg; } catch(_) {}
+    alert(msg);
+    return;
+  }
+  document.getElementById('new-username').value    = '';
+  document.getElementById('new-displayname').value = '';
+  document.getElementById('new-email').value       = '';
+  loadUsers();
+}
+
+function openEditUserModal(id, displayName, email) {
+  document.getElementById('edit-user-id').value      = id;
+  document.getElementById('edit-displayname').value  = displayName;
+  document.getElementById('edit-email').value        = email;
+  document.getElementById('edit-user-modal').classList.add('open');
+}
+
+function closeEditUserModal() {
+  document.getElementById('edit-user-modal').classList.remove('open');
+}
+
+async function confirmEditUser() {
+  const id          = document.getElementById('edit-user-id').value;
+  const displayName = document.getElementById('edit-displayname').value.trim();
+  const email       = document.getElementById('edit-email').value.trim();
+  try {
+    await api(`/api/users/${id}`, {
+      method:'PUT', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({display_name: displayName||null, email: email||null})
+    });
+  } catch(e) {
+    let msg = 'Failed to update user.';
+    try { msg = JSON.parse(e.message).error || msg; } catch(_) {}
+    alert(msg);
+    return;
+  }
+  closeEditUserModal();
+  loadUsers();
+}
+
+async function deleteUser(id, username) {
+  if (!confirm(`Delete user "${username}"? Their devices will become unassigned.`)) return;
+  try {
+    await api(`/api/users/${id}`, {method:'DELETE'});
+  } catch(e) {
+    let msg = 'Failed to delete user.';
+    try { msg = JSON.parse(e.message).error || msg; } catch(_) {}
+    alert(msg);
+    return;
+  }
+  loadUsers(); loadDevices();
+}
+
 // ── SSE live updates ──────────────────────────────────────────────────────────
 function connectSSE() {
   const es = new EventSource('/api/events');
@@ -270,9 +479,17 @@ function connectSSE() {
   };
 }
 
+// Close modals on backdrop click
+document.getElementById('assign-modal').addEventListener('click', function(e) {
+  if (e.target === this) closeAssignModal();
+});
+document.getElementById('edit-user-modal').addEventListener('click', function(e) {
+  if (e.target === this) closeEditUserModal();
+});
+
 // ── Bootstrap ────────────────────────────────────────────────────────────────
 (async () => {
-  await Promise.all([loadStats(), loadDevices(), loadAlerts(), loadHoneypot()]);
+  await Promise.all([loadStats(), loadDevices(), loadAlerts(), loadHoneypot(), loadUsers()]);
   connectSSE();
   // Periodic refresh
   setInterval(() => { loadStats(); loadAlerts(); loadHoneypot(); }, 30000);
