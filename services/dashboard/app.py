@@ -147,15 +147,19 @@ def ensure_schema():
         )""",
         # honeypot_events — dashboard displays honeypot hit log
         """CREATE TABLE IF NOT EXISTS honeypot_events (
-            id              SERIAL PRIMARY KEY,
-            src_ip          VARCHAR(45) NOT NULL,
-            src_port        INTEGER,
-            dst_port        INTEGER NOT NULL,
-            protocol        VARCHAR(10) NOT NULL DEFAULT 'tcp',
-            payload_preview TEXT,
-            severity        VARCHAR(16) NOT NULL DEFAULT 'low',
-            device_id       INTEGER REFERENCES devices(id),
-            created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            id                SERIAL PRIMARY KEY,
+            src_ip            VARCHAR(45) NOT NULL,
+            src_port          INTEGER,
+            dst_port          INTEGER NOT NULL,
+            protocol          VARCHAR(10) NOT NULL DEFAULT 'tcp',
+            payload_preview   TEXT,
+            severity          VARCHAR(16) NOT NULL DEFAULT 'low',
+            interaction_level VARCHAR(16) NOT NULL DEFAULT 'none',
+            intent            VARCHAR(32) NOT NULL DEFAULT 'scan',
+            is_sweep          BOOLEAN NOT NULL DEFAULT FALSE,
+            ports_scanned     JSONB,
+            device_id         INTEGER REFERENCES devices(id),
+            created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )""",
         "CREATE INDEX IF NOT EXISTS idx_devices_mac         ON devices(mac_address)",
         "CREATE INDEX IF NOT EXISTS idx_devices_ip          ON devices(ip_address)",
@@ -177,6 +181,11 @@ def ensure_schema():
         # so this statement is safe to execute on both old (NOT NULL) and new (nullable)
         # schemas without needing additional conditional logic.
         "ALTER TABLE iot_allowlist ALTER COLUMN device_id DROP NOT NULL",
+        # Migration: add new honeypot columns to existing deployments
+        "ALTER TABLE honeypot_events ADD COLUMN IF NOT EXISTS interaction_level VARCHAR(16) NOT NULL DEFAULT 'none'",
+        "ALTER TABLE honeypot_events ADD COLUMN IF NOT EXISTS intent VARCHAR(32) NOT NULL DEFAULT 'scan'",
+        "ALTER TABLE honeypot_events ADD COLUMN IF NOT EXISTS is_sweep BOOLEAN NOT NULL DEFAULT FALSE",
+        "ALTER TABLE honeypot_events ADD COLUMN IF NOT EXISTS ports_scanned JSONB",
     ]
     conn = get_db()
     try:
@@ -744,6 +753,19 @@ def iot_allowlist_txt():
     conn.close()
     text = "\n".join(r["fqdn"] for r in rows)
     return Response(text, mimetype="text/plain")
+  
+@app.route("/api/honeypot/<int:event_id>")
+def api_honeypot_event(event_id: int):
+    conn = get_db()
+    rows = rows_to_list(
+        conn,
+        "SELECT * FROM honeypot_events WHERE id=%s",
+        (event_id,),
+    )
+    conn.close()
+    if not rows:
+        return jsonify({"error": "not found"}), 404
+    return Response(json.dumps(rows[0], default=serialize), mimetype="application/json")
 
 
 # --- Pi-hole helpers ---------------------------------------------------------
@@ -752,7 +774,8 @@ def iot_allowlist_txt():
 _pihole_sid_cache: tuple[str, float] | None = None
 _pihole_sid_lock = threading.Lock()
 # Pi-hole v6 sessions last 300 s by default; refresh 60 s before expiry.
-_PIHOLE_SID_TTL = 240.0
+# Tunable via PIHOLE_SID_TTL env var (seconds).
+_PIHOLE_SID_TTL = float(os.environ.get("PIHOLE_SID_TTL", "240.0"))
 
 
 def _pihole_authenticate() -> str | None:
