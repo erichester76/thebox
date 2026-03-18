@@ -9,6 +9,7 @@ Simulated banners are served for common protocols to encourage attackers to
 reveal credentials or scanning behaviour.
 """
 
+import ipaddress
 import json
 import logging
 import os
@@ -31,6 +32,33 @@ HONEYPOT_PORTS = [
     ).split(",")
 ]
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+
+# IPs/CIDRs to silently ignore (e.g. Docker bridge gateways, loopback).
+# Default covers RFC-1918 private Docker bridge ranges and loopback.
+_IGNORED_NETWORKS_RAW = os.environ.get(
+    "HONEYPOT_IGNORED_NETWORKS", "172.16.0.0/12,127.0.0.0/8"
+)
+IGNORED_NETWORKS: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
+for _raw in _IGNORED_NETWORKS_RAW.split(","):
+    _raw = _raw.strip()
+    if not _raw:
+        continue
+    try:
+        IGNORED_NETWORKS.append(ipaddress.ip_network(_raw, strict=False))
+    except ValueError as exc:
+        raise ValueError(
+            f"HONEYPOT_IGNORED_NETWORKS contains an invalid network: {_raw!r}"
+        ) from exc
+
+
+def is_ignored(ip: str) -> bool:
+    """Return True if *ip* falls within any configured ignored network."""
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return any(addr in net for net in IGNORED_NETWORKS)
+
 
 # Hits within THRESHOLD_WINDOW seconds that exceed THRESHOLD_COUNT are "critical"
 THRESHOLD_COUNT = 3
@@ -222,6 +250,12 @@ def log_event(src_ip: str, src_port: int, dst_port: int, payload_preview: str, s
 
 def handle_connection(conn_sock: socket.socket, addr: tuple, dst_port: int, rdb: redis.Redis):
     src_ip, src_port = addr[0], addr[1]
+
+    # Silently drop connections from internal/Docker networks
+    if is_ignored(src_ip):
+        conn_sock.close()
+        return
+
     payload_preview = ""
     try:
         # Send a fake banner if we have one
