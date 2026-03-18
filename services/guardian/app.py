@@ -216,7 +216,7 @@ def _apply_iptables_ip_policy(ip: str, status: str):
     if not ip:
         return
 
-    if status in ("quarantined", "new", "iot"):
+    if status in ("quarantined", "iot"):
         rules = [
             ["-A", _THEBOX_CHAIN, "-s", ip, "-p", "udp", "--dport", "53", "-j", "ACCEPT"],
             ["-A", _THEBOX_CHAIN, "-s", ip, "-p", "udp", "--dport", "67", "-j", "ACCEPT"],
@@ -300,7 +300,7 @@ def apply_device_policy(mac: str, ip: str, status: str):
         remove_from_ipset("thebox_iot",        mac)
         remove_from_ipset("thebox_blocked",    mac)
 
-        if status in ("quarantined", "new"):
+        if status == "quarantined":
             add_to_ipset("thebox_quarantine", mac)
             log.info("device_quarantined", mac=mac, ip=ip)
         elif status == "blocked":
@@ -309,7 +309,7 @@ def apply_device_policy(mac: str, ip: str, status: str):
         elif status == "iot":
             add_to_ipset("thebox_iot", mac)
             log.info("device_iot_restricted", mac=mac, ip=ip)
-        # trusted — no ipset entry; unrestricted access
+        # new / trusted — no ipset entry; unrestricted access
     else:
         # Fallback: per-IP rules in THEBOX_POLICY chain
         if not ip:
@@ -321,7 +321,7 @@ def apply_device_policy(mac: str, ip: str, status: str):
             return
         _remove_iptables_ip_rules(ip)
         _apply_iptables_ip_policy(ip, status)
-        if status in ("quarantined", "new"):
+        if status == "quarantined":
             log.info("device_quarantined_ip_rules", mac=mac, ip=ip)
         elif status == "blocked":
             log.info("device_blocked_ip_rules", mac=mac, ip=ip)
@@ -344,7 +344,13 @@ def sync_all_policies():
     with conn.cursor() as cur:
         cur.execute("SELECT mac_address, ip_address, status FROM devices")
         for row in cur:
-            apply_device_policy(row["mac_address"], row["ip_address"] or "", row["status"])
+            effective_status = row["status"]
+            # When AUTO_QUARANTINE is enabled, treat any device still in "new"
+            # state as "quarantined" so that unprocessed devices remain
+            # restricted after a service restart.
+            if AUTO_QUARANTINE and effective_status == "new":
+                effective_status = "quarantined"
+            apply_device_policy(row["mac_address"], row["ip_address"] or "", effective_status)
 
     conn.close()
     log.info("sync_all_policies_done")
