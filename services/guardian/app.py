@@ -62,8 +62,16 @@ def run_cmd(args: list[str], check: bool = True) -> subprocess.CompletedProcess:
     return result
 
 
-def ensure_ipset(name: str, settype: str = "hash:mac"):
-    run_cmd(["ipset", "create", "-exist", name, settype], check=False)
+def ensure_ipset(name: str, settype: str = "hash:mac") -> bool:
+    """Create an ipset if it doesn't already exist.
+
+    Returns True if the set is available (created or already existed),
+    False if creation failed.
+    """
+    result = run_cmd(["ipset", "create", "-exist", name, settype])
+    if result.returncode != 0:
+        return False
+    return True
 
 
 def add_to_ipset(name: str, value: str):
@@ -85,10 +93,17 @@ def bootstrap_iptables():
     """
     log.info("bootstrapping_iptables")
 
-    # ipsets
-    ensure_ipset("thebox_quarantine", "hash:mac")
-    ensure_ipset("thebox_iot",        "hash:mac")
-    ensure_ipset("thebox_blocked",    "hash:mac")
+    # ipsets must be created before any iptables rules that reference them
+    ipsets = [
+        ("thebox_quarantine", "hash:mac"),
+        ("thebox_iot",        "hash:mac"),
+        ("thebox_blocked",    "hash:mac"),
+    ]
+    for name, settype in ipsets:
+        if not ensure_ipset(name, settype):
+            log.error("ipset_creation_failed", name=name,
+                      msg="iptables bootstrap aborted — ipsets are required")
+            return
 
     # Insert jump rules into FORWARD chain (idempotent via -C check)
     rules = [
