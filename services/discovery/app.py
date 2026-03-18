@@ -506,7 +506,7 @@ def run_scan():
 
         hosts = arp_sweep(network)
         if not hosts:
-            log.warning("arp_sweep_empty_nmap_fallback", network=network)
+            log.info("arp_sweep_empty_nmap_fallback", network=network)
             hosts = nmap_ping_sweep(network)
 
         # Merge Pi-hole network clients so devices that answered Pi-hole DNS

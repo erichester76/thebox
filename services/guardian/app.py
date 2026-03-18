@@ -55,6 +55,11 @@ def get_redis():
 
 # ─── iptables / ipset helpers ────────────────────────────────────────────────
 
+# Set to False by bootstrap_iptables() when ipset is unavailable so that
+# subsequent ipset calls are skipped silently instead of flooding the log.
+_ipsets_available: bool = True
+
+
 def run_cmd(args: list[str], check: bool = True) -> subprocess.CompletedProcess:
     result = subprocess.run(args, capture_output=True, text=True, check=False)
     if check and result.returncode != 0:
@@ -75,14 +80,20 @@ def ensure_ipset(name: str, settype: str = "hash:mac") -> bool:
 
 
 def add_to_ipset(name: str, value: str):
+    if not _ipsets_available:
+        return
     run_cmd(["ipset", "add", "-exist", name, value])
 
 
 def remove_from_ipset(name: str, value: str):
+    if not _ipsets_available:
+        return
     run_cmd(["ipset", "del", name, value], check=False)
 
 
 def flush_ipset(name: str):
+    if not _ipsets_available:
+        return
     run_cmd(["ipset", "flush", name], check=False)
 
 
@@ -91,6 +102,8 @@ def bootstrap_iptables():
     Create the ipsets and iptables chains used by the guardian.
     Idempotent — safe to call on every start.
     """
+    global _ipsets_available
+
     log.info("bootstrapping_iptables")
 
     # ipsets must be created before any iptables rules that reference them
@@ -103,6 +116,7 @@ def bootstrap_iptables():
         if not ensure_ipset(name, settype):
             log.error("ipset_creation_failed", name=name,
                       msg="iptables bootstrap aborted — ipsets are required")
+            _ipsets_available = False
             return
 
     # Insert jump rules into FORWARD chain (idempotent via -C check)

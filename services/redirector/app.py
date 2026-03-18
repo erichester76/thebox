@@ -159,6 +159,41 @@ def run_cmd(args: list[str], check: bool = True) -> subprocess.CompletedProcess:
 
 # ─── Database helpers ────────────────────────────────────────────────────────
 
+def ensure_schema():
+    """Create any missing tables that this service depends on.
+
+    Runs idempotent DDL so it is safe to call on every startup, including
+    against databases that pre-date the redirect_events table.
+    """
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS redirect_events (
+                    id          SERIAL PRIMARY KEY,
+                    action      VARCHAR(64)  NOT NULL,
+                    target_ip   VARCHAR(45)  NOT NULL,
+                    target_mac  VARCHAR(17),
+                    mode        VARCHAR(64)  NOT NULL,
+                    detail      TEXT,
+                    device_id   INTEGER REFERENCES devices(id),
+                    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+                """
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_redirect_target_ip ON redirect_events(target_ip)"
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_redirect_created ON redirect_events(created_at)"
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    log.info("schema_ensured")
+
+
 def log_redirect_event(
     conn,
     action: str,
@@ -668,6 +703,10 @@ def sync_quarantine_targets(gateway_ip: str, gateway_mac: str):
 
 def main():
     log.info("redirector_service_start", modes=sorted(REDIRECT_MODES))
+
+    # Ensure the redirect_events table exists (handles databases created before
+    # this table was added to init.sql).
+    ensure_schema()
 
     # Resolve network identity
     own_ip = BOX_IP or get_own_ip()

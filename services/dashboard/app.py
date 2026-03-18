@@ -11,6 +11,7 @@ import logging
 import os
 import queue
 import threading
+import time
 from datetime import datetime, timezone
 
 import psycopg2
@@ -545,29 +546,54 @@ def api_honeypot():
 
 # --- Pi-hole helpers ---------------------------------------------------------
 
+# Module-level SID cache: (sid, acquired_at_monotonic)
+_pihole_sid_cache: tuple[str, float] | None = None
+_pihole_sid_lock = threading.Lock()
+# Pi-hole v6 sessions last 300 s by default; refresh 60 s before expiry.
+_PIHOLE_SID_TTL = 240.0
+
+
 def _pihole_authenticate() -> str | None:
-    """Authenticate with the Pi-hole v6 API and return a session ID.
+    """Return a cached Pi-hole v6 session ID, refreshing it when stale.
+
+    Caches the SID for ``_PIHOLE_SID_TTL`` seconds so that frequent calls to
+    ``get_pihole_stats()`` do not hammer the Pi-hole auth endpoint and trigger
+    429 Too Many Requests responses.
 
     Returns ``None`` when Pi-hole is not configured, the password is empty, or
     authentication fails.
     """
+    global _pihole_sid_cache
+
     if not PIHOLE_URL or not PIHOLE_PASSWORD:
         return None
-    try:
-        resp = requests.post(
-            f"{PIHOLE_URL}/api/auth",
-            json={"password": PIHOLE_PASSWORD},
-            timeout=10,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        sid = data.get("session", {}).get("sid")
-        if not sid:
-            log.warning("pihole_auth_no_sid", response=data)
-        return sid
-    except Exception as exc:
-        log.warning("pihole_auth_failed", error=str(exc))
-        return None
+
+    with _pihole_sid_lock:
+        now = time.monotonic()
+        if _pihole_sid_cache is not None:
+            sid, acquired = _pihole_sid_cache
+            if now - acquired < _PIHOLE_SID_TTL:
+                return sid
+            # Session expired — clear cache and re-authenticate
+            _pihole_sid_cache = None
+
+        try:
+            resp = requests.post(
+                f"{PIHOLE_URL}/api/auth",
+                json={"password": PIHOLE_PASSWORD},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            sid = data.get("session", {}).get("sid")
+            if not sid:
+                log.warning("pihole_auth_no_sid", response=data)
+                return None
+            _pihole_sid_cache = (sid, time.monotonic())
+            return sid
+        except Exception as exc:
+            log.warning("pihole_auth_failed", error=str(exc))
+            return None
 
 
 def get_pihole_stats() -> dict:
@@ -588,6 +614,12 @@ def get_pihole_stats() -> dict:
             params=params,
             timeout=10,
         )
+        if resp.status_code == 401:
+            # Cached session may have been invalidated server-side; force refresh.
+            with _pihole_sid_lock:
+                _pihole_sid_cache = None
+            log.warning("pihole_stats_failed", error="401 Unauthorized — session invalidated, will re-authenticate on next request")
+            return {}
         resp.raise_for_status()
         data = resp.json()
     except Exception as exc:
