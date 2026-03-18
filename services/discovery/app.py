@@ -73,6 +73,67 @@ def get_redis():
     return redis.from_url(REDIS_URL, decode_responses=True)
 
 
+# ─── Schema bootstrap ────────────────────────────────────────────────────────
+
+def ensure_schema():
+    """Create tables this service reads from or writes to.
+
+    Scoped to: ``users`` (FK dependency for devices), ``devices``,
+    ``scan_runs``.  All DDL uses ``IF NOT EXISTS`` so this is safe to call
+    on every startup.
+    """
+    statements = [
+        # users — FK dependency for devices.owner_id
+        """CREATE TABLE IF NOT EXISTS users (
+            id              SERIAL PRIMARY KEY,
+            username        VARCHAR(64) NOT NULL UNIQUE,
+            display_name    VARCHAR(255),
+            email           VARCHAR(255),
+            created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""",
+        # devices — discovery inserts / updates every discovered host
+        """CREATE TABLE IF NOT EXISTS devices (
+            id              SERIAL PRIMARY KEY,
+            mac_address     VARCHAR(17) NOT NULL UNIQUE,
+            ip_address      VARCHAR(45),
+            hostname        VARCHAR(255),
+            vendor          VARCHAR(255),
+            device_type     VARCHAR(64) DEFAULT 'unknown',
+            os_guess        VARCHAR(255),
+            first_seen      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            last_seen       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            status          VARCHAR(32) NOT NULL DEFAULT 'new',
+            notes           TEXT,
+            open_ports      JSONB DEFAULT '[]',
+            extra_info      JSONB DEFAULT '{}',
+            owner_id        INTEGER REFERENCES users(id) ON DELETE SET NULL
+        )""",
+        # scan_runs — discovery records each scan cycle
+        """CREATE TABLE IF NOT EXISTS scan_runs (
+            id              SERIAL PRIMARY KEY,
+            started_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            finished_at     TIMESTAMPTZ,
+            network_range   VARCHAR(64) NOT NULL,
+            devices_found   INTEGER NOT NULL DEFAULT 0,
+            new_devices     INTEGER NOT NULL DEFAULT 0,
+            status          VARCHAR(32) NOT NULL DEFAULT 'running'
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_devices_mac    ON devices(mac_address)",
+        "CREATE INDEX IF NOT EXISTS idx_devices_ip     ON devices(ip_address)",
+        "CREATE INDEX IF NOT EXISTS idx_devices_status ON devices(status)",
+    ]
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            for stmt in statements:
+                cur.execute(stmt)
+        conn.commit()
+    finally:
+        conn.close()
+    log.info("schema_ensured")
+
+
 # ─── ARP sweep ───────────────────────────────────────────────────────────────
 
 def arp_sweep(network: str) -> list[dict]:
@@ -117,6 +178,8 @@ def nmap_ping_sweep(network: str) -> list[dict]:
 
     hosts = []
     for ip in nm.all_hosts():
+        if nm[ip].state() != "up":
+            continue
         host_data: dict[str, str] = {"ip": ip}
         mac = nm[ip].get("addresses", {}).get("mac", "").upper()
         if mac:
@@ -506,7 +569,7 @@ def run_scan():
 
         hosts = arp_sweep(network)
         if not hosts:
-            log.warning("arp_sweep_empty_nmap_fallback", network=network)
+            log.info("arp_sweep_empty_nmap_fallback", network=network)
             hosts = nmap_ping_sweep(network)
 
         # Merge Pi-hole network clients so devices that answered Pi-hole DNS
@@ -578,6 +641,8 @@ def run_scan():
 
 def main():
     log.info("discovery_service_start", networks=NETWORK_RANGES, interval=SCAN_INTERVAL)
+
+    ensure_schema()
 
     # Start the background DNS-packet sniffer (requires NET_RAW capability).
     if DNS_SNIFF_ENABLED:

@@ -53,7 +53,78 @@ def get_redis():
     return redis.from_url(REDIS_URL, decode_responses=True)
 
 
+# ─── Schema bootstrap ────────────────────────────────────────────────────────
+
+def ensure_schema():
+    """Create tables this service reads from or writes to.
+
+    Scoped to: ``users`` (FK dependency for devices), ``devices``, ``alerts``.
+    All DDL uses ``IF NOT EXISTS`` so this is safe to call on every startup.
+    """
+    statements = [
+        # users — FK dependency for devices.owner_id
+        """CREATE TABLE IF NOT EXISTS users (
+            id              SERIAL PRIMARY KEY,
+            username        VARCHAR(64) NOT NULL UNIQUE,
+            display_name    VARCHAR(255),
+            email           VARCHAR(255),
+            created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""",
+        # devices — guardian reads status and writes quarantine state
+        """CREATE TABLE IF NOT EXISTS devices (
+            id              SERIAL PRIMARY KEY,
+            mac_address     VARCHAR(17) NOT NULL UNIQUE,
+            ip_address      VARCHAR(45),
+            hostname        VARCHAR(255),
+            vendor          VARCHAR(255),
+            device_type     VARCHAR(64) DEFAULT 'unknown',
+            os_guess        VARCHAR(255),
+            first_seen      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            last_seen       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            status          VARCHAR(32) NOT NULL DEFAULT 'new',
+            notes           TEXT,
+            open_ports      JSONB DEFAULT '[]',
+            extra_info      JSONB DEFAULT '{}',
+            owner_id        INTEGER REFERENCES users(id) ON DELETE SET NULL
+        )""",
+        # alerts — guardian writes quarantine / new-device alerts
+        """CREATE TABLE IF NOT EXISTS alerts (
+            id           SERIAL PRIMARY KEY,
+            source       VARCHAR(64) NOT NULL,
+            level        VARCHAR(16) NOT NULL DEFAULT 'info',
+            title        VARCHAR(255) NOT NULL,
+            detail       TEXT,
+            device_id    INTEGER REFERENCES devices(id),
+            acknowledged BOOLEAN NOT NULL DEFAULT FALSE,
+            created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_devices_mac    ON devices(mac_address)",
+        "CREATE INDEX IF NOT EXISTS idx_devices_ip     ON devices(ip_address)",
+        "CREATE INDEX IF NOT EXISTS idx_devices_status ON devices(status)",
+        "CREATE INDEX IF NOT EXISTS idx_alerts_level   ON alerts(level)",
+        "CREATE INDEX IF NOT EXISTS idx_alerts_created ON alerts(created_at)",
+    ]
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            for stmt in statements:
+                cur.execute(stmt)
+        conn.commit()
+    finally:
+        conn.close()
+    log.info("schema_ensured")
+
+
 # ─── iptables / ipset helpers ────────────────────────────────────────────────
+
+# Set to False by bootstrap_iptables() when ipset hash:mac is unavailable.
+# When False, policy is enforced via per-IP iptables rules in THEBOX_POLICY.
+_ipsets_available: bool = True
+
+# Name of the dedicated iptables chain used for IP-based fallback rules.
+_THEBOX_CHAIN = "THEBOX_POLICY"
+
 
 def run_cmd(args: list[str], check: bool = True) -> subprocess.CompletedProcess:
     result = subprocess.run(args, capture_output=True, text=True, check=False)
@@ -75,22 +146,104 @@ def ensure_ipset(name: str, settype: str = "hash:mac") -> bool:
 
 
 def add_to_ipset(name: str, value: str):
+    if not _ipsets_available:
+        return
     run_cmd(["ipset", "add", "-exist", name, value])
 
 
 def remove_from_ipset(name: str, value: str):
+    if not _ipsets_available:
+        return
     run_cmd(["ipset", "del", name, value], check=False)
 
 
 def flush_ipset(name: str):
+    if not _ipsets_available:
+        return
     run_cmd(["ipset", "flush", name], check=False)
+
+
+# ─── IP-based iptables fallback (when ipset hash:mac is unavailable) ─────────
+
+def _bootstrap_iptables_ip_fallback():
+    """Create the THEBOX_POLICY chain and insert a jump into FORWARD.
+
+    Used when the kernel does not support the ``hash:mac`` ipset type (e.g.
+    macOS Docker Desktop).  Policy is enforced via per-IP iptables rules in
+    the dedicated chain rather than MAC-based ipsets.
+    """
+    # Create the chain (idempotent — -N fails if it already exists)
+    run_cmd(["iptables", "-N", _THEBOX_CHAIN], check=False)
+    # Insert the jump rule into FORWARD if not already there
+    if run_cmd(["iptables", "-C", "FORWARD", "-j", _THEBOX_CHAIN], check=False).returncode != 0:
+        run_cmd(["iptables", "-I", "FORWARD", "-j", _THEBOX_CHAIN])
+    log.info("iptables_ip_fallback_ready", chain=_THEBOX_CHAIN)
+
+
+def _flush_iptables_ip_chain():
+    """Remove all per-IP rules from the THEBOX_POLICY chain."""
+    run_cmd(["iptables", "-F", _THEBOX_CHAIN], check=False)
+
+
+def _remove_iptables_ip_rules(ip: str):
+    """Delete all THEBOX_POLICY rules that reference source IP *ip*.
+
+    Tries every rule variant we might have inserted and repeats each deletion
+    until iptables reports no matching rule (handles duplicate entries).
+    A maximum of 10 iterations per variant guards against unexpected loops.
+    """
+    _MAX_ITER = 10
+    for extra in [
+        ["-p", "udp", "--dport", "53", "-j", "ACCEPT"],
+        ["-p", "udp", "--dport", "67", "-j", "ACCEPT"],
+        ["-p", "udp", "--dport", "68", "-j", "ACCEPT"],
+        ["-j", "DROP"],
+    ]:
+        for _ in range(_MAX_ITER):
+            if run_cmd(
+                ["iptables", "-D", _THEBOX_CHAIN, "-s", ip] + extra, check=False
+            ).returncode != 0:
+                break
+
+
+def _apply_iptables_ip_policy(ip: str, status: str):
+    """Insert per-IP THEBOX_POLICY rules for a single device.
+
+    The caller is responsible for removing any stale rules for *ip* first
+    (either via :func:`_remove_iptables_ip_rules` or
+    :func:`_flush_iptables_ip_chain`).
+    """
+    if not ip:
+        return
+
+    if status in ("quarantined", "new", "iot"):
+        rules = [
+            ["-A", _THEBOX_CHAIN, "-s", ip, "-p", "udp", "--dport", "53", "-j", "ACCEPT"],
+            ["-A", _THEBOX_CHAIN, "-s", ip, "-p", "udp", "--dport", "67", "-j", "ACCEPT"],
+            ["-A", _THEBOX_CHAIN, "-s", ip, "-p", "udp", "--dport", "68", "-j", "ACCEPT"],
+            ["-A", _THEBOX_CHAIN, "-s", ip, "-j", "DROP"],
+        ]
+    elif status == "blocked":
+        rules = [
+            ["-A", _THEBOX_CHAIN, "-s", ip, "-j", "DROP"],
+        ]
+    else:
+        return  # trusted — no rules; unrestricted access
+
+    for rule in rules:
+        run_cmd(["iptables"] + rule)
 
 
 def bootstrap_iptables():
     """
     Create the ipsets and iptables chains used by the guardian.
     Idempotent — safe to call on every start.
+
+    Falls back to per-IP iptables rules in the ``THEBOX_POLICY`` chain when
+    the kernel does not support the ``hash:mac`` ipset type.
     """
+    global _ipsets_available
+
     log.info("bootstrapping_iptables")
 
     # ipsets must be created before any iptables rules that reference them
@@ -101,8 +254,13 @@ def bootstrap_iptables():
     ]
     for name, settype in ipsets:
         if not ensure_ipset(name, settype):
-            log.error("ipset_creation_failed", name=name,
-                      msg="iptables bootstrap aborted — ipsets are required")
+            log.warning(
+                "ipset_unavailable_using_ip_fallback",
+                name=name,
+                msg="hash:mac ipset not supported -- falling back to per-IP iptables rules",
+            )
+            _ipsets_available = False
+            _bootstrap_iptables_ip_fallback()
             return
 
     # Insert jump rules into FORWARD chain (idempotent via -C check)
@@ -131,31 +289,57 @@ def bootstrap_iptables():
 
 
 def apply_device_policy(mac: str, ip: str, status: str):
-    """Apply iptables policy for a single device based on its status."""
-    # Remove from all ipsets first
-    remove_from_ipset("thebox_quarantine", mac)
-    remove_from_ipset("thebox_iot",        mac)
-    remove_from_ipset("thebox_blocked",    mac)
+    """Apply iptables policy for a single device based on its status.
 
-    if status == "quarantined" or status == "new":
-        add_to_ipset("thebox_quarantine", mac)
-        log.info("device_quarantined", mac=mac, ip=ip)
-    elif status == "blocked":
-        add_to_ipset("thebox_blocked", mac)
-        log.info("device_blocked", mac=mac, ip=ip)
-    elif status == "iot":
-        add_to_ipset("thebox_iot", mac)
-        log.info("device_iot_restricted", mac=mac, ip=ip)
-    # trusted — no ipset entry; unrestricted access
+    Uses MAC-based ipsets when available; falls back to per-IP iptables rules
+    in the THEBOX_POLICY chain when the kernel does not support hash:mac.
+    """
+    if _ipsets_available:
+        # Preferred path: O(1) MAC-based ipset membership
+        remove_from_ipset("thebox_quarantine", mac)
+        remove_from_ipset("thebox_iot",        mac)
+        remove_from_ipset("thebox_blocked",    mac)
+
+        if status in ("quarantined", "new"):
+            add_to_ipset("thebox_quarantine", mac)
+            log.info("device_quarantined", mac=mac, ip=ip)
+        elif status == "blocked":
+            add_to_ipset("thebox_blocked", mac)
+            log.info("device_blocked", mac=mac, ip=ip)
+        elif status == "iot":
+            add_to_ipset("thebox_iot", mac)
+            log.info("device_iot_restricted", mac=mac, ip=ip)
+        # trusted — no ipset entry; unrestricted access
+    else:
+        # Fallback: per-IP rules in THEBOX_POLICY chain
+        if not ip:
+            log.warning(
+                "apply_device_policy_no_ip",
+                mac=mac, status=status,
+                msg="Cannot apply IP-based fallback rules -- device has no IP address",
+            )
+            return
+        _remove_iptables_ip_rules(ip)
+        _apply_iptables_ip_policy(ip, status)
+        if status in ("quarantined", "new"):
+            log.info("device_quarantined_ip_rules", mac=mac, ip=ip)
+        elif status == "blocked":
+            log.info("device_blocked_ip_rules", mac=mac, ip=ip)
+        elif status == "iot":
+            log.info("device_iot_restricted_ip_rules", mac=mac, ip=ip)
 
 
 def sync_all_policies():
-    """Rebuild ipsets from the current database state."""
+    """Rebuild ipset / THEBOX_POLICY rules from the current database state."""
     log.info("sync_all_policies_start")
     conn = get_db()
-    flush_ipset("thebox_quarantine")
-    flush_ipset("thebox_iot")
-    flush_ipset("thebox_blocked")
+
+    if _ipsets_available:
+        flush_ipset("thebox_quarantine")
+        flush_ipset("thebox_iot")
+        flush_ipset("thebox_blocked")
+    else:
+        _flush_iptables_ip_chain()
 
     with conn.cursor() as cur:
         cur.execute("SELECT mac_address, ip_address, status FROM devices")
@@ -244,6 +428,8 @@ def subscribe_loop():
 
 def main():
     log.info("guardian_service_start")
+
+    ensure_schema()
 
     # Wait for iptables to be available (may not be in all environments)
     try:

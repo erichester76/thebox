@@ -11,6 +11,7 @@ import logging
 import os
 import queue
 import threading
+import time
 from datetime import datetime, timezone
 
 import psycopg2
@@ -55,6 +56,116 @@ def get_redis():
     return redis.from_url(REDIS_URL, decode_responses=True)
 
 
+# ─── Schema bootstrap ────────────────────────────────────────────────────────
+
+def ensure_schema():
+    """Create tables this service reads from or writes to.
+
+    Scoped to: ``users``, ``devices``, ``iot_allowlist``, ``groups``,
+    ``user_groups``, ``device_groups``, ``alerts``, ``honeypot_events``.
+    All DDL uses ``IF NOT EXISTS`` so this is safe to call on every startup.
+    """
+    statements = [
+        # users — dashboard manages user records
+        """CREATE TABLE IF NOT EXISTS users (
+            id              SERIAL PRIMARY KEY,
+            username        VARCHAR(64) NOT NULL UNIQUE,
+            display_name    VARCHAR(255),
+            email           VARCHAR(255),
+            created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""",
+        # devices — dashboard reads and updates device status / owner
+        """CREATE TABLE IF NOT EXISTS devices (
+            id              SERIAL PRIMARY KEY,
+            mac_address     VARCHAR(17) NOT NULL UNIQUE,
+            ip_address      VARCHAR(45),
+            hostname        VARCHAR(255),
+            vendor          VARCHAR(255),
+            device_type     VARCHAR(64) DEFAULT 'unknown',
+            os_guess        VARCHAR(255),
+            first_seen      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            last_seen       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            status          VARCHAR(32) NOT NULL DEFAULT 'new',
+            notes           TEXT,
+            open_ports      JSONB DEFAULT '[]',
+            extra_info      JSONB DEFAULT '{}',
+            owner_id        INTEGER REFERENCES users(id) ON DELETE SET NULL
+        )""",
+        # iot_allowlist — dashboard manages per-device IoT FQDN allow-lists
+        """CREATE TABLE IF NOT EXISTS iot_allowlist (
+            id          SERIAL PRIMARY KEY,
+            device_id   INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+            fqdn        VARCHAR(255) NOT NULL,
+            created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE(device_id, fqdn)
+        )""",
+        # groups — dashboard manages Pi-hole groups
+        """CREATE TABLE IF NOT EXISTS groups (
+            id                SERIAL PRIMARY KEY,
+            name              VARCHAR(64) NOT NULL UNIQUE,
+            description       TEXT,
+            pihole_group_name VARCHAR(64),
+            created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""",
+        # user_groups — dashboard manages user ↔ group memberships
+        """CREATE TABLE IF NOT EXISTS user_groups (
+            user_id  INTEGER NOT NULL REFERENCES users(id)  ON DELETE CASCADE,
+            group_id INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+            PRIMARY KEY (user_id, group_id)
+        )""",
+        # device_groups — dashboard manages device ↔ group memberships
+        """CREATE TABLE IF NOT EXISTS device_groups (
+            device_id INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+            group_id  INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+            PRIMARY KEY (device_id, group_id)
+        )""",
+        # alerts — dashboard reads and acknowledges alerts
+        """CREATE TABLE IF NOT EXISTS alerts (
+            id           SERIAL PRIMARY KEY,
+            source       VARCHAR(64) NOT NULL,
+            level        VARCHAR(16) NOT NULL DEFAULT 'info',
+            title        VARCHAR(255) NOT NULL,
+            detail       TEXT,
+            device_id    INTEGER REFERENCES devices(id),
+            acknowledged BOOLEAN NOT NULL DEFAULT FALSE,
+            created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""",
+        # honeypot_events — dashboard displays honeypot hit log
+        """CREATE TABLE IF NOT EXISTS honeypot_events (
+            id              SERIAL PRIMARY KEY,
+            src_ip          VARCHAR(45) NOT NULL,
+            src_port        INTEGER,
+            dst_port        INTEGER NOT NULL,
+            protocol        VARCHAR(10) NOT NULL DEFAULT 'tcp',
+            payload_preview TEXT,
+            severity        VARCHAR(16) NOT NULL DEFAULT 'low',
+            device_id       INTEGER REFERENCES devices(id),
+            created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_devices_mac         ON devices(mac_address)",
+        "CREATE INDEX IF NOT EXISTS idx_devices_ip          ON devices(ip_address)",
+        "CREATE INDEX IF NOT EXISTS idx_devices_status      ON devices(status)",
+        "CREATE INDEX IF NOT EXISTS idx_devices_owner       ON devices(owner_id)",
+        "CREATE INDEX IF NOT EXISTS idx_alerts_level        ON alerts(level)",
+        "CREATE INDEX IF NOT EXISTS idx_alerts_created      ON alerts(created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_honeypot_src_ip     ON honeypot_events(src_ip)",
+        "CREATE INDEX IF NOT EXISTS idx_honeypot_created    ON honeypot_events(created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_user_groups_group   ON user_groups(group_id)",
+        "CREATE INDEX IF NOT EXISTS idx_device_groups_group ON device_groups(group_id)",
+    ]
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            for stmt in statements:
+                cur.execute(stmt)
+        conn.commit()
+    finally:
+        conn.close()
+    log.info("schema_ensured")
+
+
 # ─── SSE / Redis subscriber ──────────────────────────────────────────────────
 
 def redis_subscriber_loop():
@@ -75,6 +186,10 @@ def redis_subscriber_loop():
 
 
 threading.Thread(target=redis_subscriber_loop, daemon=True).start()
+
+# Called at module level (not inside if __name__) so the schema is ensured
+# whether the app is run directly or served by a WSGI host (gunicorn, etc.).
+ensure_schema()
 
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -545,29 +660,54 @@ def api_honeypot():
 
 # --- Pi-hole helpers ---------------------------------------------------------
 
+# Module-level SID cache: (sid, acquired_at_monotonic)
+_pihole_sid_cache: tuple[str, float] | None = None
+_pihole_sid_lock = threading.Lock()
+# Pi-hole v6 sessions last 300 s by default; refresh 60 s before expiry.
+_PIHOLE_SID_TTL = 240.0
+
+
 def _pihole_authenticate() -> str | None:
-    """Authenticate with the Pi-hole v6 API and return a session ID.
+    """Return a cached Pi-hole v6 session ID, refreshing it when stale.
+
+    Caches the SID for ``_PIHOLE_SID_TTL`` seconds so that frequent calls to
+    ``get_pihole_stats()`` do not hammer the Pi-hole auth endpoint and trigger
+    429 Too Many Requests responses.
 
     Returns ``None`` when Pi-hole is not configured, the password is empty, or
     authentication fails.
     """
+    global _pihole_sid_cache
+
     if not PIHOLE_URL or not PIHOLE_PASSWORD:
         return None
-    try:
-        resp = requests.post(
-            f"{PIHOLE_URL}/api/auth",
-            json={"password": PIHOLE_PASSWORD},
-            timeout=10,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        sid = data.get("session", {}).get("sid")
-        if not sid:
-            log.warning("pihole_auth_no_sid", response=data)
-        return sid
-    except Exception as exc:
-        log.warning("pihole_auth_failed", error=str(exc))
-        return None
+
+    with _pihole_sid_lock:
+        now = time.monotonic()
+        if _pihole_sid_cache is not None:
+            sid, acquired = _pihole_sid_cache
+            if now - acquired < _PIHOLE_SID_TTL:
+                return sid
+            # Session expired — clear cache and re-authenticate
+            _pihole_sid_cache = None
+
+        try:
+            resp = requests.post(
+                f"{PIHOLE_URL}/api/auth",
+                json={"password": PIHOLE_PASSWORD},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            sid = data.get("session", {}).get("sid")
+            if not sid:
+                log.warning("pihole_auth_no_sid", response=data)
+                return None
+            _pihole_sid_cache = (sid, time.monotonic())
+            return sid
+        except Exception as exc:
+            log.warning("pihole_auth_failed", error=str(exc))
+            return None
 
 
 def get_pihole_stats() -> dict:
@@ -588,6 +728,12 @@ def get_pihole_stats() -> dict:
             params=params,
             timeout=10,
         )
+        if resp.status_code == 401:
+            # Cached session may have been invalidated server-side; force refresh.
+            with _pihole_sid_lock:
+                _pihole_sid_cache = None
+            log.warning("pihole_stats_failed", error="401 Unauthorized -- session invalidated, will re-authenticate on next request")
+            return {}
         resp.raise_for_status()
         data = resp.json()
     except Exception as exc:

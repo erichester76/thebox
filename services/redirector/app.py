@@ -159,6 +159,51 @@ def run_cmd(args: list[str], check: bool = True) -> subprocess.CompletedProcess:
 
 # ─── Database helpers ────────────────────────────────────────────────────────
 
+def ensure_schema():
+    """Create tables this service reads from or writes to.
+
+    Scoped to: ``redirect_events``, ``alerts``.  All DDL uses
+    ``IF NOT EXISTS`` so this is safe to call on every startup.
+    """
+    statements = [
+        # redirect_events — redirector writes every ARP-spoof / DNS-redirect action
+        """CREATE TABLE IF NOT EXISTS redirect_events (
+            id          SERIAL PRIMARY KEY,
+            action      VARCHAR(64)  NOT NULL,
+            target_ip   VARCHAR(45)  NOT NULL,
+            target_mac  VARCHAR(17),
+            mode        VARCHAR(64)  NOT NULL,
+            detail      TEXT,
+            device_id   INTEGER REFERENCES devices(id),
+            created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""",
+        # alerts — redirector writes quarantine-start / stop alerts
+        """CREATE TABLE IF NOT EXISTS alerts (
+            id           SERIAL PRIMARY KEY,
+            source       VARCHAR(64) NOT NULL,
+            level        VARCHAR(16) NOT NULL DEFAULT 'info',
+            title        VARCHAR(255) NOT NULL,
+            detail       TEXT,
+            device_id    INTEGER REFERENCES devices(id),
+            acknowledged BOOLEAN NOT NULL DEFAULT FALSE,
+            created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_redirect_target_ip ON redirect_events(target_ip)",
+        "CREATE INDEX IF NOT EXISTS idx_redirect_created   ON redirect_events(created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_alerts_level       ON alerts(level)",
+        "CREATE INDEX IF NOT EXISTS idx_alerts_created     ON alerts(created_at)",
+    ]
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            for stmt in statements:
+                cur.execute(stmt)
+        conn.commit()
+    finally:
+        conn.close()
+    log.info("schema_ensured")
+
+
 def log_redirect_event(
     conn,
     action: str,
@@ -668,6 +713,10 @@ def sync_quarantine_targets(gateway_ip: str, gateway_mac: str):
 
 def main():
     log.info("redirector_service_start", modes=sorted(REDIRECT_MODES))
+
+    # Ensure the redirect_events table exists (handles databases created before
+    # this table was added to init.sql).
+    ensure_schema()
 
     # Resolve network identity
     own_ip = BOX_IP or get_own_ip()
