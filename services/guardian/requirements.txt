@@ -1,0 +1,7 @@
+psycopg2-binary==2.9.9
+redis==5.0.3
+structlog==24.1.0
+requests==2.31.0
+schedule==1.2.1
+netfilterqueue==1.1.0
+scapy==2.5.0

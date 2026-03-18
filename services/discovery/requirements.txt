@@ -1,0 +1,8 @@
+scapy==2.5.0
+python-nmap==0.7.1
+psycopg2-binary==2.9.9
+redis==5.0.3
+requests==2.31.0
+mac-vendor-lookup==0.1.12
+schedule==1.2.1
+structlog==24.1.0
