@@ -687,7 +687,8 @@ def api_honeypot_event(event_id: int):
 _pihole_sid_cache: tuple[str, float] | None = None
 _pihole_sid_lock = threading.Lock()
 # Pi-hole v6 sessions last 300 s by default; refresh 60 s before expiry.
-_PIHOLE_SID_TTL = 240.0
+# Tunable via PIHOLE_SID_TTL env var (seconds).
+_PIHOLE_SID_TTL = float(os.environ.get("PIHOLE_SID_TTL", "240.0"))
 
 
 def _pihole_authenticate() -> str | None:

@@ -67,23 +67,24 @@ def is_ignored(ip: str) -> bool:
     return any(addr in net for net in IGNORED_NETWORKS)
 
 
-# Hits within THRESHOLD_WINDOW seconds that exceed THRESHOLD_COUNT are "critical"
-THRESHOLD_COUNT = 3
-THRESHOLD_WINDOW = 60  # seconds
+# Hits within THRESHOLD_WINDOW seconds that exceed THRESHOLD_COUNT are "high/critical".
+# These can be tuned via environment variables without code changes.
+THRESHOLD_COUNT = int(os.environ.get("HONEYPOT_THRESHOLD_COUNT", "3"))
+THRESHOLD_WINDOW = int(os.environ.get("HONEYPOT_THRESHOLD_WINDOW", "60"))  # seconds
 
 # Port-sweep detection: SWEEP_THRESHOLD distinct ports from one IP within SWEEP_WINDOW
-SWEEP_THRESHOLD = 4
-SWEEP_WINDOW = 60  # seconds
+SWEEP_THRESHOLD = int(os.environ.get("HONEYPOT_SWEEP_THRESHOLD", "4"))
+SWEEP_WINDOW = int(os.environ.get("HONEYPOT_SWEEP_WINDOW", "60"))  # seconds
 
 # Interaction recv timeout (seconds)
-RECV_TIMEOUT = 4
+RECV_TIMEOUT = int(os.environ.get("HONEYPOT_RECV_TIMEOUT", "4"))
 
 # Maximum characters stored for payload_preview per event
-MAX_PAYLOAD_PREVIEW_LENGTH = 2000
+MAX_PAYLOAD_PREVIEW_LENGTH = int(os.environ.get("HONEYPOT_MAX_PAYLOAD_LENGTH", "2000"))
 
 # Credential attempts are tracked across a wider window to detect slow brute-force.
 # This multiplier × THRESHOLD_WINDOW gives the credential tracking window (seconds).
-CREDENTIAL_WINDOW_MULTIPLIER = 5
+CREDENTIAL_WINDOW_MULTIPLIER = int(os.environ.get("HONEYPOT_CREDENTIAL_WINDOW_MULTIPLIER", "5"))
 
 # ─── Logging ─────────────────────────────────────────────────────────────────
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
