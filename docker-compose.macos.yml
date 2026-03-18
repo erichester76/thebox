@@ -29,18 +29,15 @@
 # Linux host (Raspberry Pi, mini-PC, VM, etc.) on your LAN.
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Port mappings for the honeypot service are generated dynamically by
+# scripts/setup.sh based on the HONEYPOT_PORTS variable in .env.
+# Port 22 is always excluded on macOS because the system's built-in
+# OpenSSH service already binds that port.
+#
+# The generated mappings are written to docker-compose.macos.ports.yml
+# (gitignored) and merged into the compose command automatically.
+# If you run docker compose directly without setup.sh, create
+# docker-compose.macos.ports.yml manually or run setup.sh first.
+
 services:
-  honeypot:
-    ports:
-      - "21:21"
-      - "22:22"
-      - "23:23"
-      - "25:25"
-      - "80:80"
-      - "110:110"
-      - "143:143"
-      - "443:443"
-      - "445:445"
-      - "3306:3306"
-      - "3389:3389"
-      - "8080:8080"
+  honeypot: {}
