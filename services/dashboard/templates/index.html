@@ -7,6 +7,8 @@
   <style>
     /* ── Reset & base ───────────────────────────────── */
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    /* ── Dark theme (default) ───────────────────────── */
     :root {
       --bg:       #0d1117;
       --surface:  #161b22;
@@ -18,36 +20,149 @@
       --muted:    #8b949e;
       --text:     #c9d1d9;
       --radius:   8px;
+      --shadow:   0 1px 3px rgba(0,0,0,.4);
     }
-    body { background: var(--bg); color: var(--text); font-family: system-ui, sans-serif; font-size: 14px; min-height: 100vh; }
+
+    /* ── Light theme ────────────────────────────────── */
+    body.light {
+      --bg:       #f6f8fa;
+      --surface:  #ffffff;
+      --border:   #d0d7de;
+      --accent:   #0969da;
+      --success:  #1a7f37;
+      --warning:  #9a6700;
+      --danger:   #cf222e;
+      --muted:    #57606a;
+      --text:     #24292f;
+      --shadow:   0 1px 3px rgba(0,0,0,.12);
+    }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: system-ui, sans-serif;
+      font-size: 14px;
+      min-height: 100vh;
+      transition: background .2s, color .2s;
+    }
 
     /* ── Layout ────────────────────────────────────── */
-    header { background: var(--surface); border-bottom: 1px solid var(--border); padding: 12px 24px; display: flex; align-items: center; gap: 12px; }
+    header {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 10px 24px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      box-shadow: var(--shadow);
+    }
     header h1 { font-size: 18px; font-weight: 700; color: var(--accent); }
-    header .pill { background: var(--bg); border: 1px solid var(--border); border-radius: 99px; padding: 2px 10px; font-size: 12px; color: var(--muted); }
+    header .pill {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 99px;
+      padding: 2px 10px;
+      font-size: 12px;
+      color: var(--muted);
+    }
     #live-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); display: inline-block; margin-right: 4px; }
     #live-dot.online { background: var(--success); animation: pulse 2s infinite; }
     @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:0.4; } }
 
-    main { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; padding: 20px 24px; max-width: 1400px; margin: auto; }
-    @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+    /* Theme toggle button */
+    #theme-toggle {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 4px 10px;
+      font-size: 14px;
+      cursor: pointer;
+      color: var(--text);
+      transition: background .2s, border-color .2s;
+    }
+    #theme-toggle:hover { opacity: .8; }
+
+    /* ── 3-column grid ──────────────────────────────── */
+    main {
+      display: grid;
+      grid-template-columns: 1fr 1fr 1fr;
+      gap: 16px;
+      padding: 20px 24px;
+      max-width: 1600px;
+      margin: auto;
+    }
+    @media (max-width: 1100px) { main { grid-template-columns: 1fr 1fr; } }
+    @media (max-width: 700px)  { main { grid-template-columns: 1fr; } }
 
     /* ── Cards ─────────────────────────────────────── */
-    .card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
-    .card-header { padding: 12px 16px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--border); }
-    .card-header h2 { font-size: 14px; font-weight: 600; color: var(--text); }
-    .card-body { padding: 16px; }
-    .card.full { grid-column: 1 / -1; }
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: hidden;
+      box-shadow: var(--shadow);
+      transition: background .2s, border-color .2s;
+    }
+    .card-header {
+      padding: 10px 16px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      border-bottom: 1px solid var(--border);
+    }
+    .card-header h2 { font-size: 13px; font-weight: 600; color: var(--text); }
+    .card-body { padding: 14px 16px; }
+    /* Span helpers */
+    .span-3 { grid-column: 1 / -1; }
+    .span-2 { grid-column: span 2; }
+    @media (max-width: 1100px) { .span-2 { grid-column: 1 / -1; } }
 
-    /* ── Stats row ──────────────────────────────────── */
-    #stats-row { display: flex; gap: 12px; flex-wrap: wrap; }
-    .stat { flex: 1; min-width: 100px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius); padding: 12px 16px; text-align: center; }
-    .stat .val { font-size: 28px; font-weight: 700; }
-    .stat .lbl { font-size: 11px; color: var(--muted); margin-top: 2px; text-transform: uppercase; letter-spacing: .05em; }
-    .stat.trusted   .val { color: var(--success); }
-    .stat.quarantine .val { color: var(--warning); }
-    .stat.blocked   .val { color: var(--danger);  }
-    .stat.iot       .val { color: var(--accent);  }
+    /* ── Compact stats bar ──────────────────────────── */
+    #stats-bar {
+      display: flex;
+      gap: 0;
+      flex-wrap: wrap;
+      /* dividers between items */
+    }
+    .cstat {
+      flex: 1;
+      min-width: 90px;
+      padding: 10px 14px;
+      text-align: center;
+      border-right: 1px solid var(--border);
+      position: relative;
+    }
+    .cstat:last-child { border-right: none; }
+    .cstat .val { font-size: 22px; font-weight: 700; line-height: 1.1; }
+    .cstat .lbl { font-size: 10px; color: var(--muted); margin-top: 2px; text-transform: uppercase; letter-spacing: .05em; white-space: nowrap; }
+    .cstat .src { font-size: 9px; color: var(--muted); opacity: .6; text-transform: uppercase; letter-spacing: .04em; }
+    .cstat.trusted    .val { color: var(--success); }
+    .cstat.quarantine .val { color: var(--warning); }
+    .cstat.blocked    .val { color: var(--danger);  }
+    .cstat.iot        .val { color: var(--accent);  }
+    .cstat.honeypot   .val { color: #c084fc; }
+    .cstat.alerts     .val { color: var(--warning); }
+    .cstat.ph-blocked .val { color: var(--danger);  }
+    .cstat.ph-pct     .val { color: var(--warning); }
+    .cstat.ph-gravity .val { color: var(--success); }
+    /* Section divider inside stats bar */
+    .cstat-sep {
+      width: 1px;
+      background: var(--border);
+      margin: 6px 0;
+      opacity: .5;
+    }
+    .stats-section-label {
+      font-size: 9px;
+      text-transform: uppercase;
+      letter-spacing: .08em;
+      color: var(--muted);
+      padding: 4px 10px 0;
+      opacity: .7;
+      white-space: nowrap;
+      align-self: flex-end;
+      writing-mode: horizontal-tb;
+    }
 
     /* ── Tables ─────────────────────────────────────── */
     table { width: 100%; border-collapse: collapse; }
@@ -58,9 +173,10 @@
     th.sort-asc::after  { content: ' ↑'; opacity: 1; color: var(--accent); }
     th.sort-desc::after { content: ' ↓'; opacity: 1; color: var(--accent); }
     th.sort-asc, th.sort-desc { color: var(--accent); }
-    td { padding: 8px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+    td { padding: 7px 8px; border-bottom: 1px solid var(--border); vertical-align: middle; }
     tr:last-child td { border-bottom: none; }
     tr:hover td { background: rgba(88,166,255,0.05); }
+    body.light tr:hover td { background: rgba(9,105,218,0.06); }
 
     /* ── Status badges ──────────────────────────────── */
     .badge { display: inline-block; padding: 2px 8px; border-radius: 99px; font-size: 11px; font-weight: 600; }
@@ -83,6 +199,7 @@
     .btn-user   { background: rgba(139,148,158,.15);color: var(--text);    }
     .btn-danger { background: rgba(248,81,73,.15);  color: var(--danger);  }
     .btn:hover  { opacity: .8; }
+    .ml-auto { margin-left: auto; }
 
     /* ── Modal ──────────────────────────────────────── */
     .modal-backdrop { display:none; position:fixed; inset:0; background:rgba(0,0,0,.6); z-index:100; align-items:center; justify-content:center; }
@@ -93,7 +210,7 @@
     .modal input, .modal select { width:100%; background:var(--bg); border:1px solid var(--border); border-radius:6px; padding:6px 10px; color:var(--text); font-size:13px; }
     .modal input:focus, .modal select:focus { outline:none; border-color:var(--accent); }
     .modal-actions { display:flex; gap:8px; justify-content:flex-end; margin-top:20px; }
-    .btn-primary { background:var(--accent); color:#000; padding:6px 16px; font-size:13px; }
+    .btn-primary { background:var(--accent); color:#fff; padding:6px 16px; font-size:13px; }
 
     /* ── Checklist (group membership editor) ────────── */
     .checklist { max-height:160px; overflow-y:auto; border:1px solid var(--border); border-radius:6px; padding:8px; background:var(--bg); }
@@ -106,18 +223,20 @@
     .form-row input:focus { outline:none; border-color:var(--accent); }
 
     /* ── Alert list ─────────────────────────────────── */
-    .alert-item { padding: 10px 12px; border-left: 3px solid var(--muted); margin-bottom: 8px; background: var(--bg); border-radius: 0 6px 6px 0; }
+    .alert-item { padding: 9px 12px; border-left: 3px solid var(--muted); margin-bottom: 7px; background: var(--bg); border-radius: 0 6px 6px 0; }
     .alert-item.warning  { border-left-color: var(--warning); }
     .alert-item.critical { border-left-color: var(--danger); }
     .alert-item.info     { border-left-color: var(--accent); }
-    .alert-title { font-weight: 600; margin-bottom: 2px; }
+    .alert-title { font-weight: 600; margin-bottom: 2px; font-size: 13px; }
     .alert-meta  { font-size: 11px; color: var(--muted); }
 
     /* ── Empty state ────────────────────────────────── */
     .empty { text-align: center; padding: 32px; color: var(--muted); }
 
-    /* ── Scrollable panel ───────────────────────────── */
-    .scrollable { max-height: 380px; overflow-y: auto; }
+    /* ── Scrollable panels ──────────────────────────── */
+    .scrollable      { max-height: 400px; overflow-y: auto; }
+    .scrollable-tall { max-height: 520px; overflow-y: auto; }
+    .scrollable-sm   { max-height: 280px; overflow-y: auto; }
 
     /* ── Honeypot table ─────────────────────────────── */
     #hp-table-wrap table { font-size: 12px; }
@@ -142,14 +261,7 @@
     .event-detail-val { font-size: 13px; color: var(--text); font-family: monospace; word-break: break-all; }
     .payload-box { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; font-family: monospace; font-size: 12px; white-space: pre-wrap; word-break: break-all; max-height: 200px; overflow-y: auto; color: var(--text); }
 
-    /* ── Pi-hole stats ──────────────────────────────────────── */
-    #pihole-stats { display: flex; gap: 12px; flex-wrap: wrap; }
-    .ph-stat { flex: 1; min-width: 100px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius); padding: 12px 16px; text-align: center; }
-    .ph-stat .val { font-size: 24px; font-weight: 700; color: var(--accent); }
-    .ph-stat .lbl { font-size: 11px; color: var(--muted); margin-top: 2px; text-transform: uppercase; letter-spacing: .05em; }
-    .ph-stat.blocked-stat .val { color: var(--danger); }
-    .ph-stat.pct-stat     .val { color: var(--warning); }
-    .ph-stat.gravity-stat .val { color: var(--success); }
+    /* ── Pi-hole status badge ───────────────────────── */
     #pihole-status-badge { font-size: 11px; padding: 2px 8px; border-radius: 99px; font-weight: 600; }
     #pihole-status-badge.enabled  { background: rgba(63,185,80,.15);  color: var(--success); }
     #pihole-status-badge.disabled { background: rgba(248,81,73,.15);  color: var(--danger); }
@@ -161,50 +273,42 @@
 <header>
   <h1>🛡 TheBox</h1>
   <span class="pill">Network Command Center</span>
-  <span style="margin-left:auto;display:flex;align-items:center;font-size:12px;color:var(--muted)">
-    <span id="live-dot"></span><span id="live-label">Connecting…</span>
+  <span style="margin-left:auto;display:flex;align-items:center;gap:12px;font-size:12px;color:var(--muted)">
+    <span style="display:flex;align-items:center"><span id="live-dot"></span><span id="live-label">Connecting…</span></span>
+    <button id="theme-toggle" onclick="toggleTheme()" title="Toggle dark/light mode">☀️</button>
   </span>
 </header>
 
 <main>
 
-  <!-- Stats row (full width) -->
-  <div class="card full">
-    <div class="card-header"><h2>Network Overview</h2><button class="btn btn-ack" onclick="loadStats()">Refresh</button></div>
-    <div class="card-body">
-      <div id="stats-row">
-        <div class="stat trusted">   <div class="val" id="s-trusted">–</div>   <div class="lbl">Trusted</div></div>
-        <div class="stat quarantine"><div class="val" id="s-quarantine">–</div><div class="lbl">Quarantined</div></div>
-        <div class="stat blocked">   <div class="val" id="s-blocked">–</div>   <div class="lbl">Blocked</div></div>
-        <div class="stat iot">       <div class="val" id="s-iot">–</div>       <div class="lbl">IoT</div></div>
-        <div class="stat">           <div class="val" id="s-total">–</div>     <div class="lbl">Total Devices</div></div>
-        <div class="stat">           <div class="val" id="s-honeypot">–</div>  <div class="lbl">Honeypot Hits</div></div>
-        <div class="stat">           <div class="val" id="s-alerts" style="color:var(--warning)">–</div><div class="lbl">Open Alerts</div></div>
-      </div>
-    </div>
-  </div>
-
-  <!-- Pi-hole statistics -->
-  <div class="card full">
+  <!-- Combined stats bar (full width) -->
+  <div class="card span-3">
     <div class="card-header">
-      <h2>Pi-hole DNS Statistics</h2>
-      <span id="pihole-status-badge" class="unknown">unknown</span>
-      <button class="btn btn-ack" style="margin-left:auto" onclick="loadPihole()">Refresh</button>
+      <h2>Dashboard Overview</h2>
+      <span id="pihole-status-badge" class="unknown" style="margin-left:6px">unknown</span>
+      <button class="btn btn-ack ml-auto" onclick="loadStats();loadPihole()">Refresh</button>
     </div>
-    <div class="card-body">
-      <div id="pihole-stats">
-        <div class="ph-stat">           <div class="val" id="ph-total">–</div>    <div class="lbl">Total Queries</div></div>
-        <div class="ph-stat blocked-stat"><div class="val" id="ph-blocked">–</div> <div class="lbl">Queries Blocked</div></div>
-        <div class="ph-stat pct-stat">   <div class="val" id="ph-pct">–</div>     <div class="lbl">% Blocked</div></div>
-        <div class="ph-stat gravity-stat"><div class="val" id="ph-gravity">–</div> <div class="lbl">Domains Blocked</div></div>
-        <div class="ph-stat">           <div class="val" id="ph-clients">–</div>  <div class="lbl">Active Clients</div></div>
-      </div>
+    <div id="stats-bar">
+      <!-- Network device stats -->
+      <div class="cstat trusted">   <div class="val" id="s-trusted">–</div>   <div class="lbl">Trusted</div>    <div class="src">devices</div></div>
+      <div class="cstat quarantine"><div class="val" id="s-quarantine">–</div><div class="lbl">Quarantined</div><div class="src">devices</div></div>
+      <div class="cstat blocked">   <div class="val" id="s-blocked">–</div>   <div class="lbl">Blocked</div>    <div class="src">devices</div></div>
+      <div class="cstat iot">       <div class="val" id="s-iot">–</div>       <div class="lbl">IoT</div>         <div class="src">devices</div></div>
+      <div class="cstat">           <div class="val" id="s-total">–</div>     <div class="lbl">Total</div>       <div class="src">devices</div></div>
+      <div class="cstat honeypot">  <div class="val" id="s-honeypot">–</div>  <div class="lbl">HP Hits</div>    <div class="src">honeypot</div></div>
+      <div class="cstat alerts">    <div class="val" id="s-alerts">–</div>    <div class="lbl">Open Alerts</div><div class="src">alerts</div></div>
+      <!-- Pi-hole stats -->
+      <div class="cstat">           <div class="val" id="ph-total">–</div>    <div class="lbl">DNS Queries</div> <div class="src">pi-hole</div></div>
+      <div class="cstat ph-blocked"><div class="val" id="ph-blocked">–</div>  <div class="lbl">DNS Blocked</div> <div class="src">pi-hole</div></div>
+      <div class="cstat ph-pct">    <div class="val" id="ph-pct">–</div>      <div class="lbl">% Blocked</div>   <div class="src">pi-hole</div></div>
+      <div class="cstat ph-gravity"><div class="val" id="ph-gravity">–</div>  <div class="lbl">Block Lists</div> <div class="src">pi-hole</div></div>
+      <div class="cstat">           <div class="val" id="ph-clients">–</div>  <div class="lbl">DNS Clients</div> <div class="src">pi-hole</div></div>
     </div>
   </div>
 
-  <!-- Devices table -->
-  <div class="card full">
-    <div class="card-header"><h2>Devices</h2><button class="btn btn-ack" onclick="loadDevices()">Refresh</button></div>
+  <!-- Devices table (full width) -->
+  <div class="card span-3">
+    <div class="card-header"><h2>Devices</h2><button class="btn btn-ack ml-auto" onclick="loadDevices()">Refresh</button></div>
     <div class="card-body">
       <div class="scrollable">
         <table id="devices-table">
@@ -227,16 +331,14 @@
     </div>
   </div>
 
-  <!-- Alerts panel -->
-  <div class="card">
-    <div class="card-header"><h2>Recent Alerts</h2><button class="btn btn-ack" onclick="loadAlerts()">Refresh</button></div>
-    <div class="card-body scrollable" id="alerts-list"><div class="empty">Loading…</div></div>
-  </div>
-
-  <!-- Honeypot feed -->
-  <div class="card full">
-    <div class="card-header"><h2>Honeypot Activity</h2><span style="font-size:11px;color:var(--muted);margin-left:8px">Click a row to view full details</span><button class="btn btn-ack" style="margin-left:auto" onclick="loadHoneypot()">Refresh</button></div>
-    <div class="card-body scrollable" id="hp-table-wrap">
+  <!-- Honeypot feed (2/3 width) + Alerts (1/3 width) side by side -->
+  <div class="card span-2">
+    <div class="card-header">
+      <h2>Honeypot Activity</h2>
+      <span style="font-size:11px;color:var(--muted)">Click row for details</span>
+      <button class="btn btn-ack ml-auto" onclick="loadHoneypot()">Refresh</button>
+    </div>
+    <div class="card-body scrollable-tall" id="hp-table-wrap">
       <table id="hp-table">
         <thead><tr>
           <th>Time</th>
@@ -251,11 +353,17 @@
     </div>
   </div>
 
+  <!-- Alerts panel (1/3 width, beside honeypot) -->
+  <div class="card">
+    <div class="card-header"><h2>Recent Alerts</h2><button class="btn btn-ack ml-auto" onclick="loadAlerts()">Refresh</button></div>
+    <div class="card-body scrollable-tall" id="alerts-list"><div class="empty">Loading…</div></div>
+  </div>
+
   <!-- Users management -->
-  <div class="card full">
+  <div class="card span-3">
     <div class="card-header">
       <h2>Users</h2>
-      <button class="btn btn-ack" onclick="loadUsers()">Refresh</button>
+      <button class="btn btn-ack ml-auto" onclick="loadUsers()">Refresh</button>
     </div>
     <div class="card-body">
       <div class="form-row" style="margin-bottom:16px">
@@ -277,10 +385,10 @@
   </div>
 
   <!-- Groups management -->
-  <div class="card full">
+  <div class="card span-3">
     <div class="card-header">
       <h2>Groups</h2>
-      <button class="btn btn-ack" onclick="loadGroups()">Refresh</button>
+      <button class="btn btn-ack ml-auto" onclick="loadGroups()">Refresh</button>
     </div>
     <div class="card-body">
       <div class="form-row" style="margin-bottom:16px">
@@ -377,6 +485,23 @@
 </div>
 
 <script>
+// ── Theme toggle ─────────────────────────────────────────────────────────────
+function applyTheme(theme) {
+  const isLight = theme === 'light';
+  document.body.classList.toggle('light', isLight);
+  const btn = document.getElementById('theme-toggle');
+  if (btn) btn.textContent = isLight ? '🌙' : '☀️';
+}
+
+function toggleTheme() {
+  const isLight = document.body.classList.toggle('light');
+  document.getElementById('theme-toggle').textContent = isLight ? '🌙' : '☀️';
+  localStorage.setItem('thebox-theme', isLight ? 'light' : 'dark');
+}
+
+// Apply saved theme on load (before DOMContentLoaded)
+applyTheme(localStorage.getItem('thebox-theme') || 'dark');
+
 // ── API helpers ──────────────────────────────────────────────────────────────
 async function api(path, opts={}) {
   const r = await fetch(path, opts);
