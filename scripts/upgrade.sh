@@ -1,13 +1,22 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# TheBox — Upgrade script
+# TheBox — Upgrade / schema-migration script
 # Run as root (or with sudo) on the TheBox host.
-# Re-applies config/postgres/init.sql against the running database so that
-# any tables or indexes added since the initial install are created, then
-# rebuilds and restarts all services to pick up code changes.
 #
-# All schema statements use CREATE TABLE IF NOT EXISTS / CREATE INDEX IF NOT
-# EXISTS, so existing data is never modified or lost.
+# Schema migrations
+# -----------------
+# Each *.sql file in config/postgres/migrations/ is a versioned, idempotent
+# migration (numbered prefix: 0001_initial_schema.sql, 0002_…, …).
+# A "schema_migrations" table in PostgreSQL records which versions have been
+# applied; already-applied migrations are skipped so the script is safe to
+# re-run at any time.
+#
+# To introduce a schema change:
+#   1. Add a new file: config/postgres/migrations/NNNN_description.sql
+#   2. Write idempotent SQL (ALTER TABLE … ADD COLUMN IF NOT EXISTS, etc.)
+#   3. Re-run this script — only the new migration will be applied.
+#
+# Existing data is never modified or lost.
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
@@ -88,12 +97,77 @@ for i in $(seq 1 30); do
   sleep 2
 done
 
-# ── Re-apply init.sql ─────────────────────────────────────────────────────────
-echo "Applying schema migrations from config/postgres/init.sql…"
+# ── Schema migrations ─────────────────────────────────────────────────────────
+# Each *.sql file in config/postgres/migrations/ is a numbered, idempotent
+# migration (e.g. 0001_initial_schema.sql, 0002_add_foo_column.sql).
+# A schema_migrations table in PostgreSQL tracks which versions have already
+# been applied so that each migration is only ever executed once.
+# To add a new schema change, create the next numbered file and re-run this
+# script; already-applied migrations are safely skipped.
+
+echo "Running schema migrations…"
+
+# Ensure the migration-tracking table exists (safe on both fresh and
+# pre-migration installs; init.sql also creates it on new deployments).
 # shellcheck disable=SC2086
 $COMPOSE_CMD $COMPOSE_FILES exec -T postgres \
-  psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
-  < "$REPO_DIR/config/postgres/init.sql"
+  psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c \
+  "CREATE TABLE IF NOT EXISTS schema_migrations (
+       version    VARCHAR(16) NOT NULL PRIMARY KEY,
+       applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+   );" > /dev/null
+
+MIGRATIONS_DIR="$REPO_DIR/config/postgres/migrations"
+
+# Collect migration files, sorted numerically.
+mapfile -t MIGRATION_FILES < <(find "$MIGRATIONS_DIR" -maxdepth 1 -name '*.sql' | sort)
+
+if [ "${#MIGRATION_FILES[@]}" -eq 0 ]; then
+  echo "  No migration files found in $MIGRATIONS_DIR."
+else
+  for migration_file in "${MIGRATION_FILES[@]}"; do
+    filename="$(basename "$migration_file")"
+    # Version is the leading numeric prefix (e.g. "0001" from 0001_foo.sql).
+    version="${filename%%_*}"
+
+    # Validate version contains only digits so it can never be used to inject SQL.
+    if [[ ! "$version" =~ ^[0-9]+$ ]]; then
+      echo "  ⚠  Skipping $filename — version prefix '$version' must be all digits."
+      continue
+    fi
+
+    # Check whether this version has already been recorded.
+    # Trim whitespace from psql output before numeric comparison.
+    # shellcheck disable=SC2086
+    already_applied=$($COMPOSE_CMD $COMPOSE_FILES exec -T postgres \
+      psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc \
+      "SELECT COUNT(*) FROM schema_migrations WHERE version = '$version';" \
+      | tr -d '[:space:]')
+
+    if [ "$already_applied" -gt 0 ]; then
+      echo "  ↷ $filename — already applied, skipping."
+      continue
+    fi
+
+    echo "  ➜ Applying $filename…"
+    # shellcheck disable=SC2086
+    if $COMPOSE_CMD $COMPOSE_FILES exec -T postgres \
+        psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+        < "$migration_file"; then
+      # Record successful application.
+      # shellcheck disable=SC2086
+      $COMPOSE_CMD $COMPOSE_FILES exec -T postgres \
+        psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c \
+        "INSERT INTO schema_migrations (version) VALUES ('${version}')
+             ON CONFLICT (version) DO NOTHING;" > /dev/null
+      echo "    ✔ $filename applied."
+    else
+      echo "ERROR: Migration $filename failed — aborting."
+      exit 1
+    fi
+  done
+fi
+
 echo "  ✔ Schema is up to date."
 echo
 
@@ -113,3 +187,8 @@ echo "╚═══════════════════════�
 echo
 echo "Check the logs with:"
 echo "  docker compose logs -f"
+echo
+echo "To add a schema change in future:"
+echo "  1. Create config/postgres/migrations/NNNN_description.sql"
+echo "  2. Write idempotent SQL (ALTER TABLE … ADD COLUMN IF NOT EXISTS, etc.)"
+echo "  3. Re-run scripts/upgrade.sh"
