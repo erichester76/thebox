@@ -618,7 +618,7 @@ def get_pihole_stats() -> dict:
             # Cached session may have been invalidated server-side; force refresh.
             with _pihole_sid_lock:
                 _pihole_sid_cache = None
-            log.warning("pihole_stats_failed", error="401 Unauthorized — session invalidated, will re-authenticate on next request")
+            log.warning("pihole_stats_failed", error="401 Unauthorized -- session invalidated, will re-authenticate on next request")
             return {}
         resp.raise_for_status()
         data = resp.json()

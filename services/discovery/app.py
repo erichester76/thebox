@@ -117,6 +117,8 @@ def nmap_ping_sweep(network: str) -> list[dict]:
 
     hosts = []
     for ip in nm.all_hosts():
+        if nm[ip].state() != "up":
+            continue
         host_data: dict[str, str] = {"ip": ip}
         mac = nm[ip].get("addresses", {}).get("mac", "").upper()
         if mac:
