@@ -1,3 +1,5 @@
+# STILL EARLY DEVELOPMENT - USE WITH CAUTION
+
 # 🛡 TheBox — Container-Based Home Network Server
 
 TheBox is a self-hosted, Docker Compose-based home network security and management platform.  It brings together capabilities inspired by Pi-hole, Firewalla, Bark, and UniFi into a single, easily deployable solution.
