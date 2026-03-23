@@ -12,7 +12,9 @@ TheBox is a self-hosted, Docker Compose-based home network security and manageme
 |---------|-------------|
 | **Auto-discovery** | ARP sweeps + nmap scan every N minutes to find every device on your network |
 | **Pi-hole client discovery** | Queries the Pi-hole v6 FTL API to discover devices that have made DNS queries, even if they didn't respond to ARP |
-| **DNS packet sniffing** | Captures DNS query packets on the network interface to discover devices in real-time |
+| **DNS packet sniffing** | Captures DNS query packets (port 53) and mDNS responses (port 5353) to discover devices and extract hostnames in real-time |
+| **DHCP hostname sniffing** | Extracts device hostnames directly from DHCP DISCOVER/REQUEST packets (option 12) — more reliable than reverse DNS, updated the moment a device connects |
+| **ARP packet sniffing** | Detects devices the instant they send an ARP request, without waiting for the next periodic scan; includes ARP spoof detection |
 | **SSDP / UPnP discovery** | Sends multicast M-SEARCH probes; fetches UPnP device description XML for manufacturer, model, and friendly name |
 | **mDNS / Zeroconf discovery** | Browses DNS-SD service types (Bonjour/Avahi) to find Apple, Chromecast, printers, HomeKit, and other Zeroconf devices |
 | **NetBIOS discovery** | Runs `nmap nbstat` across the subnet to retrieve NetBIOS hostnames and workgroup names for Windows/Samba hosts |
@@ -62,7 +64,7 @@ TheBox is a self-hosted, Docker Compose-based home network security and manageme
 | `pihole` | 53 (DNS), 80 (API), 8080 (UI) | Pi-hole v6 DNS filtering / ad-blocking |
 | `postgres` | internal | Persistent state |
 | `redis` | internal | Event bus & ephemeral cache |
-| `discovery` | host network | Network scanner (ARP + nmap + Pi-hole + DNS sniff + SSDP + mDNS + NetBIOS + banners) |
+| `discovery` | host network | Network scanner (ARP + nmap + Pi-hole + DNS sniff + DHCP sniff + ARP sniff + SSDP + mDNS + NetBIOS + banners) |
 | `guardian` | host network | iptables/ipset policy enforcement |
 | `honeypot` | host network | Multi-protocol fake-service attack catcher |
 | `redirector` | host network | DNS/DHCP traffic interception and quarantine enforcement |
@@ -164,7 +166,8 @@ it detects macOS.
 | Honeypot (port listeners) | ✅ Full | Ports mapped to Mac host via explicit port bindings |
 | Pi-hole client discovery | ✅ Full | Queries the Pi-hole FTL API via bridge network |
 | DNS packet sniffing | ⚠️ Limited | Sniffs the Docker bridge interface; may not capture queries from physical LAN hosts |
-| ARP-based LAN scanning | ⚠️ Limited | Docker Desktop VM's network namespace is used, not the Mac's physical interface. Discovery starts without errors but may not reach all LAN devices. |
+| DHCP hostname sniffing | ⚠️ Limited | Sniffs the Docker bridge interface; DHCP packets from physical LAN hosts may not reach the container |
+| ARP-based LAN scanning / ARP sniffing | ⚠️ Limited | Docker Desktop VM's network namespace is used, not the Mac's physical interface. Discovery starts without errors but may not reach all LAN devices. |
 | iptables quarantine / IoT allow-lists | ⚠️ Limited | iptables/ipset are Linux kernel features. Guardian starts and manages database state normally but will not enforce rules on physical LAN traffic. |
 | ARP spoofing / traffic redirection | ⚠️ Limited | Redirector starts and manages state normally but ARP/iptables operations target the Docker VM's stack, not physical LAN traffic. |
 
@@ -221,8 +224,10 @@ nano .env
 |----------|---------|-------------|
 | `NETWORK_RANGES` | `192.168.1.0/24` | Comma-separated CIDR ranges to scan |
 | `SCAN_INTERVAL` | `300` | Seconds between ARP/nmap discovery scans |
-| `DNS_SNIFF_ENABLED` | `true` | Capture DNS query packets to discover devices in real-time (requires `NET_RAW`; most effective with `network_mode: host` on Linux) |
+| `DNS_SNIFF_ENABLED` | `true` | Capture DNS query packets (port 53) and mDNS responses (port 5353) to discover devices and extract hostnames in real-time (requires `NET_RAW`; most effective with `network_mode: host` on Linux) |
 | `DNS_SNIFF_IFACE` | *(auto)* | Network interface to sniff; leave empty for auto-detection |
+| `DHCP_SNIFF_ENABLED` | `true` | Extract device hostnames from DHCP DISCOVER/REQUEST packets (option 12) in real-time — more reliable than reverse DNS (requires `NET_RAW`) |
+| `ARP_SNIFF_ENABLED` | `true` | Detect new devices immediately from ARP traffic, rather than waiting for the next periodic sweep; includes ARP spoof detection (requires `NET_RAW`) |
 | `SSDP_ENABLED` | `true` | Send SSDP/UPnP multicast M-SEARCH probes to discover routers, smart TVs, NAS, and other UPnP devices |
 | `SSDP_TIMEOUT` | `5` | Seconds to wait for SSDP responses per scan cycle |
 | `MDNS_ENABLED` | `true` | Browse mDNS/Zeroconf DNS-SD service types (Bonjour/Avahi) to find Apple, Chromecast, printers, and HomeKit devices |
@@ -398,7 +403,7 @@ thebox/
 │   ├── postgres/init.sql        # DB schema (devices, alerts, honeypot_events, iot_allowlist, …)
 │   └── redis/redis.conf
 ├── services/
-│   ├── discovery/               # Network scanner (ARP + nmap + Pi-hole + DNS sniff + SSDP + mDNS + NetBIOS + banners)
+│   ├── discovery/               # Network scanner (ARP + nmap + Pi-hole + DNS/DHCP/ARP sniff + SSDP + mDNS + NetBIOS + banners)
 │   ├── guardian/                # iptables/ipset policy enforcement
 │   ├── honeypot/                # Multi-protocol fake-service attack catcher
 │   ├── redirector/              # DNS/DHCP traffic redirector + quarantine enforcement

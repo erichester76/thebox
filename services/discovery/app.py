@@ -47,7 +47,7 @@ import requests
 import schedule
 import structlog
 from mac_vendor_lookup import MacLookup, VendorNotFoundError
-from scapy.all import ARP, DNS, DNSQR, Ether, IP, UDP, srp, sniff  # noqa: F401
+from scapy.all import ARP, BOOTP, DNSRR, DHCP, DNS, DNSQR, Ether, IP, TCP, UDP, srp, sniff  # noqa: F401
 from zeroconf import ServiceBrowser, Zeroconf
 
 # ─── Configuration ───────────────────────────────────────────────────────────
@@ -85,6 +85,12 @@ NETBIOS_ENABLED = os.environ.get("NETBIOS_ENABLED", "true").lower() == "true"
 # HTTP/HTTPS banner grabbing
 BANNER_GRAB_ENABLED = os.environ.get("BANNER_GRAB_ENABLED", "true").lower() == "true"
 BANNER_GRAB_TIMEOUT = float(os.environ.get("BANNER_GRAB_TIMEOUT", "3"))
+
+# DHCP packet sniffing — extracts device hostnames from DHCP option 12
+DHCP_SNIFF_ENABLED = os.environ.get("DHCP_SNIFF_ENABLED", "true").lower() == "true"
+
+# ARP packet sniffing — real-time device detection between scan cycles
+ARP_SNIFF_ENABLED = os.environ.get("ARP_SNIFF_ENABLED", "true").lower() == "true"
 
 # ─── Logging ─────────────────────────────────────────────────────────────────
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
@@ -765,32 +771,97 @@ def process_completed_learnings(conn, rdb) -> int:
 # in high-traffic environments; excess items are dropped silently.
 _dns_sniff_queue: queue.Queue = queue.Queue(maxsize=10_000)
 
+# Hostname hints extracted from mDNS A/AAAA responses (port 5353).
+# Each entry is a dict with keys: ip, hostname, device_type (optional).
+_mdns_hostname_queue: queue.Queue = queue.Queue(maxsize=10_000)
+
 
 def _dns_packet_handler(pkt) -> None:
-    """Scapy packet callback — enqueue the source IP of every DNS query."""
+    """Scapy packet callback — enqueue source IPs of DNS queries and extract
+    hostname hints from mDNS A/AAAA responses (inspired by netsleuth).
+
+    For regular DNS (port 53): enqueues the source IP of every outbound query
+    so that the device can be discovered and enriched in the next scan cycle.
+
+    For mDNS (port 5353): inspects DNS response records to extract:
+    - Hostnames from A (type 1) and AAAA (type 28) records.
+    - Printer device type from TXT records containing 'ipp'.
+    - Apple/mobile device type from TXT records containing 'rdlink'.
+    """
     try:
-        if (
-            pkt.haslayer(IP)
-            and pkt.haslayer(UDP)
-            and pkt.haslayer(DNS)
-            and pkt[DNS].qr == 0  # query, not response
-            and pkt.haslayer(DNSQR)
-        ):
+        if not (pkt.haslayer(IP) and pkt.haslayer(UDP) and pkt.haslayer(DNS)):
+            return
+
+        sport = pkt[UDP].sport
+        src_ip = pkt[IP].src
+
+        # Regular DNS queries (port 53) — enqueue for device discovery
+        if sport != 5353 and pkt[DNS].qr == 0 and pkt.haslayer(DNSQR):
             try:
-                _dns_sniff_queue.put_nowait(pkt[IP].src)
+                _dns_sniff_queue.put_nowait(src_ip)
             except queue.Full:
-                pass  # queue is bounded; drop the item rather than block
+                pass
+            return
+
+        # mDNS responses (port 5353) — extract hostname and device-type hints
+        if sport == 5353 and pkt[DNS].qr == 1 and pkt[DNS].ancount >= 1:
+            try:
+                ans = pkt[DNS].an
+                while ans and hasattr(ans, "type"):
+                    rtype = ans.type
+                    rname = b""
+                    if hasattr(ans, "rrname"):
+                        rname = ans.rrname if isinstance(ans.rrname, bytes) else ans.rrname.encode()
+
+                    if rtype in (1, 28):
+                        # A / AAAA record: rrname is the hostname for this IP
+                        hostname_full = rname.decode("utf-8", errors="replace").rstrip(".")
+                        hostname_short = hostname_full.split(".")[0]
+                        if hostname_short:
+                            entry: dict = {"ip": src_ip, "hostname": hostname_short}
+                            try:
+                                _mdns_hostname_queue.put_nowait(entry)
+                            except queue.Full:
+                                pass
+
+                    elif rtype == 16:
+                        # TXT record: check for service-type hints
+                        name_str = rname.decode("utf-8", errors="replace").lower()
+                        device_type: str | None = None
+                        if "._ipp._tcp" in name_str or "._ipps._tcp" in name_str:
+                            device_type = "printer"
+                        elif "rdlink" in name_str:
+                            # Apple Private Relay / Continuity — indicates an Apple mobile device
+                            device_type = "mobile"
+                        if device_type:
+                            hint: dict = {"ip": src_ip, "device_type": device_type}
+                            try:
+                                _mdns_hostname_queue.put_nowait(hint)
+                            except queue.Full:
+                                pass
+
+                    # Advance to next answer record
+                    if hasattr(ans, "payload") and isinstance(ans.payload, DNSRR):
+                        ans = ans.payload
+                    else:
+                        break
+            except Exception as exc:
+                log.debug("mdns_packet_parse_error", ip=src_ip, error=str(exc))
+
     except Exception as exc:
         log.debug("dns_packet_handler_error", error=str(exc))
 
 
 def start_dns_sniffer() -> threading.Thread:
-    """Start a daemon thread that sniffs DNS query packets.
+    """Start a daemon thread that sniffs DNS query packets and mDNS responses.
 
-    The thread runs ``scapy.sniff()`` with ``filter="udp port 53"`` so that
-    every DNS query seen on the network interface triggers
-    :func:`_dns_packet_handler`.  The thread is a daemon so it is
-    automatically cleaned up when the main process exits.
+    The thread runs ``scapy.sniff()`` capturing both regular DNS (port 53)
+    and mDNS (port 5353) traffic.  Every DNS query triggers device discovery;
+    mDNS A/AAAA/TXT responses provide real-time hostname and device-type hints
+    without waiting for a Zeroconf service advertisement.
+
+    The thread is a daemon so it is automatically cleaned up when the main
+    process exits.
 
     Returns the :class:`threading.Thread` object (already started).
     """
@@ -798,7 +869,7 @@ def start_dns_sniffer() -> threading.Thread:
         log.info("dns_sniffer_start", iface=DNS_SNIFF_IFACE or "auto")
         try:
             sniff(
-                filter="udp port 53",
+                filter="udp port 53 or udp port 5353",
                 prn=_dns_packet_handler,
                 store=False,
                 iface=DNS_SNIFF_IFACE,
@@ -877,9 +948,385 @@ def process_dns_sniff_queue(conn, rdb) -> int:
     return new_count
 
 
-# ─── SSDP / UPnP discovery ───────────────────────────────────────────────────
+def process_mdns_sniff_queue(conn) -> int:
+    """Drain the mDNS hostname queue and update device records in the DB.
 
-_SSDP_MULTICAST_ADDR = "239.255.255.250"
+    Processes hostname and device-type hints extracted from mDNS A/AAAA/TXT
+    responses by the DNS sniffer thread.  For each hint:
+
+    - Updates the ``hostname`` column when the device exists but currently has
+      no hostname (NULL or empty string).
+    - Updates the ``device_type`` column when the current value is ``unknown``
+      and the mDNS hint provides a more specific classification (e.g. printer,
+      mobile).
+
+    Returns the number of device rows touched.
+    """
+    # Collect all hints; keyed by IP so later entries override earlier ones
+    # per-IP (last hostname/type hint wins within a single drain).
+    hints: dict[str, dict] = {}
+    while True:
+        try:
+            entry = _mdns_hostname_queue.get_nowait()
+        except queue.Empty:
+            break
+        ip = entry.get("ip")
+        if not ip:
+            continue
+        if ip not in hints:
+            hints[ip] = {}
+        if entry.get("hostname"):
+            hints[ip]["hostname"] = entry["hostname"]
+        if entry.get("device_type"):
+            hints[ip]["device_type"] = entry["device_type"]
+
+    if not hints:
+        return 0
+
+    log.info("mdns_sniff_queue_drain", candidates=len(hints))
+    updated = 0
+
+    for ip, hint in hints.items():
+        hostname = hint.get("hostname")
+        device_type = hint.get("device_type")
+        if not hostname and not device_type:
+            continue
+
+        with conn.cursor() as cur:
+            if hostname and device_type:
+                cur.execute(
+                    """
+                    UPDATE devices
+                    SET hostname = COALESCE(NULLIF(hostname, ''), %s),
+                        device_type = CASE WHEN device_type = 'unknown' THEN %s ELSE device_type END,
+                        last_seen = NOW()
+                    WHERE ip_address = %s
+                      AND (hostname IS NULL OR hostname = '' OR device_type = 'unknown')
+                    """,
+                    (hostname, device_type, ip),
+                )
+            elif hostname:
+                cur.execute(
+                    """
+                    UPDATE devices
+                    SET hostname = COALESCE(NULLIF(hostname, ''), %s),
+                        last_seen = NOW()
+                    WHERE ip_address = %s
+                      AND (hostname IS NULL OR hostname = '')
+                    """,
+                    (hostname, ip),
+                )
+            else:
+                cur.execute(
+                    """
+                    UPDATE devices
+                    SET device_type = %s,
+                        last_seen = NOW()
+                    WHERE ip_address = %s
+                      AND device_type = 'unknown'
+                    """,
+                    (device_type, ip),
+                )
+        if cur.rowcount > 0:
+            updated += 1
+            log.info("mdns_sniff_hint_applied", ip=ip, hostname=hostname, device_type=device_type)
+        conn.commit()
+
+    return updated
+
+
+# ─── DHCP packet sniffer ─────────────────────────────────────────────────────
+
+# Background thread pushes (mac, hostname, ip) hints here so that the
+# main scan loop can update device records without blocking the sniffer.
+_dhcp_hostname_queue: queue.Queue = queue.Queue(maxsize=10_000)
+
+
+def _dhcp_packet_handler(pkt) -> None:
+    """Scapy packet callback — extract device hostnames from DHCP packets.
+
+    Watches for DHCPDISCOVER (type 1) and DHCPREQUEST (type 3) packets,
+    which are sent by clients and carry the client hostname in DHCP option 12.
+    This mirrors the DHCP hostname extraction in netsleuth, providing
+    authoritative, near-real-time hostnames without relying on reverse DNS.
+
+    Enqueues dicts with ``mac``, ``hostname``, and optionally ``ip`` for
+    processing by :func:`process_dhcp_sniff_queue`.
+    """
+    try:
+        if not (pkt.haslayer(BOOTP) and pkt.haslayer(DHCP)):
+            return
+        if not pkt.haslayer(Ether):
+            return
+
+        msg_type: int | None = None
+        hostname: str | None = None
+        req_ip: str | None = None
+
+        for option in pkt[DHCP].options:
+            if not isinstance(option, tuple):
+                continue
+            code, value = option[0], option[1]
+            if code == "message-type":
+                msg_type = value
+            elif code == "hostname":
+                hostname = value.decode("utf-8", errors="replace") if isinstance(value, bytes) else str(value)
+            elif code == "requested_addr":
+                req_ip = value
+
+        # Only process DHCPDISCOVER (1) and DHCPREQUEST (3) which are sent by
+        # clients and typically include the hostname option.
+        if msg_type not in (1, 3):
+            return
+        if not hostname:
+            return
+
+        src_mac = pkt[Ether].src.upper()
+        if src_mac in ("FF:FF:FF:FF:FF:FF", "00:00:00:00:00:00"):
+            return
+
+        # Determine the client IP: DHCPREQUEST usually puts it in ciaddr;
+        # DHCPDISCOVER has 0.0.0.0 there so we fall back to the requested-addr
+        # option, then the IP layer source address.
+        src_ip: str | None = None
+        if pkt[BOOTP].ciaddr and pkt[BOOTP].ciaddr not in ("0.0.0.0", ""):
+            src_ip = pkt[BOOTP].ciaddr
+        elif req_ip:
+            src_ip = req_ip
+        elif pkt.haslayer(IP) and pkt[IP].src not in ("0.0.0.0", ""):
+            src_ip = pkt[IP].src
+
+        entry: dict = {"mac": src_mac, "hostname": hostname}
+        if src_ip:
+            entry["ip"] = src_ip
+        try:
+            _dhcp_hostname_queue.put_nowait(entry)
+        except queue.Full:
+            pass
+    except Exception as exc:
+        log.debug("dhcp_packet_handler_error", error=str(exc))
+
+
+def start_dhcp_sniffer() -> threading.Thread:
+    """Start a daemon thread that sniffs DHCP packets for hostname extraction.
+
+    Captures DHCP client messages (DHCPDISCOVER and DHCPREQUEST) on ports 67
+    and 68.  Hostname hints from DHCP option 12 are enqueued for DB update via
+    :func:`process_dhcp_sniff_queue`.  This provides near-real-time, vendor-
+    authoritative hostnames that are far more reliable than reverse DNS — the
+    same technique used in netsleuth for host identification.
+
+    Returns the :class:`threading.Thread` object (already started).
+    """
+    def _loop() -> None:
+        log.info("dhcp_sniffer_start", iface=DNS_SNIFF_IFACE or "auto")
+        try:
+            sniff(
+                filter="udp and (port 67 or port 68)",
+                prn=_dhcp_packet_handler,
+                store=False,
+                iface=DNS_SNIFF_IFACE,
+            )
+        except Exception as exc:
+            log.error("dhcp_sniffer_error", error=str(exc))
+
+    t = threading.Thread(target=_loop, name="dhcp-sniffer", daemon=True)
+    t.start()
+    return t
+
+
+def process_dhcp_sniff_queue(conn) -> int:
+    """Drain the DHCP sniffer queue and update device hostnames in the DB.
+
+    For each enqueued (mac, hostname, ip) entry:
+
+    - If the device is already known (matched by MAC): update its hostname when
+      currently absent and back-fill a missing IP address.
+    - If the device is not yet known: the main scan loop will discover it in
+      the next ARP sweep; the hint is applied after that via MAC match.
+
+    Returns the number of device rows updated.
+    """
+    pending: list[dict] = []
+    while True:
+        try:
+            pending.append(_dhcp_hostname_queue.get_nowait())
+        except queue.Empty:
+            break
+
+    if not pending:
+        return 0
+
+    log.info("dhcp_sniff_queue_drain", candidates=len(pending))
+    updated = 0
+
+    for entry in pending:
+        mac = entry.get("mac")
+        hostname = entry.get("hostname")
+        ip = entry.get("ip")
+        if not mac or not hostname:
+            continue
+
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE devices
+                SET hostname    = COALESCE(NULLIF(hostname, ''), %s),
+                    ip_address  = COALESCE(ip_address, %s),
+                    last_seen   = NOW()
+                WHERE mac_address = %s
+                  AND (hostname IS NULL OR hostname = '')
+                """,
+                (hostname, ip, mac),
+            )
+            if cur.rowcount > 0:
+                updated += 1
+                log.info("dhcp_hostname_updated", mac=mac, hostname=hostname, ip=ip)
+        conn.commit()
+
+    return updated
+
+
+# ─── ARP packet sniffer ───────────────────────────────────────────────────────
+
+# Background thread pushes newly-seen IP/MAC pairs here for real-time
+# device detection between periodic scan cycles.
+_arp_sniff_queue: queue.Queue = queue.Queue(maxsize=10_000)
+
+
+def _arp_packet_handler(pkt) -> None:
+    """Scapy packet callback — enqueue hosts seen in ARP traffic.
+
+    Inspired by netsleuth's ARP-based host discovery, this captures both
+    ARP requests (op=1, who-has) and ARP replies (op=2, is-at) to detect
+    devices the moment they join or communicate on the network — without
+    waiting for the next periodic scan cycle.
+
+    Packets where the Ethernet source MAC does not match the ARP sender MAC
+    (a sign of ARP spoofing) are skipped so that forged MACs are never stored.
+    """
+    try:
+        if not pkt.haslayer(ARP):
+            return
+        arp = pkt[ARP]
+        src_mac = arp.hwsrc
+        src_ip = arp.psrc
+
+        if not src_mac or src_mac in ("ff:ff:ff:ff:ff:ff", "00:00:00:00:00:00"):
+            return
+        if not src_ip or src_ip == "0.0.0.0":
+            return
+
+        # Discard packets where Ethernet src ≠ ARP hwsrc — indicates spoofing
+        if pkt.haslayer(Ether) and pkt[Ether].src.lower() != src_mac.lower():
+            log.debug("arp_spoof_skipped", ip=src_ip, ether_src=pkt[Ether].src, arp_hwsrc=src_mac)
+            return
+
+        entry: dict = {"ip": src_ip, "mac": src_mac.upper()}
+        try:
+            _arp_sniff_queue.put_nowait(entry)
+        except queue.Full:
+            pass
+    except Exception as exc:
+        log.debug("arp_packet_handler_error", error=str(exc))
+
+
+def start_arp_sniffer() -> threading.Thread:
+    """Start a daemon thread that sniffs ARP traffic for real-time host detection.
+
+    Captures all ARP packets on the network interface and enqueues each
+    sender's IP/MAC pair.  This detects newly-powered devices the moment they
+    broadcast an ARP request — a technique taken directly from netsleuth —
+    rather than waiting for the next periodic ARP sweep.
+
+    Returns the :class:`threading.Thread` object (already started).
+    """
+    def _loop() -> None:
+        log.info("arp_sniffer_start", iface=DNS_SNIFF_IFACE or "auto")
+        try:
+            sniff(
+                filter="arp",
+                prn=_arp_packet_handler,
+                store=False,
+                iface=DNS_SNIFF_IFACE,
+            )
+        except Exception as exc:
+            log.error("arp_sniffer_error", error=str(exc))
+
+    t = threading.Thread(target=_loop, name="arp-sniffer", daemon=True)
+    t.start()
+    return t
+
+
+def process_arp_sniff_queue(conn, rdb) -> int:
+    """Drain the ARP sniffer queue and upsert any newly discovered devices.
+
+    For each unique MAC address seen in the queue:
+
+    1. If the device is already in the database: update its IP and last_seen
+       without running a full enrichment scan (keeps the hot path cheap).
+    2. If the device is new: run full enrichment (hostname, vendor, nmap,
+       banner grab) and upsert — identical to the main scan loop behaviour.
+
+    Returns the number of new devices added.
+    """
+    # Deduplicate by MAC; keep the most recently seen IP for each.
+    pending: dict[str, dict] = {}
+    while True:
+        try:
+            entry = _arp_sniff_queue.get_nowait()
+            pending[entry["mac"]] = entry
+        except queue.Empty:
+            break
+
+    if not pending:
+        return 0
+
+    log.info("arp_sniff_queue_drain", candidates=len(pending))
+    new_count = 0
+
+    macs = list(pending.keys())
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT mac_address FROM devices WHERE mac_address = ANY(%s)",
+            (macs,),
+        )
+        known_macs: set[str] = {row["mac_address"] for row in cur.fetchall()}
+
+    for mac, host in pending.items():
+        if mac in known_macs:
+            # Already known — just refresh the IP and timestamp cheaply.
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE devices SET ip_address = %s, last_seen = NOW() WHERE mac_address = %s",
+                    (host["ip"], mac),
+                )
+            conn.commit()
+            continue
+
+        # New device — run full enrichment then upsert
+        host["hostname"] = resolve_hostname(host["ip"])
+        host["vendor"] = vendor_lookup(mac)
+        scan_data = nmap_scan(host["ip"])
+        host.update(scan_data)
+        extra_info: dict = enrich_from_banners(host["ip"], host.get("open_ports", []))
+        if extra_info.get("tls_cn") and not host.get("hostname"):
+            host["hostname"] = extra_info["tls_cn"]
+        host["extra_info"] = extra_info
+        host["device_type"] = guess_device_type(
+            host.get("vendor"), host.get("open_ports", []), host.get("os_guess"), extra_info,
+            host.get("hostname"),
+        )
+
+        is_new = upsert_device(conn, rdb, host)
+        if is_new:
+            new_count += 1
+            log.info("arp_sniff_new_device", ip=host["ip"], mac=mac, vendor=host.get("vendor"))
+
+    return new_count
+
+
+# ─── SSDP / UPnP discovery ───────────────────────────────────────────────────_SSDP_MULTICAST_ADDR = "239.255.255.250"
 _SSDP_PORT = 1900
 _SSDP_MX = 3
 
@@ -1753,6 +2200,16 @@ def run_scan():
         # last scan cycle.
         if DNS_SNIFF_ENABLED:
             new_count += process_dns_sniff_queue(conn, rdb)
+            # Apply mDNS hostname/device-type hints extracted by the DNS sniffer.
+            process_mdns_sniff_queue(conn)
+
+        # Process real-time ARP-sniffed devices (netsleuth-style live detection).
+        if ARP_SNIFF_ENABLED:
+            new_count += process_arp_sniff_queue(conn, rdb)
+
+        # Apply DHCP-sniffed hostnames to existing device records.
+        if DHCP_SNIFF_ENABLED:
+            process_dhcp_sniff_queue(conn)
 
         # Check for IoT learning sessions that have passed the observation window.
         process_completed_learnings(conn, rdb)
@@ -1839,15 +2296,28 @@ def main():
     ensure_schema()
 
     # Start the background DNS-packet sniffer (requires NET_RAW capability).
+    # Also handles mDNS (port 5353) hostname extraction when DNS_SNIFF_ENABLED.
     if DNS_SNIFF_ENABLED:
         start_dns_sniffer()
     else:
         log.info("dns_sniffer_disabled")
 
+    # Start the DHCP packet sniffer for real-time hostname extraction.
+    if DHCP_SNIFF_ENABLED:
+        start_dhcp_sniffer()
+    else:
+        log.info("dhcp_sniffer_disabled")
+
+    # Start the ARP packet sniffer for real-time device detection.
+    if ARP_SNIFF_ENABLED:
+        start_arp_sniffer()
+    else:
+        log.info("arp_sniffer_disabled")
+
     # Subscribe to Redis events so we can react to dashboard-triggered actions
     # (e.g. a user manually assigning a device to IoT status for the first time).
     threading.Thread(target=_discovery_subscribe_loop, name="discovery-redis-sub", daemon=True).start()
-    
+
     # Start the background mDNS/Zeroconf service browser.
     if MDNS_ENABLED:
         start_mdns_discovery()
