@@ -62,7 +62,7 @@ enforce network policy via Pi-hole (DNS) and Linux iptables/ipset.
 
 | Service | Source | Default Port(s) | Responsibilities |
 |---------|--------|-----------------|-----------------|
-| `discovery` | `services/discovery/app.py` | host network | ARP sweep, nmap, Pi-hole FTL API, DNS sniff, SSDP/UPnP, mDNS, NetBIOS, HTTP banners, IoT learning sessions |
+| `discovery` | `services/discovery/app.py` | host network | ARP sweep, nmap, Pi-hole FTL API, DNS sniff (port 53 + mDNS port 5353), DHCP hostname sniff, ARP packet sniff, SSDP/UPnP, mDNS Zeroconf, NetBIOS, HTTP banners, IoT learning sessions |
 | `guardian` | `services/guardian/app.py` | host network | iptables/ipset policy (quarantine / iot / blocked / trusted), sync every 10 min, event-driven policy updates |
 | `honeypot` | `services/honeypot/app.py` | host network | 24-port fake-service listener, protocol simulation, severity/intent classification, Redis hit-counter |
 | `redirector` | `services/redirector/app.py` | host network | passive monitoring, iptables DNAT, ARP spoof, DHCP inject/starvation, gateway takeover |
@@ -333,8 +333,10 @@ Events.  Keep-alive `:\n\n` comments are sent every 30 s to prevent idle-connect
 |----------|---------|----------|-------------|
 | `NETWORK_RANGES` | `192.168.1.0/24` | discovery, redirector | Comma-separated CIDR ranges |
 | `SCAN_INTERVAL` | `300` | discovery | Seconds between ARP/nmap sweeps |
-| `DNS_SNIFF_ENABLED` | `true` | discovery | Enable live DNS packet capture (requires NET_RAW) |
+| `DNS_SNIFF_ENABLED` | `true` | discovery | Enable live DNS packet capture (port 53) and mDNS response parsing (port 5353) for hostname/device-type hints (requires NET_RAW) |
 | `DNS_SNIFF_IFACE` | *(auto)* | discovery | Network interface to sniff; empty = auto-detect |
+| `DHCP_SNIFF_ENABLED` | `true` | discovery | Sniff DHCP DISCOVER/REQUEST packets (ports 67/68) to extract device hostnames from option 12 in real-time (requires NET_RAW) |
+| `ARP_SNIFF_ENABLED` | `true` | discovery | Sniff all ARP traffic to detect new devices immediately on join; skips packets where Ether src ≠ ARP hwsrc (spoof guard) (requires NET_RAW) |
 | `SSDP_ENABLED` | `true` | discovery | SSDP/UPnP multicast M-SEARCH probes |
 | `SSDP_TIMEOUT` | `5` | discovery | Seconds to collect SSDP responses |
 | `MDNS_ENABLED` | `true` | discovery | mDNS/Zeroconf DNS-SD browser (zeroconf==0.131.0) |
@@ -468,12 +470,11 @@ with no prior `iot_learning_sessions` row.
 ### Scan cycle (`run_scan`)
 
 1. ARP sweep (`scapy` or nmap fallback) → list of `{ip, mac}` dicts
-2. Pi-hole FTL API — fetch `/api/clients` → augment list
-3. DNS sniff queue drain → augment list (if `DNS_SNIFF_ENABLED`)
-4. SSDP discover → `dict[ip → enrichment]` (if `SSDP_ENABLED`)
-5. mDNS queue drain → `dict[ip → enrichment]` (if `MDNS_ENABLED`)
-6. NetBIOS scan (`nmap nbstat`) → `dict[ip → enrichment]` (if `NETBIOS_ENABLED`)
-7. For each host:
+2. Pi-hole FTL API — fetch `/api/network/devices` → augment list
+3. SSDP discover → `dict[ip → enrichment]` (if `SSDP_ENABLED`)
+4. mDNS Zeroconf queue drain → `dict[ip → enrichment]` (if `MDNS_ENABLED`)
+5. NetBIOS scan (`nmap nbstat`) → `dict[ip → enrichment]` (if `NETBIOS_ENABLED`)
+6. For each host:
    - Merge SSDP/mDNS/NetBIOS data
    - Reverse DNS lookup
    - MAC OUI vendor lookup
@@ -481,15 +482,22 @@ with no prior `iot_learning_sessions` row.
    - Banner grab → `http_server`, `tls_cn`, `tls_org` (if `BANNER_GRAB_ENABLED`)
    - `guess_device_type(vendor, open_ports, os_guess, extra_info, hostname)` → `device_type`
    - `upsert_device(conn, rdb, host)` → `True` if new device
-8. If new device and `AUTO_QUARANTINE`: publish `new_device`
-9. `process_completed_learnings()` — finalise any expired IoT learning sessions
+7. If `DNS_SNIFF_ENABLED`:
+   - `process_dns_sniff_queue(conn, rdb)` — upsert any new IPs seen in DNS queries since last cycle
+   - `process_mdns_sniff_queue(conn)` — apply hostname/device-type hints from mDNS A/AAAA/TXT records
+8. If `ARP_SNIFF_ENABLED`: `process_arp_sniff_queue(conn, rdb)` — upsert new devices seen in ARP traffic since last cycle; refresh IP/last_seen for known devices
+9. If `DHCP_SNIFF_ENABLED`: `process_dhcp_sniff_queue(conn)` — back-fill hostnames from DHCP option 12 for matching MAC records
+10. `process_completed_learnings()` — finalise any expired IoT learning sessions
 
 ### Enrichment function names
 
 | Capability | Function | Returns |
 |-----------|----------|---------|
 | SSDP/UPnP | `ssdp_discover(timeout)` | `dict[ip → {upnp_location, upnp_friendly_name, upnp_manufacturer, upnp_model_name, upnp_device_type, upnp_udn, …}]` |
-| mDNS | `process_mdns_queue()` | `dict[ip → {mdns_services: [...], mdns_hostname}]` |
+| mDNS Zeroconf | `process_mdns_queue()` | `dict[ip → {mdns_services: [...], mdns_hostname}]` |
+| mDNS raw sniff | `process_mdns_sniff_queue(conn)` | Updates `hostname`/`device_type` in DB from sniffed A/AAAA/TXT records; returns count of rows updated |
+| DHCP hostname sniff | `process_dhcp_sniff_queue(conn)` | Updates `hostname` (and `ip_address`) in DB from DHCP option 12; returns count of rows updated |
+| ARP packet sniff | `process_arp_sniff_queue(conn, rdb)` | Upserts new devices from sniffed ARP traffic; refreshes IP/last_seen for known MACs; returns count of new devices |
 | NetBIOS | `netbios_scan(network)` | `dict[ip → {netbios_name, workgroup}]` |
 | Banner | `enrich_from_banners(ip, open_ports)` | `{http_server, tls_cn, tls_org, tls_issuer_cn, tls_sans}` |
 | Port/OS | `nmap_scan(ip)` | `{open_ports: [{port, proto, service}], os_guess}` |
@@ -753,7 +761,9 @@ On `unquarantine_device`:
 | Capability | Linux (host networking) | macOS (Docker Desktop bridge) |
 |-----------|------------------------|-------------------------------|
 | ARP sweeps | Physical LAN | Docker VM network only |
+| ARP packet sniffing | Physical LAN — instant detection | Docker VM only; may miss physical LAN devices |
 | DNS packet sniffing | Physical LAN interface | Docker bridge interface only |
+| DHCP hostname sniffing | Physical LAN — captures all DHCP broadcasts | Docker bridge only; physical LAN DHCP may not reach container |
 | iptables / ipset enforcement | Full — affects physical LAN | ipset may be unavailable; falls back to THEBOX_POLICY chain — does not affect physical LAN |
 | ARP spoofing | Physical LAN | Docker VM stack only |
 | DHCP injection | Physical LAN | Docker VM stack only |
@@ -772,7 +782,9 @@ On `unquarantine_device`:
 - **Database access:** raw `psycopg2` connections; no ORM
 - **Redis client:** `redis-py` (synchronous)
 - **HTTP/Scapy:** `requests` for Pi-hole API; `scapy` for ARP/DHCP packet crafting
-- **DNS sniffing:** `scapy` with `sniff(filter="udp port 53", store=0, prn=...)`
+- **DNS sniffing:** `scapy` with `sniff(filter="udp port 53 or udp port 5353", store=0, prn=...)` — covers standard DNS queries (port 53) and mDNS responses (port 5353)
+- **DHCP sniffing:** `scapy` with `sniff(filter="udp and (port 67 or port 68)", store=0, prn=...)` — extracts hostnames from DHCP option 12
+- **ARP sniffing:** `scapy` with `sniff(filter="arp", store=0, prn=...)` — real-time device detection; packets where `Ether.src ≠ ARP.hwsrc` are discarded (spoof guard)
 - **mDNS:** `zeroconf==0.131.0`
 - **Environment variables:** read at module level via `os.environ.get(KEY, default)`;
   `int()` / `float()` cast inline; booleans via `.lower() == "true"`
