@@ -189,3 +189,4 @@ INSERT INTO schema_migrations (version) VALUES ('0001') ON CONFLICT (version) DO
 INSERT INTO schema_migrations (version) VALUES ('0002') ON CONFLICT (version) DO NOTHING;
 INSERT INTO schema_migrations (version) VALUES ('0003') ON CONFLICT (version) DO NOTHING;
 INSERT INTO schema_migrations (version) VALUES ('0004') ON CONFLICT (version) DO NOTHING;
+INSERT INTO schema_migrations (version) VALUES ('0005') ON CONFLICT (version) DO NOTHING;

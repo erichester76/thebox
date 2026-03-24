@@ -346,87 +346,57 @@ def get_redis():
 
 # ─── Schema bootstrap ────────────────────────────────────────────────────────
 
-def ensure_schema():
-    """Create tables this service reads from or writes to.
+_MIGRATIONS_DIR = "/app/migrations"
+REQUIRED_MIGRATIONS = ["0001", "0005"]
 
-    Scoped to: ``users`` (FK dependency for devices), ``devices``,
-    ``honeypot_events``, ``alerts``.  All DDL uses ``IF NOT EXISTS`` so
-    this is safe to call on every startup.
+
+def apply_migrations(required_versions):
+    """Apply all required migrations that have not yet been recorded.
+
+    Reads SQL from ``_MIGRATIONS_DIR``/NNNN_*.sql files and applies each
+    version in ascending order, skipping any already recorded in
+    schema_migrations.
     """
-    statements = [
-        # users — FK dependency for devices.owner_id
-        """CREATE TABLE IF NOT EXISTS users (
-            id              SERIAL PRIMARY KEY,
-            username        VARCHAR(64) NOT NULL UNIQUE,
-            display_name    VARCHAR(255),
-            email           VARCHAR(255),
-            created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )""",
-        # devices — honeypot looks up device_id by source IP
-        """CREATE TABLE IF NOT EXISTS devices (
-            id              SERIAL PRIMARY KEY,
-            mac_address     VARCHAR(17) NOT NULL UNIQUE,
-            ip_address      VARCHAR(45),
-            hostname        VARCHAR(255),
-            vendor          VARCHAR(255),
-            device_type     VARCHAR(64) DEFAULT 'unknown',
-            os_guess        VARCHAR(255),
-            first_seen      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            last_seen       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            status          VARCHAR(32) NOT NULL DEFAULT 'new',
-            notes           TEXT,
-            open_ports      JSONB DEFAULT '[]',
-            extra_info      JSONB DEFAULT '{}',
-            owner_id        INTEGER REFERENCES users(id) ON DELETE SET NULL
-        )""",
-        # honeypot_events — honeypot writes every connection attempt
-        """CREATE TABLE IF NOT EXISTS honeypot_events (
-            id                SERIAL PRIMARY KEY,
-            src_ip            VARCHAR(45) NOT NULL,
-            src_port          INTEGER,
-            dst_port          INTEGER NOT NULL,
-            protocol          VARCHAR(10) NOT NULL DEFAULT 'tcp',
-            payload_preview   TEXT,
-            severity          VARCHAR(16) NOT NULL DEFAULT 'low',
-            interaction_level VARCHAR(16) NOT NULL DEFAULT 'none',
-            intent            VARCHAR(32) NOT NULL DEFAULT 'scan',
-            is_sweep          BOOLEAN NOT NULL DEFAULT FALSE,
-            ports_scanned     JSONB,
-            device_id         INTEGER REFERENCES devices(id),
-            created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )""",
-        # alerts — honeypot writes high/critical severity alerts
-        """CREATE TABLE IF NOT EXISTS alerts (
-            id           SERIAL PRIMARY KEY,
-            source       VARCHAR(64) NOT NULL,
-            level        VARCHAR(16) NOT NULL DEFAULT 'info',
-            title        VARCHAR(255) NOT NULL,
-            detail       TEXT,
-            device_id    INTEGER REFERENCES devices(id),
-            acknowledged BOOLEAN NOT NULL DEFAULT FALSE,
-            created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )""",
-        "CREATE INDEX IF NOT EXISTS idx_devices_ip        ON devices(ip_address)",
-        "CREATE INDEX IF NOT EXISTS idx_honeypot_src_ip   ON honeypot_events(src_ip)",
-        "CREATE INDEX IF NOT EXISTS idx_honeypot_created  ON honeypot_events(created_at)",
-        "CREATE INDEX IF NOT EXISTS idx_alerts_level      ON alerts(level)",
-        "CREATE INDEX IF NOT EXISTS idx_alerts_created    ON alerts(created_at)",
-        # Migration: add new columns to existing tables if they don't exist yet
-        "ALTER TABLE honeypot_events ADD COLUMN IF NOT EXISTS interaction_level VARCHAR(16) NOT NULL DEFAULT 'none'",
-        "ALTER TABLE honeypot_events ADD COLUMN IF NOT EXISTS intent VARCHAR(32) NOT NULL DEFAULT 'scan'",
-        "ALTER TABLE honeypot_events ADD COLUMN IF NOT EXISTS is_sweep BOOLEAN NOT NULL DEFAULT FALSE",
-        "ALTER TABLE honeypot_events ADD COLUMN IF NOT EXISTS ports_scanned JSONB",
-    ]
     conn = get_db()
     try:
         with conn.cursor() as cur:
-            for stmt in statements:
-                cur.execute(stmt)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS schema_migrations (
+                    version     VARCHAR(16) NOT NULL PRIMARY KEY,
+                    applied_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
         conn.commit()
+        for version in sorted(required_versions):
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT 1 FROM schema_migrations WHERE version = %s",
+                    (version,)
+                )
+                if cur.fetchone():
+                    continue
+                sql_file = None
+                for name in sorted(os.listdir(_MIGRATIONS_DIR)):
+                    if name.startswith(f"{version}_") and name.endswith(".sql"):
+                        sql_file = os.path.join(_MIGRATIONS_DIR, name)
+                        break
+                if sql_file is None:
+                    raise RuntimeError(
+                        f"Migration {version} not found in {_MIGRATIONS_DIR}"
+                    )
+                with open(sql_file) as fh:
+                    sql = fh.read()
+                cur.execute(sql)
+                cur.execute(
+                    "INSERT INTO schema_migrations (version) VALUES (%s)"
+                    " ON CONFLICT (version) DO NOTHING",
+                    (version,)
+                )
+                conn.commit()
+                log.info("migration_applied", version=version, file=os.path.basename(sql_file))
     finally:
         conn.close()
-    log.info("schema_ensured")
+    log.info("migrations_complete")
 
 
 # ─── Settings helpers ────────────────────────────────────────────────────────
@@ -759,7 +729,7 @@ def listen_on_port(port: int):
 
 def main():
     log.info("honeypot_service_start")
-    ensure_schema()
+    apply_migrations(REQUIRED_MIGRATIONS)
     _load_settings()
     log.info("honeypot_listening", ports=HONEYPOT_PORTS)
     threads = []

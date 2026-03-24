@@ -101,6 +101,7 @@ services:
       BANNER_GRAB_TIMEOUT: ${BANNER_GRAB_TIMEOUT:-3}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./config/postgres/migrations:/app/migrations:ro
     cap_add:
       - NET_ADMIN
       - NET_RAW
@@ -136,6 +137,8 @@ services:
       SMTP_PASSWORD: ${SMTP_PASSWORD:-}
       SMTP_TLS: ${SMTP_TLS:-true}
       ALERT_WEBHOOK_URL: ${ALERT_WEBHOOK_URL:-}
+    volumes:
+      - ./config/postgres/migrations:/app/migrations:ro
     cap_add:
       - NET_ADMIN
       - NET_RAW
@@ -180,6 +183,8 @@ services:
       SMTP_PASSWORD: ${SMTP_PASSWORD:-}
       SMTP_TLS: ${SMTP_TLS:-true}
       ALERT_WEBHOOK_URL: ${ALERT_WEBHOOK_URL:-}
+    volumes:
+      - ./config/postgres/migrations:/app/migrations:ro
     depends_on:
       postgres:
         condition: service_healthy
@@ -222,6 +227,8 @@ services:
       SMTP_PASSWORD: ${SMTP_PASSWORD:-}
       SMTP_TLS: ${SMTP_TLS:-true}
       ALERT_WEBHOOK_URL: ${ALERT_WEBHOOK_URL:-}
+    volumes:
+      - ./config/postgres/migrations:/app/migrations:ro
     cap_add:
       - NET_ADMIN
       - NET_RAW
@@ -253,6 +260,7 @@ services:
     volumes:
       - ./.env.example:/app/.env.example:ro
       - ./.env:/app/.env:ro
+      - ./config/postgres/migrations:/app/migrations:ro
     networks:
       - thebox_internal
       - thebox_external

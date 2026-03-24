@@ -195,180 +195,57 @@ def get_redis():
 
 # ─── Schema bootstrap ────────────────────────────────────────────────────────
 
-def ensure_schema():
-    """Create tables this service reads from or writes to.
+_MIGRATIONS_DIR = "/app/migrations"
+REQUIRED_MIGRATIONS = ["0001", "0002", "0003", "0004", "0005"]
 
-    Scoped to: ``users``, ``devices``, ``iot_allowlist``, ``groups``,
-    ``user_groups``, ``device_groups``, ``alerts``, ``honeypot_events``,
-    ``scan_runs``.
-    All DDL uses ``IF NOT EXISTS`` so this is safe to call on every startup.
+
+def apply_migrations(required_versions):
+    """Apply all required migrations that have not yet been recorded.
+
+    Reads SQL from ``_MIGRATIONS_DIR``/NNNN_*.sql files and applies each
+    version in ascending order, skipping any already recorded in
+    schema_migrations.
     """
-    statements = [
-        # users — dashboard manages user records
-        """CREATE TABLE IF NOT EXISTS users (
-            id              SERIAL PRIMARY KEY,
-            username        VARCHAR(64) NOT NULL UNIQUE,
-            display_name    VARCHAR(255),
-            email           VARCHAR(255),
-            created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )""",
-        # devices — dashboard reads and updates device status / owner
-        """CREATE TABLE IF NOT EXISTS devices (
-            id              SERIAL PRIMARY KEY,
-            mac_address     VARCHAR(17) NOT NULL UNIQUE,
-            ip_address      VARCHAR(45),
-            hostname        VARCHAR(255),
-            vendor          VARCHAR(255),
-            device_type     VARCHAR(64) DEFAULT 'unknown',
-            os_guess        VARCHAR(255),
-            first_seen      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            last_seen       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            status          VARCHAR(32) NOT NULL DEFAULT 'new',
-            notes           TEXT,
-            open_ports      JSONB DEFAULT '[]',
-            extra_info      JSONB DEFAULT '{}',
-            owner_id        INTEGER REFERENCES users(id) ON DELETE SET NULL
-        )""",
-        # iot_allowlist — FQDNs that IoT devices are permitted to reach.
-        # device_id is nullable: NULL marks a globally-shared entry added by
-        # the learning engine; a non-NULL value ties the FQDN to a specific device.
-        """CREATE TABLE IF NOT EXISTS iot_allowlist (
-            id          SERIAL PRIMARY KEY,
-            device_id   INTEGER REFERENCES devices(id) ON DELETE CASCADE,
-            fqdn        VARCHAR(255) NOT NULL,
-            created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            UNIQUE(device_id, fqdn)
-        )""",
-        # iot_learning_sessions — tracks the 48-hour observation window for each
-        # newly discovered or user-assigned IoT device.
-        """CREATE TABLE IF NOT EXISTS iot_learning_sessions (
-            id                    SERIAL PRIMARY KEY,
-            device_id             INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
-            pihole_group_name     VARCHAR(64) NOT NULL,
-            learning_started_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            learning_completed_at TIMESTAMPTZ,
-            status                VARCHAR(32) NOT NULL DEFAULT 'active',
-            UNIQUE(device_id)
-        )""",
-        # groups — dashboard manages Pi-hole groups
-        """CREATE TABLE IF NOT EXISTS groups (
-            id                SERIAL PRIMARY KEY,
-            name              VARCHAR(64) NOT NULL UNIQUE,
-            description       TEXT,
-            pihole_group_name VARCHAR(64),
-            created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )""",
-        # user_groups — dashboard manages user ↔ group memberships
-        """CREATE TABLE IF NOT EXISTS user_groups (
-            user_id  INTEGER NOT NULL REFERENCES users(id)  ON DELETE CASCADE,
-            group_id INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
-            PRIMARY KEY (user_id, group_id)
-        )""",
-        # device_groups — dashboard manages device ↔ group memberships
-        """CREATE TABLE IF NOT EXISTS device_groups (
-            device_id INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
-            group_id  INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
-            PRIMARY KEY (device_id, group_id)
-        )""",
-        # alerts — dashboard reads and acknowledges alerts
-        """CREATE TABLE IF NOT EXISTS alerts (
-            id           SERIAL PRIMARY KEY,
-            source       VARCHAR(64) NOT NULL,
-            level        VARCHAR(16) NOT NULL DEFAULT 'info',
-            title        VARCHAR(255) NOT NULL,
-            detail       TEXT,
-            device_id    INTEGER REFERENCES devices(id),
-            acknowledged BOOLEAN NOT NULL DEFAULT FALSE,
-            created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )""",
-        # honeypot_events — dashboard displays honeypot hit log
-        """CREATE TABLE IF NOT EXISTS honeypot_events (
-            id                SERIAL PRIMARY KEY,
-            src_ip            VARCHAR(45) NOT NULL,
-            src_port          INTEGER,
-            dst_port          INTEGER NOT NULL,
-            protocol          VARCHAR(10) NOT NULL DEFAULT 'tcp',
-            payload_preview   TEXT,
-            severity          VARCHAR(16) NOT NULL DEFAULT 'low',
-            interaction_level VARCHAR(16) NOT NULL DEFAULT 'none',
-            intent            VARCHAR(32) NOT NULL DEFAULT 'scan',
-            is_sweep          BOOLEAN NOT NULL DEFAULT FALSE,
-            ports_scanned     JSONB,
-            device_id         INTEGER REFERENCES devices(id),
-            created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )""",
-        # scan_runs — discovery scan history, dashboard provides read-only view
-        """CREATE TABLE IF NOT EXISTS scan_runs (
-            id              SERIAL PRIMARY KEY,
-            started_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            finished_at     TIMESTAMPTZ,
-            network_range   VARCHAR(64) NOT NULL,
-            devices_found   INTEGER NOT NULL DEFAULT 0,
-            new_devices     INTEGER NOT NULL DEFAULT 0,
-            status          VARCHAR(32) NOT NULL DEFAULT 'running'
-        )""",
-        "CREATE INDEX IF NOT EXISTS idx_devices_mac         ON devices(mac_address)",
-        "CREATE INDEX IF NOT EXISTS idx_devices_ip          ON devices(ip_address)",
-        "CREATE INDEX IF NOT EXISTS idx_devices_status      ON devices(status)",
-        "CREATE INDEX IF NOT EXISTS idx_devices_owner       ON devices(owner_id)",
-        "CREATE INDEX IF NOT EXISTS idx_alerts_level        ON alerts(level)",
-        "CREATE INDEX IF NOT EXISTS idx_alerts_created      ON alerts(created_at)",
-        "CREATE INDEX IF NOT EXISTS idx_honeypot_src_ip     ON honeypot_events(src_ip)",
-        "CREATE INDEX IF NOT EXISTS idx_honeypot_created    ON honeypot_events(created_at)",
-        "CREATE INDEX IF NOT EXISTS idx_user_groups_group   ON user_groups(group_id)",
-        "CREATE INDEX IF NOT EXISTS idx_device_groups_group ON device_groups(group_id)",
-        "CREATE INDEX IF NOT EXISTS idx_iot_learning_status  ON iot_learning_sessions(status)",
-        "CREATE INDEX IF NOT EXISTS idx_iot_learning_started ON iot_learning_sessions(learning_started_at)",
-        # Partial unique index for globally-shared allow-list entries (device_id IS NULL).
-        """CREATE UNIQUE INDEX IF NOT EXISTS idx_iot_allowlist_global_fqdn
-            ON iot_allowlist(fqdn) WHERE device_id IS NULL""",
-        # Upgrade safety: allow NULL device_id on installs created before migration 0002.
-        # In PostgreSQL, DROP NOT NULL on an already-nullable column is a no-op,
-        # so this statement is safe to execute on both old (NOT NULL) and new (nullable)
-        # schemas without needing additional conditional logic.
-        "ALTER TABLE iot_allowlist ALTER COLUMN device_id DROP NOT NULL",
-        # Migration: add new honeypot columns to existing deployments
-        "ALTER TABLE honeypot_events ADD COLUMN IF NOT EXISTS interaction_level VARCHAR(16) NOT NULL DEFAULT 'none'",
-        "ALTER TABLE honeypot_events ADD COLUMN IF NOT EXISTS intent VARCHAR(32) NOT NULL DEFAULT 'scan'",
-        "ALTER TABLE honeypot_events ADD COLUMN IF NOT EXISTS is_sweep BOOLEAN NOT NULL DEFAULT FALSE",
-        "ALTER TABLE honeypot_events ADD COLUMN IF NOT EXISTS ports_scanned JSONB",
-        # settings — runtime configuration key/value store
-        """CREATE TABLE IF NOT EXISTS settings (
-            key         VARCHAR(64)  NOT NULL PRIMARY KEY,
-            value       TEXT         NOT NULL,
-            description TEXT,
-            category    VARCHAR(32)  NOT NULL DEFAULT 'general',
-            updated_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
-        )""",
-        "CREATE INDEX IF NOT EXISTS idx_settings_category ON settings(category)",
-        # Migration: add password_hash for dashboard login
-        "ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash VARCHAR(255)",
-        # Migration: add ipv6_address column for IPv6 policy enforcement
-        "ALTER TABLE devices ADD COLUMN IF NOT EXISTS ipv6_address VARCHAR(45)",
-        "CREATE INDEX IF NOT EXISTS idx_devices_ipv6        ON devices(ipv6_address)",
-        # scan_runs — populated by discovery after each nmap scan cycle
-        """CREATE TABLE IF NOT EXISTS scan_runs (
-            id              SERIAL PRIMARY KEY,
-            started_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            finished_at     TIMESTAMPTZ,
-            network_range   VARCHAR(64) NOT NULL,
-            devices_found   INTEGER NOT NULL DEFAULT 0,
-            new_devices     INTEGER NOT NULL DEFAULT 0,
-            status          VARCHAR(32) NOT NULL DEFAULT 'running'
-        )""",
-        "CREATE INDEX IF NOT EXISTS idx_scan_runs_started ON scan_runs(started_at)",
-    ]
     conn = get_db()
     try:
         with conn.cursor() as cur:
-            for stmt in statements:
-                cur.execute(stmt)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS schema_migrations (
+                    version     VARCHAR(16) NOT NULL PRIMARY KEY,
+                    applied_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
         conn.commit()
+        for version in sorted(required_versions):
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT 1 FROM schema_migrations WHERE version = %s",
+                    (version,)
+                )
+                if cur.fetchone():
+                    continue
+                sql_file = None
+                for name in sorted(os.listdir(_MIGRATIONS_DIR)):
+                    if name.startswith(f"{version}_") and name.endswith(".sql"):
+                        sql_file = os.path.join(_MIGRATIONS_DIR, name)
+                        break
+                if sql_file is None:
+                    raise RuntimeError(
+                        f"Migration {version} not found in {_MIGRATIONS_DIR}"
+                    )
+                with open(sql_file) as fh:
+                    sql = fh.read()
+                cur.execute(sql)
+                cur.execute(
+                    "INSERT INTO schema_migrations (version) VALUES (%s)"
+                    " ON CONFLICT (version) DO NOTHING",
+                    (version,)
+                )
+                conn.commit()
+                log.info("migration_applied", version=version, file=os.path.basename(sql_file))
     finally:
         conn.close()
-    log.info("schema_ensured")
+    log.info("migrations_complete")
 
 
 # ─── SSE / Redis subscriber ──────────────────────────────────────────────────
@@ -392,9 +269,9 @@ def redis_subscriber_loop():
 
 threading.Thread(target=redis_subscriber_loop, daemon=True).start()
 
-# Called at module level (not inside if __name__) so the schema is ensured
+# Called at module level (not inside if __name__) so migrations are applied
 # whether the app is run directly or served by a WSGI host (gunicorn, etc.).
-ensure_schema()
+apply_migrations(REQUIRED_MIGRATIONS)
 
 
 # ─── Settings helpers ────────────────────────────────────────────────────────
