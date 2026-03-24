@@ -325,6 +325,14 @@ _SYNTHETIC_DATA: list[dict] = [
 
     # ── Vendor-only (no DHCP, no open ports) ─────────────────────────────────
     # ARP-discovered devices where only the MAC OUI vendor is known.
+    #
+    # Note: vendor strings here are representative examples — they do NOT need
+    # to be exact OUI registry strings.  extract_features() converts every
+    # vendor string to a VENDOR_KEYWORDS binary flag vector using case-insensitive
+    # *substring* matching (e.g. "amazon" matches "Amazon Technologies Inc.",
+    # "Amazon.com, LLC", and any other Amazon OUI variant automatically).
+    # One entry per keyword is therefore sufficient regardless of how many
+    # different company-name spellings the OUI database uses.
 
     # Unambiguous IoT vendors
     {"label": "iot",            "os_family": "embedded", "vendor": "Espressif Inc.",      "open_ports": [], "extra_info": {}, "dhcp_fingerprint": None},
@@ -333,13 +341,7 @@ _SYNTHETIC_DATA: list[dict] = [
     {"label": "iot",            "os_family": "embedded", "vendor": "Hikvision Digital",   "open_ports": [], "extra_info": {}, "dhcp_fingerprint": None},
     {"label": "iot",            "os_family": "embedded", "vendor": "Dahua Technology",    "open_ports": [], "extra_info": {}, "dhcp_fingerprint": None},
     {"label": "iot",            "os_family": "embedded", "vendor": "Axis Communications", "open_ports": [], "extra_info": {}, "dhcp_fingerprint": None},
-    # Amazon devices: OUI lookup returns multiple company name variants depending
-    # on the specific MAC block — include all observed forms so the "amazon"
-    # keyword feature fires consistently regardless of variant.
-    {"label": "iot",            "os_family": "embedded", "vendor": "Amazon Technologies Inc", "open_ports": [], "extra_info": {}, "dhcp_fingerprint": None},
     {"label": "iot",            "os_family": "embedded", "vendor": "Amazon Technologies Inc.", "open_ports": [], "extra_info": {}, "dhcp_fingerprint": None},
-    {"label": "iot",            "os_family": "embedded", "vendor": "Amazon.com, LLC",     "open_ports": [], "extra_info": {}, "dhcp_fingerprint": None},
-    {"label": "iot",            "os_family": "embedded", "vendor": "Amazon.Com, LLC",     "open_ports": [], "extra_info": {}, "dhcp_fingerprint": None},
     {"label": "iot",            "os_family": "embedded", "vendor": "Nest Labs Inc.",      "open_ports": [], "extra_info": {}, "dhcp_fingerprint": None},
     {"label": "iot",            "os_family": "embedded", "vendor": "Ring LLC",            "open_ports": [], "extra_info": {}, "dhcp_fingerprint": None},
     # Streaming / smart TV vendors
