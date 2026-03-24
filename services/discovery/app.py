@@ -67,6 +67,12 @@ from mac_vendor_lookup import MacLookup, VendorNotFoundError
 from scapy.all import ARP, BOOTP, DNSRR, DHCP, DNS, DNSQR, Ether, IP, TCP, UDP, srp, sniff  # noqa: F401
 from zeroconf import ServiceBrowser, Zeroconf
 
+# RF device-type classifier — optional, gracefully absent before first build.
+try:
+    import device_classifier as _dc
+except ImportError:
+    _dc = None  # type: ignore[assignment]
+
 # ─── Configuration ───────────────────────────────────────────────────────────
 DATABASE_URL = os.environ["DATABASE_URL"]
 REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379/0")
@@ -3055,11 +3061,36 @@ def _enrich_and_classify(host: dict, extra_seed: dict | None = None) -> dict:
             host["hostname"] = banner_data["tls_cn"]
 
     host["extra_info"] = extra_info
-    host["device_type"] = guess_device_type(
-        host.get("vendor"), host.get("open_ports", []),
-        host.get("os_guess"), extra_info, host.get("hostname"),
-        mac=mac,
-    )
+
+    # ── RF classifier (primary) ───────────────────────────────────────────────
+    # Try the RandomForest model first.  If it returns a confident prediction
+    # (above RF_MIN_CONFIDENCE), use it directly.  Otherwise fall back to the
+    # rule-based heuristic so that the two classifiers are complementary.
+    dhcp_fp: str | None = extra_info.get("dhcp_fingerprint") or None
+    rf_type: str = "unknown"
+    rf_conf: float = 0.0
+    if _dc is not None:
+        rf_type, rf_conf = _dc.classify_device(
+            host.get("vendor"),
+            host.get("open_ports", []),
+            extra_info,
+            dhcp_fingerprint=dhcp_fp,
+        )
+
+    if rf_type != "unknown":
+        host["device_type"] = rf_type
+        log.debug(
+            "rf_classify_used",
+            ip=ip, device_type=rf_type, confidence=round(rf_conf, 3),
+        )
+    else:
+        # Heuristic fallback — retains all the high-specificity rules
+        # (mDNS service types, WSD, UPnP, SNMP, fingerbank result, etc.)
+        host["device_type"] = guess_device_type(
+            host.get("vendor"), host.get("open_ports", []),
+            host.get("os_guess"), extra_info, host.get("hostname"),
+            mac=mac,
+        )
     return host
 
 
@@ -3653,6 +3684,11 @@ def _discovery_subscribe_loop() -> None:
 def main():
     apply_migrations(REQUIRED_MIGRATIONS)
     _load_settings()
+
+    # Load the RF device-type classifier model (built at image build time by
+    # train_classifier.py).  Failure is non-fatal: the heuristic takes over.
+    if _dc is not None:
+        _dc.load_classifier()
 
     log.info(
         "discovery_service_start",
