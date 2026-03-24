@@ -1963,26 +1963,69 @@ def _parse_nmap_ssl_cert(output: str) -> dict:
     return result
 
 
-def enrich_from_banners(ip: str, open_ports: list[dict]) -> dict:
-    """Grab HTTP server banners and TLS certificate info for *ip*.
+def _parse_snmp_info(output: str) -> dict:
+    """Parse nmap ``snmp-info`` script text output into structured fields.
 
-    First checks for nmap ``http-server-header`` and ``ssl-cert`` NSE script
-    results embedded in *open_ports* by :func:`nmap_scan`.  Using nmap's
-    built-in scripts avoids opening additional TCP connections for data that
-    nmap has already collected during the port/service scan pass.
+    nmap's ``snmp-info`` NSE script produces output such as::
+
+        Enterprise: enterprises.9 (Cisco Systems, Inc.)
+        sysDescr: Cisco IOS Software, Version 15.1(4)M12a ...
+        sysObjectID: 1.3.6.1.4.1.9.1.620
+        sysContact: noc@example.com
+        sysName: core-rtr-01
+        sysLocation: Building A, Server Room
+
+    Returns a dict with any of these keys that are present:
+    ``snmp_sysdescr``, ``snmp_sysname``, ``snmp_contact``, ``snmp_location``,
+    ``snmp_enterprise``.
+    """
+    result: dict = {}
+    for line in output.splitlines():
+        line = line.strip()
+        key, _, val = line.partition(":")
+        key = key.strip()
+        val = val.strip()
+        if not val:
+            continue
+        if key.lower() == "sysdescr":
+            result["snmp_sysdescr"] = val
+        elif key.lower() == "sysname":
+            result["snmp_sysname"] = val
+        elif key.lower() == "syscontact":
+            result["snmp_contact"] = val
+        elif key.lower() == "syslocation":
+            result["snmp_location"] = val
+        elif key.lower() == "enterprise":
+            # Strip trailing parenthetical OUI annotation, keep the text part.
+            m = re.search(r"\((.+?)\)", val)
+            result["snmp_enterprise"] = m.group(1).strip() if m else val
+    return result
+
+
+def enrich_from_banners(ip: str, open_ports: list[dict]) -> dict:
+    """Grab HTTP server banners, TLS certificate info, SNMP metadata, and TCP
+    banners for *ip*.
+
+    First checks for NSE script results embedded in *open_ports* by
+    :func:`nmap_scan`.  Using nmap's built-in scripts avoids opening additional
+    TCP connections for data that nmap has already collected during the
+    port/service scan pass.
 
     Falls back to direct socket probes (``HEAD /`` and TLS handshake) only
     when nmap script output is not present — for example, when a host was
     discovered via ARP or Pi-hole without a prior nmap scan, or when the
     scripts produced no output for a particular port.
 
-    Iterates over *open_ports* and:
-    - Reads ``http-server-header`` script output (or calls :func:`http_banner`)
-      for ports with service ``http`` or common HTTP port numbers (80, 8080).
-    - Reads ``ssl-cert`` script output (or calls :func:`tls_cert_info`) for
-      ports with service ``https`` or common HTTPS port numbers (443, 8443).
+    Script outputs consumed:
 
-    Returns a (possibly empty) dict of banner/cert enrichment fields.
+    - ``http-server-header`` → ``http_server``
+    - ``http-title`` → ``http_title``
+    - ``ssl-cert`` → ``tls_cn``, ``tls_org``, ``tls_issuer_cn``, ``tls_sans``
+    - ``snmp-info`` → ``snmp_sysdescr``, ``snmp_sysname``, ``snmp_contact``,
+      ``snmp_location``, ``snmp_enterprise``
+    - ``banner`` → ``tcp_banner`` (first non-HTTP/HTTPS port that has one)
+
+    Returns a (possibly empty) dict of enrichment fields.
     """
     if not BANNER_GRAB_ENABLED or not open_ports:
         return {}
@@ -1990,8 +2033,10 @@ def enrich_from_banners(ip: str, open_ports: list[dict]) -> dict:
     result: dict = {}
     http_ports = [p for p in open_ports if p.get("service") in ("http",) or p["port"] in (80, 8080)]
     https_ports = [p for p in open_ports if p.get("service") in ("https", "ssl") or p["port"] in (443, 8443)]
+    snmp_ports = [p for p in open_ports if p.get("service") == "snmp" or p["port"] in (161, 162)]
+    other_ports = [p for p in open_ports if p not in http_ports and p not in https_ports and p not in snmp_ports]
 
-    # ── HTTP: prefer nmap http-server-header script, fall back to socket ──────
+    # ── HTTP: prefer nmap http-server-header + http-title scripts, fall back to socket ──
     for p in http_ports:
         scripts = p.get("scripts", {})
         header_val = scripts.get("http-server-header", "").strip()
@@ -2004,6 +2049,15 @@ def enrich_from_banners(ip: str, open_ports: list[dict]) -> dict:
             if banner:
                 result["http_server"] = banner
                 break
+
+    # ── HTTP title: nmap http-title script ───────────────────────────────────
+    for p in http_ports + https_ports:
+        scripts = p.get("scripts", {})
+        title_val = scripts.get("http-title", "").strip()
+        # Strip the common "Did not follow redirect to ..." noise
+        if title_val and not title_val.lower().startswith("did not follow"):
+            result["http_title"] = title_val
+            break
 
     # ── HTTPS: prefer nmap ssl-cert script, fall back to TLS socket ──────────
     for p in https_ports:
@@ -2031,6 +2085,24 @@ def enrich_from_banners(ip: str, open_ports: list[dict]) -> dict:
                         result["http_server"] = banner
                 break
 
+    # ── SNMP: nmap snmp-info script ───────────────────────────────────────────
+    for p in snmp_ports:
+        scripts = p.get("scripts", {})
+        snmp_output = scripts.get("snmp-info", "")
+        if snmp_output:
+            snmp_fields = _parse_snmp_info(snmp_output)
+            if snmp_fields:
+                result.update(snmp_fields)
+                break
+
+    # ── TCP banner: nmap banner script (non-HTTP/HTTPS/SNMP ports) ───────────
+    for p in other_ports:
+        scripts = p.get("scripts", {})
+        banner_val = scripts.get("banner", "").strip()
+        if banner_val:
+            result["tcp_banner"] = banner_val
+            break
+
     return result
 
 
@@ -2039,11 +2111,18 @@ def enrich_from_banners(ip: str, open_ports: list[dict]) -> dict:
 def nmap_scan(ip: str) -> dict:
     """Run a quick nmap scan on *ip* and return port list + OS guess.
 
-    Uses nmap's built-in ``http-server-header`` and ``ssl-cert`` NSE scripts
-    so that HTTP banner and TLS certificate data are collected in the same
-    scan pass rather than requiring separate socket connections.  The script
-    output is attached to each port entry under the ``"scripts"`` key and
-    consumed by :func:`enrich_from_banners`.
+    Uses nmap's built-in NSE scripts so that enrichment data is collected in
+    the same scan pass rather than requiring separate socket connections.
+    Scripts enabled:
+
+    - ``http-server-header`` — HTTP ``Server:`` response header
+    - ``http-title`` — HTML page title (useful for device identification)
+    - ``ssl-cert`` — TLS certificate fields (CN, org, SANs)
+    - ``snmp-info`` — SNMP system description, name, contact, location
+    - ``banner`` — generic TCP banner for non-HTTP services
+
+    The script output is attached to each port entry under the ``"scripts"``
+    key and consumed by :func:`enrich_from_banners`.
     """
     nm = nmap.PortScanner()
     try:
@@ -2051,7 +2130,7 @@ def nmap_scan(ip: str) -> dict:
             ip,
             arguments=(
                 "-O -sV --osscan-guess -T4 --host-timeout 10s --open"
-                " --script=http-server-header,ssl-cert"
+                " --script=http-server-header,http-title,ssl-cert,snmp-info,banner"
             ),
         )
     except Exception as exc:
@@ -2309,6 +2388,69 @@ _IOT_UPNP_MANUFACTURERS: frozenset[str] = frozenset({
     "arlo", "august", "chamberlain", "liftmaster",
 })
 
+# HTML page title substrings (from nmap ``http-title`` NSE script) that
+# indicate IoT / embedded devices.  Matched case-insensitively.
+_IOT_HTTP_TITLE_KEYWORDS: frozenset[str] = frozenset({
+    # Routers / gateways
+    "router", "gateway", "modem", "tp-link", "tplink", "netgear", "asus router",
+    "d-link", "dlink", "linksys", "belkin", "zyxel", "mikrotik", "routeros",
+    "openwrt", "dd-wrt", "tomato", "asuswrt", "merlin",
+    # Access points / switches
+    "access point", "unifi", "ubiquiti", "edgerouter", "edgeswitch",
+    "aironet", "aruba", "ruckus", "meraki",
+    # IP cameras / NVRs
+    "ip camera", "network camera", "ipcam", "hikvision", "dahua", "foscam",
+    "amcrest", "reolink", "axis camera", "vivotek", "nvr", "dvr",
+    # Smart home devices / hubs
+    "smart home", "home automation", "home assistant", "homebridge",
+    "smartthings", "hubitat", "vera", "fibaro", "domoticz", "openhab",
+    # NAS / storage
+    "synology diskstation", "qnap", "nas manager", "diskstation manager",
+    "readynas", "buffalo nas",
+    # Printers
+    "hp laserjet", "hp officejet", "hp deskjet", "brother", "canon print",
+    "epson", "xerox", "printer", "jetdirect",
+    # Smart speakers / media
+    "chromecast", "google home", "amazon echo", "fire tv", "roku",
+    "apple tv", "sonos", "plex media",
+    # Misc embedded / IoT
+    "shelly", "tasmota", "esphome", "wled", "octoprint",
+})
+
+# SNMP sysDescr substrings that identify specific device categories.
+# Matched case-insensitively against the ``snmp_sysdescr`` field.
+_SNMP_NETWORK_DEVICE_KEYWORDS: frozenset[str] = frozenset({
+    "cisco ios", "cisco nx-os", "ios-xe", "ios xr",
+    "junos", "juniper",
+    "routeros", "mikrotik",
+    "edgeos", "edgerouter",
+    "arubaos", "aruba",
+    "openwrt", "dd-wrt",
+    "zyxel", "zywall",
+    "fortios", "fortigate",
+    "panos", "pan-os",
+    "comware",
+    "procurve",
+    "extremexos",
+    "sonic", "dell sonic",
+    "freebsd",          # pfSense / OPNsense
+    "opnsense", "pfsense",
+})
+
+_SNMP_PRINTER_KEYWORDS: frozenset[str] = frozenset({
+    "jetdirect", "laserjet", "officejet", "deskjet",
+    "brother", "bizhub", "konica", "kyocera",
+    "xerox", "lexmark", "ricoh", "epson", "canon",
+    "printer", "print server",
+})
+
+_SNMP_IOT_KEYWORDS: frozenset[str] = frozenset({
+    "esp-idf", "freertos", "ucos", "lwip", "contiki",
+    "shelly", "tasmota", "openwrt", "lede",
+    "hikvision", "dahua", "axis", "amcrest",
+    "raspberry pi", "raspbian",
+})
+
 def guess_device_type(
     vendor: str | None,
     open_ports: list[dict],
@@ -2319,8 +2461,9 @@ def guess_device_type(
     """Heuristic device-type classifier.
 
     Uses MAC vendor string, nmap OS fingerprint, open port set, mDNS service
-    types, UPnP device/manufacturer fields, HTTP server banner, and hostname
-    to produce a best-effort device category.
+    types, UPnP device/manufacturer fields, HTTP server banner, HTTP page
+    title, SNMP sysDescr/sysName, and hostname to produce a best-effort
+    device category.
 
     Returns one of: ``iot``, ``desktop``, ``server``, ``mobile``,
     ``printer``, ``network_device``, or ``unknown``.
@@ -2390,6 +2533,37 @@ def guess_device_type(
     http_server_l = extra.get("http_server", "").lower() if isinstance(extra.get("http_server"), str) else ""
     if http_server_l and any(kw in http_server_l for kw in _IOT_HTTP_SERVER_KEYWORDS):
         return "iot"
+
+    # ── HTTP page title hints ─────────────────────────────────────────────────
+    http_title_l = extra.get("http_title", "").lower() if isinstance(extra.get("http_title"), str) else ""
+    if http_title_l:
+        if any(kw in http_title_l for kw in _IOT_HTTP_TITLE_KEYWORDS):
+            return "iot"
+        # Printer titles (HP / Epson / Canon / etc.)
+        if any(kw in http_title_l for kw in ("printer", "jetdirect", "laserjet", "officejet")):
+            return "printer"
+        # NAS / storage appliance
+        if any(kw in http_title_l for kw in ("diskstation", "qnap", "nas", "readynas")):
+            return "server"
+
+    # ── SNMP sysDescr hints ───────────────────────────────────────────────────
+    snmp_descr_l = extra.get("snmp_sysdescr", "").lower() if isinstance(extra.get("snmp_sysdescr"), str) else ""
+    snmp_name_l = extra.get("snmp_sysname", "").lower() if isinstance(extra.get("snmp_sysname"), str) else ""
+    if snmp_descr_l:
+        if any(kw in snmp_descr_l for kw in _SNMP_NETWORK_DEVICE_KEYWORDS):
+            return "network_device"
+        if any(kw in snmp_descr_l for kw in _SNMP_PRINTER_KEYWORDS):
+            return "printer"
+        if any(kw in snmp_descr_l for kw in _SNMP_IOT_KEYWORDS):
+            return "iot"
+        if "windows" in snmp_descr_l:
+            return "desktop"
+        # Linux host with SSH open is likely a server; without = ambiguous
+        if "linux" in snmp_descr_l:
+            return "server" if 22 in ports else "unknown"
+    # SNMP sysName can also disambiguate (e.g. "rtr-01", "sw-01")
+    if snmp_name_l and any(kw in snmp_name_l for kw in ("rtr", "router", "sw-", "switch", "fw-", "ap-")):
+        return "network_device"
 
     # ── Desktop / workstation ─────────────────────────────────────────────────
     if "windows" in os_l:
