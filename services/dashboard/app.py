@@ -1018,20 +1018,6 @@ def api_stats():
     )
 
 
-# --- API: Scan runs ---
-
-@app.route("/api/scan-runs")
-def api_scan_runs():
-    """Return the 50 most recent discovery scan-run records."""
-    conn = get_db()
-    rows = rows_to_list(
-        conn,
-        "SELECT * FROM scan_runs ORDER BY started_at DESC LIMIT 50",
-    )
-    conn.close()
-    return Response(json.dumps(rows, default=serialize), mimetype="application/json")
-
-
 # --- API: Health check ---
 
 @app.route("/api/health")
