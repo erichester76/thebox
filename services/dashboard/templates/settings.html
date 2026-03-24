@@ -1,0 +1,95 @@
+{% extends "base.html" %}
+{% block title %}Settings{% endblock %}
+
+{% block content %}
+<main>
+
+  <div class="card span-3">
+    <div class="card-header">
+      <h2>⚙️ Configuration Settings</h2>
+      <button class="btn btn-ack ml-auto" onclick="loadSettings()">Refresh</button>
+    </div>
+    <div class="card-body">
+      <div class="settings-notice">
+        Settings are stored in the database. Changes take effect on next service restart
+        (Pi-hole URL/password apply immediately to the dashboard). Environment variables
+        are only used to seed initial values.
+      </div>
+      <div id="settings-container"><div class="empty">Loading…</div></div>
+    </div>
+  </div>
+
+</main>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const CATEGORY_LABELS = {
+  general:    '🌐 General',
+  pihole:     '🕳️ Pi-hole',
+  discovery:  '🔍 Network Discovery',
+  guardian:   '🛡️ Device Guardian',
+  iot:        '📡 IoT Learning',
+  honeypot:   '🍯 Honeypot',
+  redirector: '↩️ Redirector',
+};
+
+async function loadSettings() {
+  const container = document.getElementById('settings-container');
+  try {
+    const grouped = await api('/api/settings');
+    if (!Object.keys(grouped).length) {
+      container.innerHTML = '<div class="empty">No settings found</div>';
+      return;
+    }
+    const order = ['general','pihole','discovery','guardian','iot','honeypot','redirector'];
+    const categories = [...new Set([...order, ...Object.keys(grouped)])].filter(c => grouped[c]);
+    container.innerHTML = categories.map(cat => `
+      <div class="settings-category">
+        <div class="settings-category-title">${escHtml(CATEGORY_LABELS[cat] || cat)}</div>
+        ${grouped[cat].map(s => `
+          <div class="setting-row">
+            <div>
+              <div class="setting-key">${escHtml(s.key)}</div>
+              ${s.description ? `<div class="setting-desc">${escHtml(s.description)}</div>` : ''}
+            </div>
+            <input class="setting-input" id="setting-${escHtml(s.key)}" type="${s.key.toLowerCase().includes('password') ? 'password' : 'text'}" value="${escHtml(s.value)}" aria-label="${escHtml(s.key)}" />
+            <button class="setting-save-btn" data-key="${escHtml(s.key)}" onclick="saveSetting(this)">Save</button>
+          </div>`).join('')}
+      </div>`).join('');
+  } catch(e) {
+    container.innerHTML = '<div class="empty" style="color:var(--danger)">Failed to load settings</div>';
+  }
+}
+
+async function saveSetting(btn) {
+  const key = btn.dataset.key;
+  const input = document.getElementById(`setting-${key}`);
+  const value = input.value;
+  btn.textContent = '…';
+  btn.className = 'setting-save-btn';
+  try {
+    await api(`/api/settings/${key}`, {
+      method: 'PUT',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({value}),
+    });
+    btn.textContent = 'Saved ✓';
+    btn.className = 'setting-save-btn saved';
+  } catch(e) {
+    btn.textContent = 'Error ✗';
+    btn.className = 'setting-save-btn error';
+    let msg = 'Failed to save setting.';
+    try { msg = JSON.parse(e.message).error || msg; } catch(_) {}
+    alert(msg);
+  }
+  setTimeout(() => { btn.textContent = 'Save'; btn.className = 'setting-save-btn'; }, 2500);
+}
+
+// ── Bootstrap ────────────────────────────────────────────────────────────────
+(async () => {
+  await loadSettings();
+  connectSSE(null);
+})();
+</script>
+{% endblock %}

@@ -1,0 +1,184 @@
+{% extends "base.html" %}
+{% block title %}Honeypot{% endblock %}
+
+{% block content %}
+<main>
+
+  <!-- Summary stats card -->
+  <div class="card span-3">
+    <div class="card-header">
+      <h2>🍯 Honeypot Activity</h2>
+      <button class="btn btn-ack ml-auto" onclick="loadHoneypot()">Refresh</button>
+    </div>
+    <div class="summary-stats" id="hp-summary">
+      <div class="sstat total">  <div class="val" id="hs-total">–</div>    <div class="lbl">Total Events</div></div>
+      <div class="sstat critical"><div class="val" id="hs-critical">–</div> <div class="lbl">Critical</div></div>
+      <div class="sstat high">   <div class="val" id="hs-high">–</div>     <div class="lbl">High</div></div>
+      <div class="sstat medium"> <div class="val" id="hs-medium">–</div>   <div class="lbl">Medium</div></div>
+      <div class="sstat accent"> <div class="val" id="hs-low">–</div>      <div class="lbl">Low</div></div>
+      <div class="sstat purple"> <div class="val" id="hs-exploit">–</div>  <div class="lbl">Exploits</div></div>
+      <div class="sstat critical"><div class="val" id="hs-brute">–</div>   <div class="lbl">Brute Force</div></div>
+      <div class="sstat accent"> <div class="val" id="hs-scan">–</div>     <div class="lbl">Scans/Recon</div></div>
+      <div class="sstat purple"> <div class="val" id="hs-unique-src">–</div><div class="lbl">Unique Sources</div></div>
+    </div>
+    <div class="card-body hp-table-wrap" id="hp-table-wrap">
+      <table id="hp-table">
+        <thead><tr>
+          <th>Time</th>
+          <th>Source IP</th>
+          <th>Src Port</th>
+          <th>Dst Port</th>
+          <th>Protocol</th>
+          <th>Interaction</th>
+          <th>Intent</th>
+          <th>Severity</th>
+        </tr></thead>
+        <tbody id="hp-body"><tr><td colspan="8" class="empty">Loading…</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+</main>
+{% endblock %}
+
+{% block modals %}
+<!-- Honeypot Event Detail Modal -->
+<div class="modal-backdrop" id="hp-event-modal">
+  <div class="modal" style="max-width:640px">
+    <h3>Honeypot Event Detail</h3>
+    <div class="event-detail-grid" id="hp-event-grid"></div>
+    <div class="modal-actions" style="margin-top:16px">
+      <button class="btn btn-ack" onclick="closeHpEventModal()">Close</button>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+async function loadHoneypot() {
+  const rows = await api('/api/honeypot');
+  const tbody = document.getElementById('hp-body');
+
+  // Calculate summary stats
+  const total    = rows.length;
+  const critical = rows.filter(r => r.severity === 'critical').length;
+  const high     = rows.filter(r => r.severity === 'high').length;
+  const medium   = rows.filter(r => r.severity === 'medium').length;
+  const low      = rows.filter(r => r.severity === 'low').length;
+  const exploit  = rows.filter(r => r.intent === 'exploit').length;
+  const brute    = rows.filter(r => r.intent === 'brute_force').length;
+  const scan     = rows.filter(r => r.intent === 'scan' || r.intent === 'recon').length;
+  const uniqueSrc = new Set(rows.map(r => r.src_ip)).size;
+
+  document.getElementById('hs-total').textContent    = total.toLocaleString();
+  document.getElementById('hs-critical').textContent = critical.toLocaleString();
+  document.getElementById('hs-high').textContent     = high.toLocaleString();
+  document.getElementById('hs-medium').textContent   = medium.toLocaleString();
+  document.getElementById('hs-low').textContent      = low.toLocaleString();
+  document.getElementById('hs-exploit').textContent  = exploit.toLocaleString();
+  document.getElementById('hs-brute').textContent    = brute.toLocaleString();
+  document.getElementById('hs-scan').textContent     = scan.toLocaleString();
+  document.getElementById('hs-unique-src').textContent = uniqueSrc.toLocaleString();
+
+  if (!rows.length) {
+    tbody.innerHTML = '<tr><td colspan="8" class="empty">No honeypot activity recorded yet</td></tr>';
+    return;
+  }
+  tbody.innerHTML = rows.map(r => `
+    <tr class="clickable" onclick="openHpEventModal(${r.id})">
+      <td style="color:var(--muted);white-space:nowrap">${fmtDate(r.created_at)}</td>
+      <td style="color:var(--danger);font-family:monospace">${escHtml(r.src_ip)}${r.is_sweep ? ' <span class="badge badge-sweep">sweep</span>' : ''}</td>
+      <td style="font-family:monospace;color:var(--muted)">${r.src_port || '–'}</td>
+      <td style="color:var(--warning);font-family:monospace">${r.dst_port}</td>
+      <td style="font-family:monospace">${escHtml(r.protocol)}</td>
+      <td>${interactionBadge(r.interaction_level)}</td>
+      <td>${intentBadge(r.intent)}</td>
+      <td>${severityBadge(r.severity)}</td>
+    </tr>`).join('');
+}
+
+async function openHpEventModal(eventId) {
+  let ev;
+  try { ev = await api(`/api/honeypot/${eventId}`); } catch(_) { return; }
+
+  let portsSel = null;
+  if (ev.ports_scanned) {
+    portsSel = typeof ev.ports_scanned === 'string'
+      ? JSON.parse(ev.ports_scanned)
+      : ev.ports_scanned;
+  }
+
+  document.getElementById('hp-event-grid').innerHTML = `
+    <div>
+      <div class="event-detail-label">Time</div>
+      <div class="event-detail-val">${fmtDate(ev.created_at)}</div>
+    </div>
+    <div>
+      <div class="event-detail-label">Event ID</div>
+      <div class="event-detail-val">#${ev.id}</div>
+    </div>
+    <div>
+      <div class="event-detail-label">Source IP</div>
+      <div class="event-detail-val">${escHtml(ev.src_ip)}</div>
+    </div>
+    <div>
+      <div class="event-detail-label">Source Port</div>
+      <div class="event-detail-val">${ev.src_port || '–'}</div>
+    </div>
+    <div>
+      <div class="event-detail-label">Destination Port</div>
+      <div class="event-detail-val">${ev.dst_port}</div>
+    </div>
+    <div>
+      <div class="event-detail-label">Protocol</div>
+      <div class="event-detail-val">${escHtml(ev.protocol)}</div>
+    </div>
+    <div>
+      <div class="event-detail-label">Severity</div>
+      <div class="event-detail-val">${severityBadge(ev.severity)}</div>
+    </div>
+    <div>
+      <div class="event-detail-label">Interaction Level</div>
+      <div class="event-detail-val">${interactionBadge(ev.interaction_level)}</div>
+    </div>
+    <div>
+      <div class="event-detail-label">Inferred Intent</div>
+      <div class="event-detail-val">${intentBadge(ev.intent)}</div>
+    </div>
+    <div>
+      <div class="event-detail-label">Port Sweep</div>
+      <div class="event-detail-val">${ev.is_sweep ? `<span class="badge badge-sweep">Yes</span>` : 'No'}</div>
+    </div>
+    ${portsSel ? `
+    <div class="full">
+      <div class="event-detail-label">Ports Scanned</div>
+      <div class="event-detail-val">${escHtml(portsSel.join(', '))}</div>
+    </div>` : ''}
+    ${ev.payload_preview ? `
+    <div class="full">
+      <div class="event-detail-label">Protocol Conversation</div>
+      <div class="payload-box">${escHtml(ev.payload_preview)}</div>
+    </div>` : ''}
+  `;
+  document.getElementById('hp-event-modal').classList.add('open');
+}
+
+function closeHpEventModal() {
+  document.getElementById('hp-event-modal').classList.remove('open');
+}
+
+document.getElementById('hp-event-modal').addEventListener('click', function(e) {
+  if (e.target === this) closeHpEventModal();
+});
+
+// ── Bootstrap ────────────────────────────────────────────────────────────────
+(async () => {
+  await loadHoneypot();
+  connectSSE((ev) => {
+    if (ev.type === 'new_honeypot_event') loadHoneypot();
+  });
+  setInterval(loadHoneypot, 30000);
+})();
+</script>
+{% endblock %}

@@ -1,0 +1,87 @@
+{% extends "base.html" %}
+{% block title %}Scan History{% endblock %}
+
+{% block content %}
+<main>
+
+  <!-- Summary stats card -->
+  <div class="card span-3">
+    <div class="card-header">
+      <h2>🔍 Scan History</h2>
+      <button class="btn btn-ack ml-auto" onclick="loadScanRuns()">Refresh</button>
+    </div>
+    <div class="summary-stats">
+      <div class="sstat total">  <div class="val" id="ss-total">–</div>    <div class="lbl">Total Runs</div></div>
+      <div class="sstat success"><div class="val" id="ss-completed">–</div><div class="lbl">Completed</div></div>
+      <div class="sstat accent"> <div class="val" id="ss-running">–</div>  <div class="lbl">Running</div></div>
+      <div class="sstat critical"><div class="val" id="ss-failed">–</div>  <div class="lbl">Failed</div></div>
+      <div class="sstat total">  <div class="val" id="ss-devices">–</div>  <div class="lbl">Devices Found</div></div>
+      <div class="sstat accent"> <div class="val" id="ss-new">–</div>      <div class="lbl">New Devices</div></div>
+    </div>
+    <div class="card-body">
+      <div class="scrollable-tall">
+        <table id="scan-runs-table">
+          <thead><tr>
+            <th>Started</th>
+            <th>Finished</th>
+            <th>Network</th>
+            <th>Devices Found</th>
+            <th>New Devices</th>
+            <th>Status</th>
+          </tr></thead>
+          <tbody id="scan-runs-body"><tr><td colspan="6" class="empty">Loading…</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+</main>
+{% endblock %}
+
+{% block scripts %}
+<script>
+async function loadScanRuns() {
+  const rows = await api('/api/scan-runs');
+  const tbody = document.getElementById('scan-runs-body');
+
+  // Calculate summary stats
+  const total     = rows.length;
+  const completed = rows.filter(r => r.status === 'completed').length;
+  const running   = rows.filter(r => r.status === 'running').length;
+  const failed    = rows.filter(r => r.status === 'failed').length;
+  const devices   = rows.reduce((sum, r) => sum + (r.devices_found || 0), 0);
+  const newDevs   = rows.reduce((sum, r) => sum + (r.new_devices || 0), 0);
+
+  document.getElementById('ss-total').textContent     = total.toLocaleString();
+  document.getElementById('ss-completed').textContent = completed.toLocaleString();
+  document.getElementById('ss-running').textContent   = running.toLocaleString();
+  document.getElementById('ss-failed').textContent    = failed.toLocaleString();
+  document.getElementById('ss-devices').textContent   = devices.toLocaleString();
+  document.getElementById('ss-new').textContent       = newDevs.toLocaleString();
+
+  if (!rows.length) {
+    tbody.innerHTML = '<tr><td colspan="6" class="empty">No scan runs recorded yet</td></tr>';
+    return;
+  }
+  tbody.innerHTML = rows.map(r => {
+    const statusClassMap = { completed: 'trusted', running: 'iot', failed: 'blocked' };
+    const statusClass = statusClassMap[r.status] || 'new';
+    return `<tr>
+      <td style="white-space:nowrap">${fmtDate(r.started_at)}</td>
+      <td style="white-space:nowrap">${r.finished_at ? fmtDate(r.finished_at) : '<span style="color:var(--muted)">—</span>'}</td>
+      <td>${escHtml(r.network_range)}</td>
+      <td>${r.devices_found}</td>
+      <td>${r.new_devices}</td>
+      <td><span class="badge badge-${statusClass}">${escHtml(r.status)}</span></td>
+    </tr>`;
+  }).join('');
+}
+
+// ── Bootstrap ────────────────────────────────────────────────────────────────
+(async () => {
+  await loadScanRuns();
+  connectSSE(null);
+  setInterval(loadScanRuns, 30000);
+})();
+</script>
+{% endblock %}
