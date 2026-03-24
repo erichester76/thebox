@@ -434,6 +434,27 @@
     </div>
   </div>
 
+  <!-- Scan run history -->
+  <div class="card span-3">
+    <div class="card-header">
+      <h2>Scan History</h2>
+      <button class="btn btn-ack ml-auto" onclick="loadScanRuns()">Refresh</button>
+    </div>
+    <div class="card-body scrollable">
+      <table id="scan-runs-table">
+        <thead><tr>
+          <th>Started</th>
+          <th>Finished</th>
+          <th>Network</th>
+          <th>Devices Found</th>
+          <th>New Devices</th>
+          <th>Status</th>
+        </tr></thead>
+        <tbody id="scan-runs-body"><tr><td colspan="6" class="empty">Loading…</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
 </main>
 
 <!-- Honeypot Event Detail Modal -->
@@ -1156,6 +1177,28 @@ async function deleteGroup(id, name) {
   loadGroups(); loadUsers(); loadDevices();
 }
 
+// ── Scan history ──────────────────────────────────────────────────────────────
+async function loadScanRuns() {
+  const rows = await api('/api/scan-runs');
+  const tbody = document.getElementById('scan-runs-body');
+  if (!rows.length) {
+    tbody.innerHTML = '<tr><td colspan="6" class="empty">No scan runs recorded yet</td></tr>';
+    return;
+  }
+  tbody.innerHTML = rows.map(r => {
+    const statusClassMap = {completed: 'trusted', running: 'iot', failed: 'blocked'};
+    const statusClass = statusClassMap[r.status] || 'new';
+    return `<tr>
+      <td style="white-space:nowrap">${fmtDate(r.started_at)}</td>
+      <td style="white-space:nowrap">${r.finished_at ? fmtDate(r.finished_at) : '<span style="color:var(--muted)">—</span>'}</td>
+      <td>${escHtml(r.network_range)}</td>
+      <td>${r.devices_found}</td>
+      <td>${r.new_devices}</td>
+      <td><span class="badge badge-${statusClass}">${escHtml(r.status)}</span></td>
+    </tr>`;
+  }).join('');
+}
+
 // ── Manage group members modal ────────────────────────────────────────────────
 async function openManageGroupModalFromBtn(btn) {
   openManageGroupModal(parseInt(btn.dataset.groupId), btn.dataset.groupName);
@@ -1276,10 +1319,10 @@ document.getElementById('device-detail-modal').addEventListener('click', functio
 
 // ── Bootstrap ────────────────────────────────────────────────────────────────
 (async () => {
-  await Promise.all([loadStats(), loadPihole(), loadDevices(), loadAlerts(), loadHoneypot(), loadUsers(), loadGroups()]);
+  await Promise.all([loadStats(), loadPihole(), loadDevices(), loadAlerts(), loadHoneypot(), loadUsers(), loadGroups(), loadScanRuns()]);
   connectSSE();
   // Periodic refresh
-  setInterval(() => { loadStats(); loadPihole(); loadAlerts(); loadHoneypot(); }, 30000);
+  setInterval(() => { loadStats(); loadPihole(); loadAlerts(); loadHoneypot(); loadScanRuns(); }, 30000);
 })();
 </script>
 </body>
