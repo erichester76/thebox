@@ -128,6 +128,14 @@ services:
       TRUSTED_NETWORKS: ${TRUSTED_NETWORKS:-192.168.1.0/24}
       AUTO_QUARANTINE: ${AUTO_QUARANTINE:-true}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      ALERT_EMAIL: ${ALERT_EMAIL:-}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_FROM: ${SMTP_FROM:-alerts@thebox.local}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_TLS: ${SMTP_TLS:-true}
+      ALERT_WEBHOOK_URL: ${ALERT_WEBHOOK_URL:-}
     cap_add:
       - NET_ADMIN
       - NET_RAW
@@ -164,6 +172,14 @@ services:
       HONEYPOT_MAX_PAYLOAD_LENGTH: ${HONEYPOT_MAX_PAYLOAD_LENGTH:-2000}
       HONEYPOT_CREDENTIAL_WINDOW_MULTIPLIER: ${HONEYPOT_CREDENTIAL_WINDOW_MULTIPLIER:-5}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      ALERT_EMAIL: ${ALERT_EMAIL:-}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_FROM: ${SMTP_FROM:-alerts@thebox.local}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_TLS: ${SMTP_TLS:-true}
+      ALERT_WEBHOOK_URL: ${ALERT_WEBHOOK_URL:-}
     depends_on:
       postgres:
         condition: service_healthy
@@ -194,6 +210,14 @@ services:
       BLACKHOLE_QUARANTINED: ${BLACKHOLE_QUARANTINED:-false}
       ARP_REFRESH_INTERVAL: ${ARP_REFRESH_INTERVAL:-10}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      ALERT_EMAIL: ${ALERT_EMAIL:-}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_FROM: ${SMTP_FROM:-alerts@thebox.local}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_TLS: ${SMTP_TLS:-true}
+      ALERT_WEBHOOK_URL: ${ALERT_WEBHOOK_URL:-}
     cap_add:
       - NET_ADMIN
       - NET_RAW

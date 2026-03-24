@@ -63,6 +63,8 @@ from scapy.all import (
     srp,
 )
 
+from notifier import send_alert_notification
+
 # ─── Configuration ───────────────────────────────────────────────────────────
 DATABASE_URL = os.environ["DATABASE_URL"]
 REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379/0")
@@ -246,6 +248,7 @@ def create_alert(
             (source, level, title, detail, device_id),
         )
     conn.commit()
+    send_alert_notification(source, level, title, detail)
 
 
 # ─── ARP helpers ─────────────────────────────────────────────────────────────

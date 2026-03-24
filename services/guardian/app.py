@@ -29,6 +29,8 @@ import redis
 import schedule
 import structlog
 
+from notifier import send_alert_notification
+
 # ─── Configuration ───────────────────────────────────────────────────────────
 DATABASE_URL = os.environ["DATABASE_URL"]
 REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379/0")
@@ -396,6 +398,7 @@ def create_alert(conn, source: str, level: str, title: str, detail: str, device_
             (source, level, title, detail, device_id),
         )
     conn.commit()
+    send_alert_notification(source, level, title, detail)
 
 
 # ─── Event handler ───────────────────────────────────────────────────────────
