@@ -471,6 +471,10 @@ def _build_samples_from_fingerbank_api(
     import urllib.parse
     import urllib.request
 
+    # Validate base_url to prevent SSRF and accidental credential leakage.
+    if not base_url.startswith("https://"):
+        raise ValueError(f"base_url must start with https:// — got: {base_url!r}")
+
     # Rough top-level Fingerbank category name → our label mapping.
     _FB_CATEGORY_MAP = {
         "mobile device": "mobile",
@@ -508,7 +512,15 @@ def _build_samples_from_fingerbank_api(
             url = f"{base_url}/{endpoint}?{params}"
             try:
                 with urllib.request.urlopen(url, timeout=30) as resp:  # noqa: S310
-                    data = json.loads(resp.read().decode())
+                    raw = resp.read().decode()
+                try:
+                    data = json.loads(raw)
+                except json.JSONDecodeError as exc:
+                    log.error(
+                        "fingerbank_api_json_error endpoint=%s page=%d error=%s body_prefix=%.200s",
+                        endpoint, page, exc, raw,
+                    )
+                    break
             except urllib.error.HTTPError as exc:
                 log.error("fingerbank_api_http_error endpoint=%s page=%d status=%d", endpoint, page, exc.code)
                 break
@@ -697,7 +709,11 @@ def train(
         ]:
             # Need at least 2 samples per class for CV; skip if not enough data.
             from collections import Counter  # noqa: PLC0415
-            min_count = min(Counter(y_np).values())
+            counts = Counter(y_np)
+            if not counts:
+                print(f"[{label}] Skipping CV — no samples.")
+                continue
+            min_count = min(counts.values())
             if min_count < 2:
                 print(f"[{label}] Skipping CV — too few samples in some classes.")
                 continue
