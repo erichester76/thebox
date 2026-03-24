@@ -151,6 +151,13 @@ def add_to_ipset(name: str, value: str):
     run_cmd(["ipset", "add", "-exist", name, value])
 
 
+def is_in_ipset(name: str, value: str) -> bool:
+    """Return True if *value* is a member of ipset *name*, False otherwise."""
+    if not _ipsets_available:
+        return False
+    return run_cmd(["ipset", "test", name, value], check=False).returncode == 0
+
+
 def remove_from_ipset(name: str, value: str):
     if not _ipsets_available:
         return
@@ -368,6 +375,18 @@ def sync_all_policies():
     log.info("sync_all_policies_done")
 
 
+# ─── Redis event publisher ───────────────────────────────────────────────────
+
+def publish_event(event_type: str, **fields):
+    """Publish a structured event to the shared Redis channel."""
+    try:
+        rdb = get_redis()
+        rdb.publish("thebox:events", json.dumps({"type": event_type, **fields}))
+        log.info("event_published", event_type=event_type, **fields)
+    except Exception as exc:
+        log.error("event_publish_failed", event_type=event_type, error=str(exc))
+
+
 # ─── Alert helper ────────────────────────────────────────────────────────────
 
 def create_alert(conn, source: str, level: str, title: str, detail: str, device_id: int | None = None):
@@ -401,6 +420,7 @@ def handle_new_device_event(event: dict):
             )
         conn.commit()
         apply_device_policy(mac, ip, "quarantined")
+        publish_event("quarantine_device", ip=ip, mac=mac)
         create_alert(
             conn,
             source="guardian",
@@ -425,11 +445,16 @@ def handle_new_device_event(event: dict):
 
 # ─── Redis subscriber thread ─────────────────────────────────────────────────
 
-def _apply_policy_from_db(device_id: int, status_override: str | None = None) -> None:
+def _apply_policy_from_db(device_id: int, status_override: str | None = None) -> tuple[str, str, bool] | None:
     """Look up a device by ID and apply the correct iptables policy.
 
     When *status_override* is provided it is used instead of the DB value
     (useful when the DB hasn't been updated yet, e.g. during event handlers).
+
+    Returns a ``(mac_address, ip_address, was_quarantined)`` tuple on success,
+    where *was_quarantined* is ``True`` when the device was in the quarantine
+    ipset (or had quarantine IP rules) before the policy was applied.
+    Returns ``None`` if the device is not found.
     """
     conn = get_db()
     with conn.cursor() as cur:
@@ -439,12 +464,23 @@ def _apply_policy_from_db(device_id: int, status_override: str | None = None) ->
 
     if not row:
         log.warning("policy_apply_device_not_found", device_id=device_id)
-        return
+        return None
 
     mac = row["mac_address"]
     ip = row["ip_address"] or ""
     effective_status = status_override if status_override is not None else row["status"]
+
+    # Check quarantine membership *before* apply_device_policy clears it.
+    if _ipsets_available:
+        was_quarantined = is_in_ipset("thebox_quarantine", mac)
+    else:
+        # IP-fallback: probe for the DROP rule that marks quarantine
+        was_quarantined = ip != "" and run_cmd(
+            ["iptables", "-C", _THEBOX_CHAIN, "-s", ip, "-j", "DROP"], check=False
+        ).returncode == 0
+
     apply_device_policy(mac, ip, effective_status)
+    return mac, ip, was_quarantined
 
 
 def subscribe_loop():
@@ -477,9 +513,15 @@ def subscribe_loop():
                 device_id = event.get("device_id")
                 new_status = event.get("status")
                 if device_id and new_status:
-                    _apply_policy_from_db(device_id, status_override=new_status)
+                    result = _apply_policy_from_db(device_id, status_override=new_status)
                     log.info("device_policy_updated_from_event",
                              device_id=device_id, status=new_status)
+                    if result:
+                        mac, ip, was_quarantined = result
+                        if new_status == "quarantined":
+                            publish_event("quarantine_device", ip=ip, mac=mac)
+                        elif was_quarantined:
+                            publish_event("unquarantine_device", ip=ip, mac=mac)
         except Exception as exc:
             log.error("event_handling_error", error=str(exc))
 
