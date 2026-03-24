@@ -399,6 +399,7 @@ def classify_device(
             "rf_classify_input",
             vendor=vendor,
             open_ports=ports_in,
+            extra_info=extra_info,
             dhcp_fingerprint=dhcp_fingerprint,
             active_features=active_features,
             total_features=len(features),
