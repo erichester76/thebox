@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   # ─── Database ───────────────────────────────────────────────────────────────
   postgres:
@@ -86,7 +84,7 @@ services:
       SCAN_INTERVAL: ${SCAN_INTERVAL:-300}
       NETWORK_RANGES: ${NETWORK_RANGES:-192.168.1.0/24}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
-      PIHOLE_URL: http://pihole:80
+      PIHOLE_URL: ${PIHOLE_URL:-http://pihole:80}
       PIHOLE_PASSWORD: ${PIHOLE_PASSWORD:-thebox_pihole}
       DNS_SNIFF_ENABLED: ${DNS_SNIFF_ENABLED:-true}
       DNS_SNIFF_IFACE: ${DNS_SNIFF_IFACE:-}
@@ -246,7 +244,7 @@ services:
       DATABASE_URL: postgresql://${POSTGRES_USER:-thebox}:${POSTGRES_PASSWORD:-thebox_secret}@postgres:5432/${POSTGRES_DB:-thebox}
       REDIS_URL: redis://redis:6379/0
       SECRET_KEY: ${SECRET_KEY:-change_me_in_production}
-      PIHOLE_URL: http://pihole:80
+      PIHOLE_URL: {PIHOLE_URL:-http://pihole:80}
       PIHOLE_PASSWORD: ${PIHOLE_PASSWORD:-thebox_pihole}
       PIHOLE_SID_TTL: ${PIHOLE_SID_TTL:-240}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
