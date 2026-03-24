@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import queue
+import re
 import threading
 import time
 from datetime import datetime, timezone
@@ -30,6 +31,140 @@ SECRET_KEY = os.environ.get("SECRET_KEY", "")
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 PIHOLE_URL = os.environ.get("PIHOLE_URL", "").rstrip("/")
 PIHOLE_PASSWORD = os.environ.get("PIHOLE_PASSWORD", "")
+
+# ─── Dynamic settings catalogue (sourced from .env.example) ──────────────────
+# Paths inside the container.  Both files are bind-mounted read-only from the
+# repo root by docker-compose.yml so the parser always sees the latest version.
+_ENV_EXAMPLE_PATH = os.environ.get("ENV_EXAMPLE_PATH", "/app/.env.example")
+_ENV_PATH         = os.environ.get("ENV_PATH",         "/app/.env")
+
+# Keys present in .env.example that must NOT appear in the runtime settings
+# table because they are infrastructure-level or security-critical values that
+# must be set at deploy time and cannot be safely changed via the UI.
+_ENV_EXAMPLE_SKIP_KEYS: frozenset[str] = frozenset({
+    "TZ",
+    "POSTGRES_DB", "POSTGRES_USER", "POSTGRES_PASSWORD",
+    "PIHOLE_DNS_PORT", "PIHOLE_WEB_PORT",
+    "DASHBOARD_PORT",
+    "SECRET_KEY",
+})
+
+# Regex that matches section-header comments like:  # ─── Name ─────────────
+# The ─ characters are U+2500 BOX DRAWINGS LIGHT HORIZONTAL.
+_SECTION_HEADER_RE = re.compile(r"^#\s*─+\s+(.+?)\s+─+")
+
+
+def _section_to_category(section_name: str) -> str:
+    """Map a .env.example section header text to an internal category slug."""
+    s = section_name.lower()
+    if "postgresql" in s:
+        return "general"        # all keys in this section are skipped anyway
+    if "pi-hole" in s or "pihole" in s:
+        return "pihole"
+    if "dashboard" in s:
+        return "pihole"         # only PIHOLE_SID_TTL lives in this section
+    if "discovery" in s:
+        return "discovery"
+    if "guardian" in s:
+        return "guardian"
+    if "iot" in s:
+        return "iot"
+    if any(w in s for w in ("honeypot", "sweep", "protocol interaction", "severity")):
+        return "honeypot"
+    if "redirector" in s:
+        return "redirector"
+    if "logging" in s:
+        return "general"
+    return "general"
+
+
+def _parse_env_example() -> list[tuple[str, str, str, str]]:
+    """Parse .env.example and return ``(key, value, category, description)`` tuples.
+
+    The ``value`` in each tuple is the raw default taken from the ``.env.example``
+    file.  Callers should override this with values from ``os.environ`` or the
+    ``.env`` file before writing to the database.
+
+    * Section-header lines (``# ─── Name ───``) set the current category.
+    * Consecutive comment lines directly above a ``KEY=value`` line are joined
+      into the description for that key.
+    * An empty line resets the accumulated description.
+    * Keys in ``_ENV_EXAMPLE_SKIP_KEYS`` are omitted from the output.
+
+    Returns an empty list when the file cannot be found (fails silently so that
+    a missing mount does not crash the dashboard on startup).
+    """
+    entries: list[tuple[str, str, str, str]] = []
+    if not os.path.exists(_ENV_EXAMPLE_PATH):
+        return entries
+
+    current_category = "general"
+    pending_comments: list[str] = []
+
+    with open(_ENV_EXAMPLE_PATH, encoding="utf-8") as fh:
+        for raw_line in fh:
+            line = raw_line.rstrip("\n")
+
+            # ── Section header?
+            m = _SECTION_HEADER_RE.match(line)
+            if m:
+                current_category = _section_to_category(m.group(1).strip())
+                pending_comments = []
+                continue
+
+            # ── Empty line → reset pending description
+            if not line.strip():
+                pending_comments = []
+                continue
+
+            # ── Comment line (not a section header)
+            if line.startswith("#"):
+                text = line.lstrip("#").strip()
+                if text:
+                    pending_comments.append(text)
+                continue
+
+            # ── KEY=value line
+            if "=" in line:
+                key, _, raw_val = line.partition("=")
+                key = key.strip()
+                if key and key not in _ENV_EXAMPLE_SKIP_KEYS:
+                    description = " ".join(pending_comments)
+                    entries.append((key, raw_val.strip(), current_category, description))
+                pending_comments = []
+
+    return entries
+
+
+def _read_env_file() -> dict[str, str]:
+    """Read ``KEY=value`` pairs from the ``.env`` file.
+
+    Returns an empty dict when the file does not exist (e.g. on a fresh install
+    before the user has created it) or cannot be read.  Shell-style quoting is
+    not evaluated — values are returned exactly as written in the file.
+    """
+    env: dict[str, str] = {}
+    if not os.path.exists(_ENV_PATH):
+        return env
+    try:
+        with open(_ENV_PATH, encoding="utf-8") as fh:
+            for raw_line in fh:
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" in line:
+                    k, _, v = line.partition("=")
+                    env[k.strip()] = v.strip()
+    except OSError as exc:
+        # Log at warning level; the DB will already have correct values from a
+        # previous successful bootstrap so this is non-fatal.
+        logging.getLogger(__name__).warning("env_file_read_failed path=%s error=%s", _ENV_PATH, exc)
+    return env
+
+
+# Valid setting keys — populated from .env.example by bootstrap_settings().
+# Used to reject unknown keys in the PUT /api/settings endpoints.
+_VALID_SETTING_KEYS: frozenset[str] = frozenset()
 
 # ─── Logging ─────────────────────────────────────────────────────────────────
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
@@ -199,6 +334,15 @@ def ensure_schema():
         "ALTER TABLE honeypot_events ADD COLUMN IF NOT EXISTS intent VARCHAR(32) NOT NULL DEFAULT 'scan'",
         "ALTER TABLE honeypot_events ADD COLUMN IF NOT EXISTS is_sweep BOOLEAN NOT NULL DEFAULT FALSE",
         "ALTER TABLE honeypot_events ADD COLUMN IF NOT EXISTS ports_scanned JSONB",
+        # settings — runtime configuration key/value store
+        """CREATE TABLE IF NOT EXISTS settings (
+            key         VARCHAR(64)  NOT NULL PRIMARY KEY,
+            value       TEXT         NOT NULL,
+            description TEXT,
+            category    VARCHAR(32)  NOT NULL DEFAULT 'general',
+            updated_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_settings_category ON settings(category)",
         # Migration: add password_hash for dashboard login
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash VARCHAR(255)",
         # scan_runs — populated by discovery after each nmap scan cycle
@@ -248,6 +392,111 @@ threading.Thread(target=redis_subscriber_loop, daemon=True).start()
 # Called at module level (not inside if __name__) so the schema is ensured
 # whether the app is run directly or served by a WSGI host (gunicorn, etc.).
 ensure_schema()
+
+
+# ─── Settings helpers ────────────────────────────────────────────────────────
+
+def bootstrap_settings() -> None:
+    """Seed the settings table from ``.env.example`` (and ``.env``) on every startup.
+
+    How new keys are handled
+    ------------------------
+    On *every* dashboard restart the catalogue is re-read from ``.env.example``.
+    Keys that are **missing** from the ``settings`` table are inserted using the
+    best available value:
+
+      1. ``os.environ[key]``  — set by docker-compose from ``.env`` (highest priority)
+      2. ``.env`` file value  — for vars not forwarded to this container's env
+      3. ``.env.example`` default — absolute fallback
+
+    Keys that **already exist** in the table keep their current ``value`` so that
+    any changes made through the UI survive restarts.  Only ``category`` and
+    ``description`` are refreshed from ``.env.example`` so that documentation
+    improvements are always picked up.
+
+    Effect
+    ------
+    Newly added variables in ``.env.example`` are automatically inserted into
+    the DB on the next dashboard restart without any manual migration.
+
+    The global ``_VALID_SETTING_KEYS`` is also updated so that the API
+    immediately accepts the new keys.
+    """
+    global _VALID_SETTING_KEYS
+
+    catalogue = _parse_env_example()
+    if not catalogue:
+        log.warning("settings_catalogue_empty",
+                    msg=".env.example not found or empty; settings table may be incomplete",
+                    path=_ENV_EXAMPLE_PATH)
+        return
+
+    env_file = _read_env_file()
+
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            for key, example_default, category, description in catalogue:
+                # Value priority: process env (docker-compose) → .env file
+                # (for vars not forwarded to this container) → .env.example default.
+                value = os.environ.get(key) or env_file.get(key) or example_default
+                cur.execute(
+                    """INSERT INTO settings (key, value, category, description)
+                       VALUES (%s, %s, %s, %s)
+                       ON CONFLICT (key) DO UPDATE SET
+                         category    = EXCLUDED.category,
+                         description = EXCLUDED.description""",
+                    (key, value, category, description),
+                )
+        conn.commit()
+        log.info("settings_bootstrapped", count=len(catalogue))
+    finally:
+        conn.close()
+
+    # Refresh valid-key set so the PUT /api/settings endpoints accept any key
+    # that was just added to .env.example.
+    _VALID_SETTING_KEYS = frozenset(key for key, _, _, _ in catalogue)
+
+
+def get_setting(key: str, default: str = "") -> str:
+    """Return the current value for *key* from the database.
+
+    Falls back to *default* when the key is absent (which should only happen
+    on a freshly deployed instance before ``bootstrap_settings`` has run).
+    Opens and closes its own connection so callers don't need to pass one in.
+    """
+    try:
+        conn = get_db()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT value FROM settings WHERE key = %s", (key,))
+                row = cur.fetchone()
+                return row["value"] if row else default
+        finally:
+            conn.close()
+    except Exception as exc:
+        log.warning("get_setting_failed", key=key, error=str(exc))
+        return default
+
+
+def _load_runtime_settings() -> None:
+    """Override module-level Pi-hole vars from the database.
+
+    Called once at startup *after* ``bootstrap_settings``.  This ensures that
+    any values updated via the UI survive service restarts, overriding the
+    original environment variables.
+    """
+    global PIHOLE_URL, PIHOLE_PASSWORD
+    db_url = get_setting("PIHOLE_URL", PIHOLE_URL).rstrip("/")
+    db_pw  = get_setting("PIHOLE_PASSWORD", PIHOLE_PASSWORD)
+    if db_url:
+        PIHOLE_URL = db_url
+    if db_pw:
+        PIHOLE_PASSWORD = db_pw
+
+
+bootstrap_settings()
+_load_runtime_settings()
 
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -990,7 +1239,7 @@ def api_device_honeypot(device_id: int):
 _pihole_sid_cache: tuple[str, float] | None = None
 _pihole_sid_lock = threading.Lock()
 # Pi-hole v6 sessions last 300 s by default; refresh 60 s before expiry.
-# Tunable via PIHOLE_SID_TTL env var (seconds).
+# Tunable via the PIHOLE_SID_TTL setting in the database (seeded from env var).
 _PIHOLE_SID_TTL = float(os.environ.get("PIHOLE_SID_TTL", "240.0"))
 
 
@@ -1132,6 +1381,98 @@ def api_stats():
     )
 
 
+# --- API: Settings ---
+
+# _VALID_SETTING_KEYS is populated by bootstrap_settings() which runs at
+# module load time.  It contains every key parsed from .env.example.
+
+
+@app.route("/api/settings")
+def api_settings():
+    """Return all settings grouped by category."""
+    conn = get_db()
+    rows = rows_to_list(conn, "SELECT key, value, category, description, updated_at FROM settings ORDER BY category, key")
+    conn.close()
+    # Group by category for the UI
+    grouped: dict[str, list[dict]] = {}
+    for row in rows:
+        cat = row["category"]
+        grouped.setdefault(cat, []).append(row)
+    return Response(json.dumps(grouped, default=serialize), mimetype="application/json")
+
+
+@app.route("/api/settings/<key>", methods=["PUT"])
+def api_update_setting(key: str):
+    """Update a single setting value."""
+    data = request.get_json(silent=True) or {}
+    if "value" not in data:
+        return jsonify({"error": "Missing 'value' field"}), 400
+    value = str(data["value"])
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """UPDATE settings SET value = %s, updated_at = NOW()
+                   WHERE key = %s""",
+                (value, key),
+            )
+            if cur.rowcount == 0:
+                conn.close()
+                return jsonify({"error": f"Unknown setting: {key}"}), 404
+        conn.commit()
+    finally:
+        conn.close()
+    # Apply Pi-hole credentials immediately so the current process benefits.
+    if key in ("PIHOLE_URL", "PIHOLE_PASSWORD"):
+        _load_runtime_settings()
+        # Invalidate the cached Pi-hole session so it re-authenticates.
+        global _pihole_sid_cache
+        with _pihole_sid_lock:
+            _pihole_sid_cache = None
+    return jsonify({"ok": True, "key": key, "value": value})
+
+
+@app.route("/api/settings", methods=["PUT"])
+def api_update_settings_bulk():
+    """Update multiple settings at once.  Body: {key: value, ...}"""
+    data = request.get_json(silent=True) or {}
+    if not data:
+        return jsonify({"error": "Empty request body"}), 400
+    # Validate against known keys.  If _VALID_SETTING_KEYS is empty (e.g.
+    # .env.example was not found at startup) skip the check and rely on the
+    # DB UPDATE's rowcount to detect unknown keys below.
+    if _VALID_SETTING_KEYS:
+        unknown = [k for k in data if k not in _VALID_SETTING_KEYS]
+        if unknown:
+            return jsonify({"error": f"Unknown setting keys: {', '.join(unknown)}"}), 400
+    conn = get_db()
+    updated: list[str] = []
+    not_found: list[str] = []
+    try:
+        with conn.cursor() as cur:
+            for k, v in data.items():
+                cur.execute(
+                    "UPDATE settings SET value = %s, updated_at = NOW() WHERE key = %s",
+                    (str(v), k),
+                )
+                if cur.rowcount:
+                    updated.append(k)
+                else:
+                    not_found.append(k)
+        conn.commit()
+    finally:
+        conn.close()
+    if not updated:
+        return jsonify({"error": f"No settings updated; unknown keys: {', '.join(not_found)}"}), 404
+    if any(k in ("PIHOLE_URL", "PIHOLE_PASSWORD") for k in updated):
+        _load_runtime_settings()
+        global _pihole_sid_cache
+        with _pihole_sid_lock:
+            _pihole_sid_cache = None
+    result: dict = {"ok": True, "updated": updated}
+    if not_found:
+        result["not_found"] = not_found
+    return jsonify(result)
 # --- API: Health check ---
 
 @app.route("/api/health")

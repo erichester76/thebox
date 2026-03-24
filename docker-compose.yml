@@ -250,6 +250,9 @@ services:
       PIHOLE_PASSWORD: ${PIHOLE_PASSWORD:-thebox_pihole}
       PIHOLE_SID_TTL: ${PIHOLE_SID_TTL:-240}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - ./.env.example:/app/.env.example:ro
+      - ./.env:/app/.env:ro
     networks:
       - thebox_internal
       - thebox_external

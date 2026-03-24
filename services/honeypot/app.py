@@ -429,7 +429,60 @@ def ensure_schema():
     log.info("schema_ensured")
 
 
-# ─── Severity classifier ──────────────────────────────────────────────────────
+# ─── Settings helpers ────────────────────────────────────────────────────────
+
+def get_setting(key: str, default: str = "") -> str:
+    """Return the current value for *key* from the settings table."""
+    try:
+        conn = get_db()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT value FROM settings WHERE key = %s", (key,))
+                row = cur.fetchone()
+                return row["value"] if row else default
+        finally:
+            conn.close()
+    except Exception as exc:
+        log.warning("get_setting_failed", key=key, error=str(exc))
+        return default
+
+
+def _load_settings() -> None:
+    """Read honeypot settings from the database, falling back to env vars."""
+    global HONEYPOT_PORTS, IGNORED_NETWORKS
+    global THRESHOLD_COUNT, THRESHOLD_WINDOW
+    global SWEEP_THRESHOLD, SWEEP_WINDOW
+    global RECV_TIMEOUT, MAX_PAYLOAD_PREVIEW_LENGTH, CREDENTIAL_WINDOW_MULTIPLIER
+
+    raw_ports = get_setting(
+        "HONEYPOT_PORTS",
+        ",".join(str(p) for p in HONEYPOT_PORTS),
+    )
+    HONEYPOT_PORTS = [int(p.strip()) for p in raw_ports.split(",") if p.strip()]
+
+    raw_ignored = get_setting(
+        "HONEYPOT_IGNORED_NETWORKS",
+        ",".join(str(n) for n in IGNORED_NETWORKS),
+    )
+    parsed: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
+    for raw in raw_ignored.split(","):
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            parsed.append(ipaddress.ip_network(raw, strict=False))
+        except ValueError:
+            log.warning("invalid_ignored_network", value=raw)
+    IGNORED_NETWORKS = parsed
+
+    THRESHOLD_COUNT  = int(get_setting("HONEYPOT_THRESHOLD_COUNT",  str(THRESHOLD_COUNT)))
+    THRESHOLD_WINDOW = int(get_setting("HONEYPOT_THRESHOLD_WINDOW", str(THRESHOLD_WINDOW)))
+    SWEEP_THRESHOLD  = int(get_setting("HONEYPOT_SWEEP_THRESHOLD",  str(SWEEP_THRESHOLD)))
+    SWEEP_WINDOW     = int(get_setting("HONEYPOT_SWEEP_WINDOW",     str(SWEEP_WINDOW)))
+    RECV_TIMEOUT     = int(get_setting("HONEYPOT_RECV_TIMEOUT",     str(RECV_TIMEOUT)))
+    MAX_PAYLOAD_PREVIEW_LENGTH = int(get_setting("HONEYPOT_MAX_PAYLOAD_LENGTH", str(MAX_PAYLOAD_PREVIEW_LENGTH)))
+    CREDENTIAL_WINDOW_MULTIPLIER = int(get_setting("HONEYPOT_CREDENTIAL_WINDOW_MULTIPLIER", str(CREDENTIAL_WINDOW_MULTIPLIER)))
+    log.info("settings_loaded", ports=HONEYPOT_PORTS)
 
 def classify_severity(src_ip: str, rdb: redis.Redis, interaction_level: str, intent: str, is_sweep: bool) -> str:
     """Return severity based on hit frequency, interaction depth, and inferred intent."""
@@ -705,8 +758,10 @@ def listen_on_port(port: int):
 
 
 def main():
-    log.info("honeypot_service_start", ports=HONEYPOT_PORTS)
+    log.info("honeypot_service_start")
     ensure_schema()
+    _load_settings()
+    log.info("honeypot_listening", ports=HONEYPOT_PORTS)
     threads = []
     for port in HONEYPOT_PORTS:
         t = threading.Thread(target=listen_on_port, args=(port,), daemon=True)
