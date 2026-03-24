@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>TheBox — Sign In</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --bg:      #0d1117;
+      --surface: #161b22;
+      --border:  #30363d;
+      --accent:  #58a6ff;
+      --danger:  #f85149;
+      --muted:   #8b949e;
+      --text:    #c9d1d9;
+      --radius:  8px;
+      --shadow:  0 1px 3px rgba(0,0,0,.4);
+    }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: system-ui, sans-serif;
+      font-size: 14px;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      padding: 2rem 2.5rem;
+      width: 100%;
+      max-width: 360px;
+    }
+    .logo {
+      text-align: center;
+      margin-bottom: 1.5rem;
+    }
+    .logo h1 {
+      font-size: 1.4rem;
+      font-weight: 700;
+      color: var(--accent);
+      letter-spacing: .02em;
+    }
+    .logo p {
+      color: var(--muted);
+      font-size: 0.8rem;
+      margin-top: .25rem;
+    }
+    label {
+      display: block;
+      margin-bottom: .25rem;
+      font-size: 0.85rem;
+      color: var(--muted);
+    }
+    input[type="text"],
+    input[type="password"] {
+      width: 100%;
+      padding: .5rem .75rem;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      color: var(--text);
+      font-size: 0.9rem;
+      outline: none;
+      transition: border-color .15s;
+    }
+    input[type="text"]:focus,
+    input[type="password"]:focus {
+      border-color: var(--accent);
+    }
+    .field { margin-bottom: 1rem; }
+    .btn {
+      display: block;
+      width: 100%;
+      padding: .55rem;
+      background: var(--accent);
+      color: #0d1117;
+      font-weight: 600;
+      font-size: 0.9rem;
+      border: none;
+      border-radius: var(--radius);
+      cursor: pointer;
+      margin-top: 1.25rem;
+      transition: opacity .15s;
+    }
+    .btn:hover { opacity: .85; }
+    .error {
+      background: rgba(248,81,73,.12);
+      border: 1px solid var(--danger);
+      color: var(--danger);
+      border-radius: var(--radius);
+      padding: .5rem .75rem;
+      font-size: 0.85rem;
+      margin-bottom: 1rem;
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="logo">
+      <h1>🛡 TheBox</h1>
+      <p>Network Command Center</p>
+    </div>
+    {% if error %}
+    <div class="error">{{ error }}</div>
+    {% endif %}
+    <form method="post" action="{{ url_for('login') }}">
+      <input type="hidden" name="next" value="{{ next }}"/>
+      <div class="field">
+        <label for="username">Username</label>
+        <input type="text" id="username" name="username" autocomplete="username" autofocus required/>
+      </div>
+      <div class="field">
+        <label for="password">Password</label>
+        <input type="password" id="password" name="password" autocomplete="current-password" required/>
+      </div>
+      <button type="submit" class="btn">Sign in</button>
+    </form>
+  </div>
+</body>
+</html>

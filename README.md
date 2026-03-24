@@ -126,6 +126,27 @@ docker compose -f docker-compose.yml -f docker-compose.macos.yml up -d
 http://<host-ip>:3000
 ```
 
+### 3a. Create the first admin user
+
+The dashboard requires a login.  Because there are no users in the database on
+a fresh install, use the bundled helper script to create the first account from
+the host machine — no existing login required:
+
+```bash
+docker exec thebox-dashboard python create_admin.py admin '<strong-password>'
+```
+
+Replace `admin` with your chosen username and `<strong-password>` with a strong,
+unique password (at least 12 characters mixing letters, digits, and symbols).
+The script is idempotent: running it again with a new password updates the
+existing account rather than creating a duplicate.
+
+You can also use it at any time to reset a forgotten password:
+
+```bash
+docker exec thebox-dashboard python create_admin.py <username> '<new-password>'
+```
+
 ### 4. Point your router's DNS to this host
 
 Set your DHCP server's DNS option to the IP address of the Docker host so that
