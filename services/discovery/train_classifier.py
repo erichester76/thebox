@@ -11,8 +11,10 @@ This script can be run:
        python train_classifier.py --fingerbank-api-key <YOUR_API_KEY>
 
    This pulls labelled DHCP fingerprint data directly from the Fingerbank REST
-   API (paginating ``/devices`` and ``/dhcp_fingerprints``).  Register for a
-   free key at https://fingerbank.org/users/register.  The ``FINGERBANK_API_KEY``
+   API via ``GET /api/v2/devices/base_info?fields=id,name,parent_id,details``,
+   which returns the full device hierarchy and per-device DHCP fingerprints in
+   a single response.  Register for a free key at
+   https://fingerbank.org/users/register.  The ``FINGERBANK_API_KEY``
    environment variable is also accepted automatically.
 
 3. **Interactively** to inspect feature importances or cross-validation scores::
@@ -447,14 +449,11 @@ def _build_samples_from_fingerbank_api(
 ) -> tuple[list[list[float]], list[str]]:
     """Pull labelled DHCP fingerprint data directly from the Fingerbank REST API.
 
-    This is the recommended approach when the local ``fingerbank.db`` SQLite
-    file has an empty ``combination`` table (or ``mac_vendor.device_id`` is
-    always 0), which is common with the standard API download.
-
-    Two paginated endpoints are used:
-
-    * ``GET /api/v2/devices``           – full device-type hierarchy
-    * ``GET /api/v2/dhcp_fingerprints`` – DHCP opt-55 strings with ``device_id``
+    Uses the ``GET /api/v2/devices/base_info`` endpoint with
+    ``fields=id,name,parent_id,details`` to fetch the complete device hierarchy
+    and each device's associated DHCP fingerprints in a single request.  This
+    replaces the old paginated ``/devices`` + ``/dhcp_fingerprints`` approach;
+    those endpoints do not exist in the Fingerbank v2 API and always return 404.
 
     The API key can be obtained for free at https://fingerbank.org/users/register
     (also exposed as the ``FINGERBANK_API_KEY`` env var used by the discovery
@@ -500,58 +499,40 @@ def _build_samples_from_fingerbank_api(
         "virtual machine": "server",
     }
 
-    def _get_pages(endpoint: str) -> list[dict]:
-        """Fetch all pages from a paginated Fingerbank list endpoint."""
-        results: list[dict] = []
-        page = 1
-        per_page = 100
-        while True:
-            params = urllib.parse.urlencode(
-                {"key": api_key, "page": page, "per_page": per_page}
-            )
-            url = f"{base_url}/{endpoint}?{params}"
-            try:
-                with urllib.request.urlopen(url, timeout=30) as resp:  # noqa: S310
-                    raw = resp.read().decode()
-                try:
-                    data = json.loads(raw)
-                except json.JSONDecodeError as exc:
-                    log.error(
-                        "fingerbank_api_json_error endpoint=%s page=%d error=%s body_prefix=%.200s",
-                        endpoint, page, exc, raw,
-                    )
-                    break
-            except urllib.error.HTTPError as exc:
-                log.error("fingerbank_api_http_error endpoint=%s page=%d status=%d", endpoint, page, exc.code)
-                break
-            except Exception as exc:
-                log.error("fingerbank_api_error endpoint=%s page=%d error=%s", endpoint, page, exc)
-                break
-
-            # The API may return a bare list or a dict with a matching key.
-            if isinstance(data, list):
-                page_items = data
-            elif isinstance(data, dict):
-                # Try the endpoint name as the key (e.g. "dhcp_fingerprints").
-                page_items = data.get(endpoint) or data.get(endpoint.rstrip("s")) or []
-            else:
-                break
-
-            if not page_items:
-                break
-            results.extend(page_items)
-            log.info("fingerbank_api_page endpoint=%s page=%d fetched=%d total=%d", endpoint, page, len(page_items), len(results))
-            if len(page_items) < per_page:
-                # Last page.
-                break
-            page += 1
-        return results
-
     log.info("fingerbank_api_load_start base_url=%s", base_url)
 
-    # ── 1. Load device hierarchy ──────────────────────────────────────────────
+    # ── Fetch complete device hierarchy + DHCP fingerprint details ────────────
+    # GET /api/v2/devices/base_info returns every device in one response
+    # (typically 3-4 MB JSON).  The ``details`` field contains each device's
+    # associated DHCP opt-55 fingerprint strings.
+    params = urllib.parse.urlencode({"key": api_key, "fields": "id,name,parent_id,details"})
+    url = f"{base_url}/devices/base_info?{params}"
+    try:
+        with urllib.request.urlopen(url, timeout=120) as resp:  # noqa: S310
+            raw = resp.read().decode()
+    except urllib.error.HTTPError as exc:
+        log.error("fingerbank_api_http_error endpoint=devices/base_info status=%d", exc.code)
+        return [], []
+    except Exception as exc:
+        log.error("fingerbank_api_error endpoint=devices/base_info error=%s", exc)
+        return [], []
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        log.error(
+            "fingerbank_api_json_error endpoint=devices/base_info error=%s body_prefix=%.200s",
+            exc, raw,
+        )
+        return [], []
+
+    if not isinstance(data, list):
+        log.error("fingerbank_api_unexpected_format endpoint=devices/base_info type=%s", type(data).__name__)
+        return [], []
+
+    # ── 1. Build device lookup ────────────────────────────────────────────────
     devices: dict[int, dict] = {}
-    for dev in _get_pages("devices"):
+    for dev in data:
         did = dev.get("id")
         if did is None:
             continue
@@ -575,24 +556,14 @@ def _build_samples_from_fingerbank_api(
             did = parent
         return None
 
-    # ── 2. Load DHCP fingerprints ─────────────────────────────────────────────
+    # ── 2. Extract DHCP fingerprints from each device's details ──────────────
     X: list[list[float]] = []
     y: list[str] = []
     skipped = 0
     seen_samples: set[tuple] = set()
 
-    for fp in _get_pages("dhcp_fingerprints"):
-        # Skip ignored fingerprints.
-        if fp.get("ignored"):
-            skipped += 1
-            continue
-
-        dhcp_fp: str = (fp.get("value") or "").strip()
-        if not dhcp_fp:
-            skipped += 1
-            continue
-
-        device_id = fp.get("device_id")
+    for dev in data:
+        device_id = dev.get("id")
         if not device_id:
             skipped += 1
             continue
@@ -602,20 +573,36 @@ def _build_samples_from_fingerbank_api(
             skipped += 1
             continue
 
-        key = (dhcp_fp, device_id)
-        if key in seen_samples:
-            skipped += 1
-            continue
-        seen_samples.add(key)
+        details = dev.get("details") or {}
+        # The API returns DHCP fingerprints as a list of strings or dicts.
+        raw_fps = details.get("dhcp_fingerprints") or []
+        for fp_entry in raw_fps:
+            if isinstance(fp_entry, str):
+                dhcp_fp = fp_entry.strip()
+            elif isinstance(fp_entry, dict):
+                dhcp_fp = (fp_entry.get("value") or "").strip()
+            else:
+                skipped += 1
+                continue
 
-        feats = extract_features(
-            vendor=None,
-            open_ports=[],
-            extra_info=None,
-            dhcp_fingerprint=dhcp_fp,
-        )
-        X.append(feats)
-        y.append(label)
+            if not dhcp_fp:
+                skipped += 1
+                continue
+
+            key = (dhcp_fp, device_id)
+            if key in seen_samples:
+                skipped += 1
+                continue
+            seen_samples.add(key)
+
+            feats = extract_features(
+                vendor=None,
+                open_ports=[],
+                extra_info=None,
+                dhcp_fingerprint=dhcp_fp,
+            )
+            X.append(feats)
+            y.append(label)
 
     log.info("fingerbank_api_load_done loaded=%d skipped=%d", len(y), skipped)
     return X, y
