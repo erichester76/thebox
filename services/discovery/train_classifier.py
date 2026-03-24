@@ -333,10 +333,19 @@ _SYNTHETIC_DATA: list[dict] = [
     {"label": "iot",            "os_family": "embedded", "vendor": "Hikvision Digital",   "open_ports": [], "extra_info": {}, "dhcp_fingerprint": None},
     {"label": "iot",            "os_family": "embedded", "vendor": "Dahua Technology",    "open_ports": [], "extra_info": {}, "dhcp_fingerprint": None},
     {"label": "iot",            "os_family": "embedded", "vendor": "Axis Communications", "open_ports": [], "extra_info": {}, "dhcp_fingerprint": None},
+    # Amazon devices: OUI lookup returns multiple company name variants depending
+    # on the specific MAC block — include all observed forms so the "amazon"
+    # keyword feature fires consistently regardless of variant.
     {"label": "iot",            "os_family": "embedded", "vendor": "Amazon Technologies Inc", "open_ports": [], "extra_info": {}, "dhcp_fingerprint": None},
-    {"label": "iot",            "os_family": "embedded", "vendor": "Amazon.Com, LLC", "open_ports": [], "extra_info": {}, "dhcp_fingerprint": None},
+    {"label": "iot",            "os_family": "embedded", "vendor": "Amazon Technologies Inc.", "open_ports": [], "extra_info": {}, "dhcp_fingerprint": None},
+    {"label": "iot",            "os_family": "embedded", "vendor": "Amazon.com, LLC",     "open_ports": [], "extra_info": {}, "dhcp_fingerprint": None},
+    {"label": "iot",            "os_family": "embedded", "vendor": "Amazon.Com, LLC",     "open_ports": [], "extra_info": {}, "dhcp_fingerprint": None},
     {"label": "iot",            "os_family": "embedded", "vendor": "Nest Labs Inc.",      "open_ports": [], "extra_info": {}, "dhcp_fingerprint": None},
     {"label": "iot",            "os_family": "embedded", "vendor": "Ring LLC",            "open_ports": [], "extra_info": {}, "dhcp_fingerprint": None},
+    # Streaming / smart TV vendors
+    {"label": "iot",            "os_family": "embedded", "vendor": "Roku Inc.",           "open_ports": [], "extra_info": {}, "dhcp_fingerprint": None},
+    {"label": "iot",            "os_family": "embedded", "vendor": "TCL King Electrical", "open_ports": [], "extra_info": {}, "dhcp_fingerprint": None},
+    {"label": "iot",            "os_family": "embedded", "vendor": "Sonos Inc.",          "open_ports": [], "extra_info": {}, "dhcp_fingerprint": None},
     # Unambiguous network device vendors
     {"label": "network_device", "os_family": "embedded", "vendor": "Cisco Systems",       "open_ports": [], "extra_info": {}, "dhcp_fingerprint": None},
     {"label": "network_device", "os_family": "embedded", "vendor": "Ubiquiti Inc",        "open_ports": [], "extra_info": {}, "dhcp_fingerprint": None},
@@ -351,7 +360,7 @@ _SYNTHETIC_DATA: list[dict] = [
     {"label": "printer",        "os_family": "embedded", "vendor": "Brother Industries",   "open_ports": [], "extra_info": {}, "dhcp_fingerprint": None},
     # NAS vendors
     {"label": "server",         "os_family": "linux",    "vendor": "Synology Inc.",        "open_ports": [], "extra_info": {}, "dhcp_fingerprint": None},
-    {"label": "server",         "os_family": "linux",    "vendor": "QNAP Systems, Inc.",         "open_ports": [], "extra_info": {}, "dhcp_fingerprint": None},
+    {"label": "server",         "os_family": "linux",    "vendor": "QNAP Systems, Inc.",   "open_ports": [], "extra_info": {}, "dhcp_fingerprint": None},
 
     # ── mDNS-only (no DHCP, no open ports, vendor optional) ──────────────────
     # Devices discovered via passive mDNS / DNS-SD browsing.  These service
@@ -384,6 +393,13 @@ _SYNTHETIC_DATA: list[dict] = [
     {"label": "desktop", "os_family": "linux",    "vendor": None,         "open_ports": [], "extra_info": _m("_workstation._tcp", "_smb._tcp"), "dhcp_fingerprint": None},
     # _ssh._tcp = SSH-advertised server or desktop (treat as server — more common)
     {"label": "server",  "os_family": "linux",    "vendor": None,         "open_ports": [], "extra_info": _m("_ssh._tcp"),                     "dhcp_fingerprint": None},
+    # _companion-link._tcp = Apple mobile device (iPhone/iPad) nearby
+    {"label": "mobile",  "os_family": "ios",      "vendor": None,         "open_ports": [], "extra_info": _m("_companion-link._tcp"),           "dhcp_fingerprint": None},
+    {"label": "mobile",  "os_family": "ios",      "vendor": "Apple Inc.", "open_ports": [], "extra_info": _m("_companion-link._tcp"),           "dhcp_fingerprint": None},
+    # macOS laptop: airplay+raop+ssh (no Apple vendor OUI when MAC-randomised)
+    {"label": "desktop", "os_family": "macos",    "vendor": None,         "open_ports": [], "extra_info": _m("_airplay._tcp", "_raop._tcp", "_ssh._tcp"),                     "dhcp_fingerprint": None},
+    {"label": "desktop", "os_family": "macos",    "vendor": None,         "open_ports": [], "extra_info": _m("_airplay._tcp", "_raop._tcp", "_ssh._tcp", "_companion-link._tcp"), "dhcp_fingerprint": None},
+    {"label": "desktop", "os_family": "macos",    "vendor": "Apple Inc.", "open_ports": [], "extra_info": _m("_airplay._tcp", "_raop._tcp", "_ssh._tcp", "_companion-link._tcp"), "dhcp_fingerprint": None},
 
     # ── Combined non-DHCP (vendor + ports, no DHCP) ───────────────────────────
     # Strong multi-signal combinations without DHCP data.  These are the most
@@ -422,6 +438,13 @@ _SYNTHETIC_DATA: list[dict] = [
     {"label": "printer",        "os_family": "embedded", "vendor": "Hewlett Packard", "open_ports": _p(9100, 631),    "extra_info": _m("_ipp._tcp"), "dhcp_fingerprint": None},
     {"label": "printer",        "os_family": "embedded", "vendor": "Seiko Epson Corp.","open_ports": _p(9100, 631),   "extra_info": _m("_ipp._tcp"), "dhcp_fingerprint": None},
     {"label": "printer",        "os_family": "embedded", "vendor": "Canon Inc.",       "open_ports": _p(9100),        "extra_info": {},              "dhcp_fingerprint": None},
+    # Roku streaming player: UPnP manufacturer "Roku" (via upnp_manufacturer fallback)
+    {"label": "iot",            "os_family": "embedded", "vendor": "Roku Inc.",        "open_ports": [],              "extra_info": {"upnp_manufacturer": "Roku"}, "dhcp_fingerprint": None},
+    {"label": "iot",            "os_family": "embedded", "vendor": "TCL King Electrical", "open_ports": [],           "extra_info": {"upnp_manufacturer": "TCL"}, "dhcp_fingerprint": None},
+    # Generic chip vendor (Gaoshengda/Espressif) + UPnP identifies as Roku/media device
+    {"label": "iot",            "os_family": "embedded", "vendor": None,              "open_ports": [],              "extra_info": {"upnp_manufacturer": "Roku", "upnp_device_type": "urn:roku-com:device:player:1-0"}, "dhcp_fingerprint": None},
+    {"label": "iot",            "os_family": "embedded", "vendor": None,              "open_ports": [],              "extra_info": {"upnp_manufacturer": "TCL"},  "dhcp_fingerprint": None},
+    {"label": "iot",            "os_family": "embedded", "vendor": None,              "open_ports": [],              "extra_info": {"upnp_manufacturer": "Sonos"}, "dhcp_fingerprint": None},
 ]
 # fmt: on
 
