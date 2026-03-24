@@ -24,6 +24,8 @@ Additional discovery methods:
     hostnames, vendor, and model information.
 """
 
+import csv
+import io
 import json
 import hashlib
 import logging
@@ -92,6 +94,12 @@ DHCP_SNIFF_ENABLED = os.environ.get("DHCP_SNIFF_ENABLED", "true").lower() == "tr
 # ARP packet sniffing — real-time device detection between scan cycles
 ARP_SNIFF_ENABLED = os.environ.get("ARP_SNIFF_ENABLED", "true").lower() == "true"
 
+# IEEE OUI vendor database — downloaded at startup and cached locally
+_OUI_CSV_URL = os.environ.get(
+    "OUI_CSV_URL", "https://standards-oui.ieee.org/oui/oui.csv"
+)
+_OUI_CSV_PATH = os.environ.get("OUI_CSV_PATH", "/tmp/oui.csv")
+
 # ─── Logging ─────────────────────────────────────────────────────────────────
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
 structlog.configure(
@@ -100,11 +108,68 @@ structlog.configure(
 log = structlog.get_logger()
 
 # ─── MAC vendor lookup ───────────────────────────────────────────────────────
+
+def _load_oui_table() -> dict[str, str]:
+    """Download (or read from cache) the IEEE MA-L OUI CSV.
+
+    Returns a dict mapping 6-hex-char OUI (e.g. ``"D8BB2C"``) to the
+    registered organisation name (e.g. ``"Amazon Technologies Inc."``).
+
+    On first call the file is fetched from *_OUI_CSV_URL* and written to
+    *_OUI_CSV_PATH* for offline reuse.  If the download fails the cached
+    copy is used.  Returns an empty dict when both sources are unavailable.
+    """
+    table: dict[str, str] = {}
+
+    raw: str | None = None
+    try:
+        log.info("oui_download_start", url=_OUI_CSV_URL)
+        resp = requests.get(_OUI_CSV_URL, timeout=30)
+        resp.raise_for_status()
+        raw = resp.text
+        try:
+            with open(_OUI_CSV_PATH, "w", encoding="utf-8") as fh:
+                fh.write(raw)
+        except OSError as err:
+            log.warning("oui_cache_write_failed", path=_OUI_CSV_PATH, error=str(err))
+        log.info("oui_download_done", url=_OUI_CSV_URL)
+    except Exception as exc:
+        log.warning("oui_download_failed", error=str(exc))
+
+    if raw is None:
+        try:
+            with open(_OUI_CSV_PATH, encoding="utf-8") as fh:
+                raw = fh.read()
+            log.info("oui_loaded_from_cache", path=_OUI_CSV_PATH)
+        except OSError:
+            log.warning("oui_cache_not_found", path=_OUI_CSV_PATH)
+            return table
+
+    skipped = 0
+    reader = csv.reader(io.StringIO(raw))
+    next(reader, None)  # skip header row
+    for row in reader:
+        if len(row) < 3:
+            skipped += 1
+            continue
+        oui = row[1].strip().upper()
+        name = row[2].strip()
+        if oui and name:
+            table[oui] = name
+
+    if skipped:
+        log.warning("oui_rows_skipped", skipped=skipped, reason="fewer than 3 columns")
+    log.info("oui_table_loaded", entries=len(table))
+    return table
+
+
 mac_lookup = MacLookup()
 try:
     mac_lookup.update_vendors()
 except Exception:
     log.warning("mac_vendor_update_failed", msg="Using cached vendor list")
+
+_oui_table: dict[str, str] = _load_oui_table()
 
 
 def get_db():
@@ -1854,10 +1919,29 @@ def resolve_hostname(ip: str) -> str | None:
 
 
 def vendor_lookup(mac: str) -> str | None:
+    """Return the vendor/organisation name for *mac*.
+
+    Consults two sources in priority order:
+
+    1. The ``mac-vendor-lookup`` library (updated at startup from an online
+       source; covers MA-L, MA-M, and MA-S ranges).
+    2. The locally cached IEEE MA-L OUI table downloaded at startup.
+
+    Returns *None* when neither source recognises the OUI.
+    """
     try:
-        return mac_lookup.lookup(mac)
+        result = mac_lookup.lookup(mac)
+        if result:
+            return result
     except VendorNotFoundError:
-        return None
+        pass
+    except Exception as exc:
+        log.debug("mac_lookup_unexpected_error", mac=mac, error=str(exc))
+
+    # Fall back to the IEEE OUI table built at startup.
+    try:
+        oui = mac.replace(":", "").replace("-", "").upper()[:6]
+        return _oui_table.get(oui)
     except Exception:
         return None
 

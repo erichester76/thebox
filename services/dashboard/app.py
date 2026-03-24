@@ -6,6 +6,7 @@ services.  Uses Server-Sent Events (SSE) to push live alerts to the browser
 and exposes a REST API for the front-end JavaScript.
 """
 
+import functools
 import json
 import logging
 import os
@@ -20,7 +21,8 @@ import psycopg2.extras
 import redis
 import requests
 import structlog
-from flask import Flask, Response, jsonify, render_template, request
+from flask import Flask, Response, jsonify, redirect, render_template, request, session, url_for
+from werkzeug.security import check_password_hash, generate_password_hash
 
 # ─── Configuration ───────────────────────────────────────────────────────────
 DATABASE_URL = os.environ["DATABASE_URL"]
@@ -197,7 +199,8 @@ def ensure_schema():
     """Create tables this service reads from or writes to.
 
     Scoped to: ``users``, ``devices``, ``iot_allowlist``, ``groups``,
-    ``user_groups``, ``device_groups``, ``alerts``, ``honeypot_events``.
+    ``user_groups``, ``device_groups``, ``alerts``, ``honeypot_events``,
+    ``scan_runs``.
     All DDL uses ``IF NOT EXISTS`` so this is safe to call on every startup.
     """
     statements = [
@@ -296,6 +299,16 @@ def ensure_schema():
             device_id         INTEGER REFERENCES devices(id),
             created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )""",
+        # scan_runs — discovery scan history, dashboard provides read-only view
+        """CREATE TABLE IF NOT EXISTS scan_runs (
+            id              SERIAL PRIMARY KEY,
+            started_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            finished_at     TIMESTAMPTZ,
+            network_range   VARCHAR(64) NOT NULL,
+            devices_found   INTEGER NOT NULL DEFAULT 0,
+            new_devices     INTEGER NOT NULL DEFAULT 0,
+            status          VARCHAR(32) NOT NULL DEFAULT 'running'
+        )""",
         "CREATE INDEX IF NOT EXISTS idx_devices_mac         ON devices(mac_address)",
         "CREATE INDEX IF NOT EXISTS idx_devices_ip          ON devices(ip_address)",
         "CREATE INDEX IF NOT EXISTS idx_devices_status      ON devices(status)",
@@ -330,6 +343,19 @@ def ensure_schema():
             updated_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
         )""",
         "CREATE INDEX IF NOT EXISTS idx_settings_category ON settings(category)",
+        # Migration: add password_hash for dashboard login
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash VARCHAR(255)",
+        # scan_runs — populated by discovery after each nmap scan cycle
+        """CREATE TABLE IF NOT EXISTS scan_runs (
+            id              SERIAL PRIMARY KEY,
+            started_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            finished_at     TIMESTAMPTZ,
+            network_range   VARCHAR(64) NOT NULL,
+            devices_found   INTEGER NOT NULL DEFAULT 0,
+            new_devices     INTEGER NOT NULL DEFAULT 0,
+            status          VARCHAR(32) NOT NULL DEFAULT 'running'
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_scan_runs_started ON scan_runs(started_at)",
     ]
     conn = get_db()
     try:
@@ -488,21 +514,78 @@ def serialize(obj):
     raise TypeError(f"Type {type(obj)} not serialisable")
 
 
+def login_required(f):
+    """Decorator that enforces an active session.
+
+    API routes (path starts with /api/) receive a JSON 401 response.
+    Browser routes are redirected to /login.
+    """
+    @functools.wraps(f)
+    def wrapper(*args, **kwargs):
+        if not session.get("user_id"):
+            if request.path.startswith("/api/"):
+                return jsonify({"error": "authentication required"}), 401
+            return redirect(url_for("login", next=request.path))
+        return f(*args, **kwargs)
+    return wrapper
+
+
 # ─── Routes ──────────────────────────────────────────────────────────────────
 
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    error = None
+    if request.method == "POST":
+        username = (request.form.get("username") or "").strip()
+        password = request.form.get("password") or ""
+        conn = get_db()
+        rows = rows_to_list(
+            conn,
+            "SELECT id, username, display_name, password_hash FROM users WHERE username=%s",
+            (username,),
+        )
+        conn.close()
+        if rows and rows[0].get("password_hash") and check_password_hash(rows[0]["password_hash"], password):
+            session.clear()
+            session["user_id"] = rows[0]["id"]
+            session["username"] = rows[0]["username"]
+            session["display_name"] = rows[0]["display_name"] or rows[0]["username"]
+            next_url = request.form.get("next") or request.args.get("next") or ""
+            # Guard against open-redirect: only allow relative paths on this host.
+            if not next_url or not next_url.startswith("/") or next_url.startswith("//"):
+                next_url = url_for("index")
+            return redirect(next_url)
+        error = "Invalid username or password."
+    return render_template("login.html", error=error, next=request.args.get("next", ""))
+
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
+
+
 @app.route("/")
+@login_required
 def index():
     return render_template("index.html")
 
 
 # --- API: Devices ---
 
+_VALID_DEVICE_STATUSES = frozenset(
+    {"new", "trusted", "quarantined", "blocked", "iot", "iot_learning"}
+)
+
+
 @app.route("/api/devices")
+@login_required
 def api_devices():
-    conn = get_db()
-    rows = rows_to_list(
-        conn,
-        """
+    status_filter = request.args.get("status", "").strip()
+    if status_filter and status_filter not in _VALID_DEVICE_STATUSES:
+        return jsonify({"error": f"invalid status filter: {status_filter}"}), 400
+
+    query = """
         SELECT d.*, u.username AS owner_username, u.display_name AS owner_display_name,
                COALESCE(
                    json_agg(json_build_object('id', g.id, 'name', g.name, 'pihole_group_name', g.pihole_group_name))
@@ -512,15 +595,25 @@ def api_devices():
         LEFT JOIN users u ON u.id = d.owner_id
         LEFT JOIN device_groups dg ON dg.device_id = d.id
         LEFT JOIN groups g ON g.id = dg.group_id
+        {where}
         GROUP BY d.id, u.username, u.display_name
         ORDER BY d.last_seen DESC
-        """,
-    )
+    """
+    conn = get_db()
+    if status_filter:
+        rows = rows_to_list(
+            conn,
+            query.format(where="WHERE d.status = %s"),
+            (status_filter,),
+        )
+    else:
+        rows = rows_to_list(conn, query.format(where=""))
     conn.close()
     return Response(json.dumps(rows, default=serialize), mimetype="application/json")
 
 
 @app.route("/api/devices/<int:device_id>", methods=["GET"])
+@login_required
 def api_device(device_id: int):
     conn = get_db()
     rows = rows_to_list(
@@ -540,6 +633,7 @@ def api_device(device_id: int):
 
 
 @app.route("/api/devices/<int:device_id>/status", methods=["PUT"])
+@login_required
 def api_set_device_status(device_id: int):
     """Allow the UI to trust / quarantine / block / promote-to-IoT a device.
 
@@ -622,6 +716,7 @@ def api_set_device_status(device_id: int):
 
 
 @app.route("/api/devices/<int:device_id>/iot-allowlist", methods=["GET"])
+@login_required
 def api_iot_allowlist(device_id: int):
     conn = get_db()
     rows = rows_to_list(conn, "SELECT * FROM iot_allowlist WHERE device_id=%s ORDER BY fqdn", (device_id,))
@@ -630,6 +725,7 @@ def api_iot_allowlist(device_id: int):
 
 
 @app.route("/api/devices/<int:device_id>/iot-allowlist", methods=["POST"])
+@login_required
 def api_iot_allowlist_add(device_id: int):
     body = request.get_json(force=True)
     fqdn = (body.get("fqdn") or "").strip()
@@ -647,6 +743,7 @@ def api_iot_allowlist_add(device_id: int):
 
 
 @app.route("/api/devices/<int:device_id>/iot-allowlist/<int:entry_id>", methods=["DELETE"])
+@login_required
 def api_iot_allowlist_remove(device_id: int, entry_id: int):
     conn = get_db()
     with conn.cursor() as cur:
@@ -656,7 +753,28 @@ def api_iot_allowlist_remove(device_id: int, entry_id: int):
     return jsonify({"ok": True})
 
 
+@app.route("/api/devices/<int:device_id>/notes", methods=["PUT"])
+def api_set_device_notes(device_id: int):
+    """Update the free-text notes field for a device."""
+    body = request.get_json(force=True)
+    notes = body.get("notes")  # None / null clears the notes field
+
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE devices SET notes=%s WHERE id=%s RETURNING id",
+            (notes, device_id),
+        )
+        if cur.rowcount == 0:
+            conn.close()
+            return jsonify({"error": "device not found"}), 404
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True})
+
+
 @app.route("/api/devices/<int:device_id>/owner", methods=["PUT"])
+@login_required
 def api_set_device_owner(device_id: int):
     """Assign or unassign a user as the owner of a device."""
     body = request.get_json(force=True)
@@ -684,9 +802,32 @@ def api_set_device_owner(device_id: int):
     return jsonify({"ok": True})
 
 
+@app.route("/api/devices/<int:device_id>", methods=["PATCH"])
+def api_patch_device(device_id: int):
+    """Update editable device fields (currently: notes)."""
+    body = request.get_json(force=True)
+    notes = body.get("notes", "")
+    if notes is None:
+        notes = ""
+
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE devices SET notes=%s WHERE id=%s RETURNING id",
+            (None if not notes else notes, device_id),
+        )
+        if cur.rowcount == 0:
+            conn.close()
+            return jsonify({"error": "device not found"}), 404
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True})
+
+
 # --- API: Users ---
 
 @app.route("/api/users")
+@login_required
 def api_users():
     conn = get_db()
     rows = rows_to_list(
@@ -710,6 +851,7 @@ def api_users():
 
 
 @app.route("/api/users/<int:user_id>", methods=["GET"])
+@login_required
 def api_user(user_id: int):
     conn = get_db()
     rows = rows_to_list(conn, "SELECT * FROM users WHERE id=%s", (user_id,))
@@ -720,11 +862,14 @@ def api_user(user_id: int):
 
 
 @app.route("/api/users", methods=["POST"])
+@login_required
 def api_create_user():
     body = request.get_json(force=True)
     username = (body.get("username") or "").strip()
     display_name = (body.get("display_name") or "").strip() or None
     email = (body.get("email") or "").strip() or None
+    password = (body.get("password") or "").strip()
+    password_hash = generate_password_hash(password) if password else None
 
     if not username:
         return jsonify({"error": "username required"}), 400
@@ -733,8 +878,8 @@ def api_create_user():
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO users (username, display_name, email) VALUES (%s,%s,%s) RETURNING id",
-                (username, display_name, email),
+                "INSERT INTO users (username, display_name, email, password_hash) VALUES (%s,%s,%s,%s) RETURNING id",
+                (username, display_name, email, password_hash),
             )
             new_id = cur.fetchone()["id"]
         conn.commit()
@@ -747,17 +892,25 @@ def api_create_user():
 
 
 @app.route("/api/users/<int:user_id>", methods=["PUT"])
+@login_required
 def api_update_user(user_id: int):
     body = request.get_json(force=True)
     display_name = (body.get("display_name") or "").strip() or None
     email = (body.get("email") or "").strip() or None
+    password = (body.get("password") or "").strip()
 
     conn = get_db()
     with conn.cursor() as cur:
-        cur.execute(
-            "UPDATE users SET display_name=%s, email=%s, updated_at=NOW() WHERE id=%s RETURNING id",
-            (display_name, email, user_id),
-        )
+        if password:
+            cur.execute(
+                "UPDATE users SET display_name=%s, email=%s, password_hash=%s, updated_at=NOW() WHERE id=%s RETURNING id",
+                (display_name, email, generate_password_hash(password), user_id),
+            )
+        else:
+            cur.execute(
+                "UPDATE users SET display_name=%s, email=%s, updated_at=NOW() WHERE id=%s RETURNING id",
+                (display_name, email, user_id),
+            )
         if cur.rowcount == 0:
             conn.close()
             return jsonify({"error": "not found"}), 404
@@ -767,6 +920,7 @@ def api_update_user(user_id: int):
 
 
 @app.route("/api/users/<int:user_id>", methods=["DELETE"])
+@login_required
 def api_delete_user(user_id: int):
     conn = get_db()
     with conn.cursor() as cur:
@@ -782,6 +936,7 @@ def api_delete_user(user_id: int):
 # --- API: Groups ---
 
 @app.route("/api/groups")
+@login_required
 def api_groups():
     conn = get_db()
     rows = rows_to_list(
@@ -802,6 +957,7 @@ def api_groups():
 
 
 @app.route("/api/groups/<int:group_id>", methods=["GET"])
+@login_required
 def api_group(group_id: int):
     conn = get_db()
     rows = rows_to_list(conn, "SELECT * FROM groups WHERE id=%s", (group_id,))
@@ -812,6 +968,7 @@ def api_group(group_id: int):
 
 
 @app.route("/api/groups", methods=["POST"])
+@login_required
 def api_create_group():
     body = request.get_json(force=True)
     name = (body.get("name") or "").strip()
@@ -839,6 +996,7 @@ def api_create_group():
 
 
 @app.route("/api/groups/<int:group_id>", methods=["PUT"])
+@login_required
 def api_update_group(group_id: int):
     body = request.get_json(force=True)
     description = (body.get("description") or "").strip() or None
@@ -859,6 +1017,7 @@ def api_update_group(group_id: int):
 
 
 @app.route("/api/groups/<int:group_id>", methods=["DELETE"])
+@login_required
 def api_delete_group(group_id: int):
     conn = get_db()
     with conn.cursor() as cur:
@@ -872,6 +1031,7 @@ def api_delete_group(group_id: int):
 
 
 @app.route("/api/groups/<int:group_id>/users", methods=["GET"])
+@login_required
 def api_group_users(group_id: int):
     conn = get_db()
     rows = rows_to_list(
@@ -889,6 +1049,7 @@ def api_group_users(group_id: int):
 
 
 @app.route("/api/groups/<int:group_id>/users/<int:user_id>", methods=["PUT"])
+@login_required
 def api_group_add_user(group_id: int, user_id: int):
     conn = get_db()
     with conn.cursor() as cur:
@@ -899,6 +1060,7 @@ def api_group_add_user(group_id: int, user_id: int):
 
 
 @app.route("/api/groups/<int:group_id>/users/<int:user_id>", methods=["DELETE"])
+@login_required
 def api_group_remove_user(group_id: int, user_id: int):
     conn = get_db()
     with conn.cursor() as cur:
@@ -909,6 +1071,7 @@ def api_group_remove_user(group_id: int, user_id: int):
 
 
 @app.route("/api/groups/<int:group_id>/devices", methods=["GET"])
+@login_required
 def api_group_devices(group_id: int):
     conn = get_db()
     rows = rows_to_list(
@@ -926,6 +1089,7 @@ def api_group_devices(group_id: int):
 
 
 @app.route("/api/groups/<int:group_id>/devices/<int:device_id>", methods=["PUT"])
+@login_required
 def api_group_add_device(group_id: int, device_id: int):
     conn = get_db()
     with conn.cursor() as cur:
@@ -936,6 +1100,7 @@ def api_group_add_device(group_id: int, device_id: int):
 
 
 @app.route("/api/groups/<int:group_id>/devices/<int:device_id>", methods=["DELETE"])
+@login_required
 def api_group_remove_device(group_id: int, device_id: int):
     conn = get_db()
     with conn.cursor() as cur:
@@ -948,6 +1113,7 @@ def api_group_remove_device(group_id: int, device_id: int):
 # --- API: Alerts ---
 
 @app.route("/api/alerts")
+@login_required
 def api_alerts():
     conn = get_db()
     rows = rows_to_list(
@@ -959,6 +1125,7 @@ def api_alerts():
 
 
 @app.route("/api/alerts/<int:alert_id>/acknowledge", methods=["PUT"])
+@login_required
 def api_ack_alert(alert_id: int):
     conn = get_db()
     with conn.cursor() as cur:
@@ -968,14 +1135,44 @@ def api_ack_alert(alert_id: int):
     return jsonify({"ok": True})
 
 
+@app.route("/api/alerts/acknowledge-all", methods=["PUT"])
+def api_ack_all_alerts():
+    """Acknowledge every outstanding warning/critical alert in one request."""
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE alerts SET acknowledged=TRUE WHERE acknowledged=FALSE AND level IN ('warning','critical')"
+        )
+        updated = cur.rowcount
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True, "acknowledged": updated})
+
+
 # --- API: Honeypot events ---
 
 @app.route("/api/honeypot")
+@login_required
 def api_honeypot():
     conn = get_db()
     rows = rows_to_list(
         conn,
         "SELECT * FROM honeypot_events ORDER BY created_at DESC LIMIT 200",
+    )
+    conn.close()
+    return Response(json.dumps(rows, default=serialize), mimetype="application/json")
+
+
+# --- API: Scan runs ---
+
+@app.route("/api/scan-runs")
+def api_scan_runs():
+    conn = get_db()
+    rows = rows_to_list(
+        conn,
+        """SELECT id, started_at, finished_at, network_range,
+                  devices_found, new_devices, status
+           FROM scan_runs ORDER BY started_at DESC LIMIT 100""",
     )
     conn.close()
     return Response(json.dumps(rows, default=serialize), mimetype="application/json")
@@ -1004,6 +1201,7 @@ def iot_allowlist_txt():
     return Response(text, mimetype="text/plain")
   
 @app.route("/api/honeypot/<int:event_id>")
+@login_required
 def api_honeypot_event(event_id: int):
     conn = get_db()
     rows = rows_to_list(
@@ -1015,6 +1213,24 @@ def api_honeypot_event(event_id: int):
     if not rows:
         return jsonify({"error": "not found"}), 404
     return Response(json.dumps(rows[0], default=serialize), mimetype="application/json")
+
+
+@app.route("/api/devices/<int:device_id>/honeypot")
+def api_device_honeypot(device_id: int):
+    """Return honeypot events associated with a specific device."""
+    conn = get_db()
+    # Verify the device exists
+    device_rows = rows_to_list(conn, "SELECT id FROM devices WHERE id=%s", (device_id,))
+    if not device_rows:
+        conn.close()
+        return jsonify({"error": "not found"}), 404
+    rows = rows_to_list(
+        conn,
+        "SELECT * FROM honeypot_events WHERE device_id=%s ORDER BY created_at DESC LIMIT 200",
+        (device_id,),
+    )
+    conn.close()
+    return Response(json.dumps(rows, default=serialize), mimetype="application/json")
 
 
 # --- Pi-hole helpers ---------------------------------------------------------
@@ -1118,6 +1334,7 @@ def get_pihole_stats() -> dict:
 # --- API: Pi-hole statistics ---
 
 @app.route("/api/pihole")
+@login_required
 def api_pihole():
     stats = get_pihole_stats()
     if not stats:
@@ -1128,6 +1345,7 @@ def api_pihole():
 # --- API: Stats summary ---
 
 @app.route("/api/stats")
+@login_required
 def api_stats():
     conn = get_db()
     with conn.cursor() as cur:
@@ -1255,6 +1473,34 @@ def api_update_settings_bulk():
     if not_found:
         result["not_found"] = not_found
     return jsonify(result)
+# --- API: Health check ---
+
+@app.route("/api/health")
+def api_health():
+    """Return service health including database and Redis connectivity."""
+    checks: dict[str, str] = {}
+    ok = True
+
+    try:
+        conn = get_db()
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1")
+        conn.close()
+        checks["database"] = "ok"
+    except Exception as exc:  # pylint: disable=broad-except
+        checks["database"] = f"error: {exc}"
+        ok = False
+
+    try:
+        rdb = get_redis()
+        rdb.ping()
+        checks["redis"] = "ok"
+    except Exception as exc:  # pylint: disable=broad-except
+        checks["redis"] = f"error: {exc}"
+        ok = False
+
+    status_code = 200 if ok else 503
+    return jsonify({"status": "ok" if ok else "degraded", "checks": checks}), status_code
 
 
 # --- SSE stream ---
