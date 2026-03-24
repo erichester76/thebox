@@ -384,6 +384,7 @@ def classify_device(
         *min_confidence*.
     """
     if _clf_dt is None:
+        log.debug("rf_classify_skipped", reason="model_not_loaded")
         return "unknown", "unknown", 0.0
 
     threshold = RF_MIN_CONFIDENCE if min_confidence is None else min_confidence
@@ -392,6 +393,18 @@ def classify_device(
         import numpy as np  # noqa: PLC0415
 
         features = extract_features(vendor, open_ports, extra_info, dhcp_fingerprint)
+        active_features = sum(1 for f in features if f > 0.0)
+        ports_in = [p["port"] for p in (open_ports or [])]
+        log.debug(
+            "rf_classify_input",
+            vendor=vendor,
+            open_ports=ports_in,
+            dhcp_fingerprint=dhcp_fingerprint,
+            active_features=active_features,
+            total_features=len(features),
+            threshold=threshold,
+        )
+
         X = np.array([features], dtype=np.float32)
 
         # ── device_type prediction ────────────────────────────────────────────
@@ -399,7 +412,22 @@ def classify_device(
         max_idx_dt = int(np.argmax(proba_dt))
         confidence = float(proba_dt[max_idx_dt])
 
+        dt_scores = {str(cls): round(float(p), 3) for cls, p in zip(_clf_dt.classes_, proba_dt)}
+        log.debug(
+            "rf_classify_scores",
+            device_type_scores=dt_scores,
+            top_device_type=str(_clf_dt.classes_[max_idx_dt]),
+            top_confidence=round(confidence, 3),
+            threshold=threshold,
+        )
+
         if confidence < threshold:
+            log.debug(
+                "rf_classify_below_threshold",
+                top_device_type=str(_clf_dt.classes_[max_idx_dt]),
+                confidence=round(confidence, 3),
+                threshold=threshold,
+            )
             return "unknown", "unknown", confidence
 
         device_type = str(_clf_dt.classes_[max_idx_dt])
@@ -410,8 +438,23 @@ def classify_device(
             proba_os = _clf_os.predict_proba(X)[0]
             max_idx_os = int(np.argmax(proba_os))
             conf_os = float(proba_os[max_idx_os])
+            os_scores = {str(cls): round(float(p), 3) for cls, p in zip(_clf_os.classes_, proba_os)}
+            log.debug(
+                "rf_classify_os_scores",
+                os_family_scores=os_scores,
+                top_os_family=str(_clf_os.classes_[max_idx_os]),
+                top_confidence=round(conf_os, 3),
+                threshold=threshold,
+            )
             if conf_os >= threshold:
                 os_family = str(_clf_os.classes_[max_idx_os])
+            else:
+                log.debug(
+                    "rf_classify_os_below_threshold",
+                    top_os_family=str(_clf_os.classes_[max_idx_os]),
+                    confidence=round(conf_os, 3),
+                    threshold=threshold,
+                )
 
         log.debug(
             "rf_classify",
