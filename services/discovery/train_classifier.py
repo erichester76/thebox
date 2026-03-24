@@ -15,27 +15,7 @@ This script can be run:
    free key at https://fingerbank.org/users/register.  The ``FINGERBANK_API_KEY``
    environment variable is also accepted automatically.
 
-3. **Manually with the fingerbank JSON dataset**::
-
-       python train_classifier.py --fingerbank-json /path/to/fingerprints_and_devices.json
-
-   The fingerbank Open Source Database (CC-licensed) is available at:
-   https://github.com/fingerbank/open-source-database
-
-4. **Manually with the fingerbank SQLite database**::
-
-       python train_classifier.py --fingerbank-db /path/to/fingerbank.db
-
-   The ``fingerbank.db`` file can be downloaded from the Fingerbank API::
-
-       curl -k -o fingerbank.db "https://api.fingerbank.org/api/v2/download/db?key=<YOUR_API_KEY>"
-
-   .. note::
-       Many standard DB downloads have an empty ``combination`` table and
-       ``mac_vendor.device_id`` always set to 0, which yields no training
-       samples.  Prefer option 2 (``--fingerbank-api-key``) in that case.
-
-5. **Interactively** to inspect feature importances or cross-validation scores::
+3. **Interactively** to inspect feature importances or cross-validation scores::
 
        python train_classifier.py --cv --verbose
 
@@ -49,7 +29,6 @@ import argparse
 import json
 import logging
 import os
-import sqlite3
 import sys
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
