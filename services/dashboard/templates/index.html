@@ -368,8 +368,8 @@ function renderDevices() {
         ${trustBtn}
         <button class="btn btn-block" onclick="setStatus(${d.id},'blocked')">Block</button>
         <button class="btn btn-iot"   onclick="setStatus(${d.id},'iot')">IoT</button>
-        <button class="btn btn-user"  data-device-id="${d.id}" data-owner-id="${d.owner_id||''}" onclick="openAssignModalFromBtn(this)">&#x1F464;</button>
-        <button class="btn" title="${escHtml(d.notes||'')}" data-device-id="${d.id}" data-notes="${escHtml(d.notes||'')}" onclick="openNotesModalFromBtn(this)">&#x1F4DD;</button>
+        <button class="btn btn-user"  data-device-id="${d.id}" data-owner-id="${d.owner_id||''}" onclick="openAssignModalFromBtn(this)">👤</button>
+        <button class="btn" title="${escHtml(d.notes||'')}" data-device-id="${d.id}" data-notes="${escHtml(d.notes||'')}" onclick="openNotesModalFromBtn(this)">📝</button>
       </td>
     </tr>`;
   }).join('');
