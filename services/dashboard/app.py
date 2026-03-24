@@ -754,6 +754,7 @@ def api_iot_allowlist_remove(device_id: int, entry_id: int):
 
 
 @app.route("/api/devices/<int:device_id>/notes", methods=["PUT"])
+@login_required
 def api_set_device_notes(device_id: int):
     """Update the free-text notes field for a device."""
     body = request.get_json(force=True)

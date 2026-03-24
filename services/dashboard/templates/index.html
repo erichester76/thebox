@@ -876,11 +876,19 @@ async function confirmNotes() {
   const deviceId = document.getElementById('notes-device-id').value;
   const notes = document.getElementById('notes-textarea').value;
   try {
-    await api(`/api/devices/${deviceId}`, {
-      method:'PATCH', headers:{'Content-Type':'application/json'}, body: JSON.stringify({notes})
+    await api(`/api/devices/${deviceId}/notes`, {
+      method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify({notes})
     });
   } catch(e) {
     let msg = 'Failed to save notes.';
+    try { msg = JSON.parse(e.message).error || msg; } catch(_) {}
+    alert(msg);
+    return;
+  }
+  closeNotesModal();
+  loadDevices();
+}
+
 // ── Device detail modal ───────────────────────────────────────────────────────
 let _detailDeviceId = null;
 
