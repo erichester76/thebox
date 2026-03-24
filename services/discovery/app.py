@@ -473,6 +473,8 @@ def _load_settings() -> None:
     global BANNER_GRAB_ENABLED, BANNER_GRAB_TIMEOUT
     global DHCP_SNIFF_ENABLED, ARP_SNIFF_ENABLED
     global SNIFF_PROCESS_INTERVAL
+    global WSD_ENABLED, WSD_TIMEOUT
+    global FINGERBANK_ENABLED, FINGERBANK_API_KEY
 
     NETWORK_RANGES = [r.strip() for r in get_setting("NETWORK_RANGES", ",".join(NETWORK_RANGES)).split(",") if r.strip()]
     SCAN_INTERVAL  = int(get_setting("SCAN_INTERVAL", str(SCAN_INTERVAL)))
@@ -493,6 +495,10 @@ def _load_settings() -> None:
     DHCP_SNIFF_ENABLED   = get_setting("DHCP_SNIFF_ENABLED", str(DHCP_SNIFF_ENABLED).lower()).lower() == "true"
     ARP_SNIFF_ENABLED    = get_setting("ARP_SNIFF_ENABLED", str(ARP_SNIFF_ENABLED).lower()).lower() == "true"
     SNIFF_PROCESS_INTERVAL = int(get_setting("SNIFF_PROCESS_INTERVAL", str(SNIFF_PROCESS_INTERVAL)))
+    WSD_ENABLED          = get_setting("WSD_ENABLED", str(WSD_ENABLED).lower()).lower() == "true"
+    WSD_TIMEOUT          = int(get_setting("WSD_TIMEOUT", str(WSD_TIMEOUT)))
+    FINGERBANK_ENABLED   = get_setting("FINGERBANK_ENABLED", str(FINGERBANK_ENABLED).lower()).lower() == "true"
+    FINGERBANK_API_KEY   = get_setting("FINGERBANK_API_KEY", FINGERBANK_API_KEY)
     log.info("settings_loaded", networks=NETWORK_RANGES, scan_interval=SCAN_INTERVAL)
 
 def arp_sweep(network: str) -> list[dict]:
