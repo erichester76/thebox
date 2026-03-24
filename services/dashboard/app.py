@@ -435,6 +435,28 @@ def api_set_device_owner(device_id: int):
     return jsonify({"ok": True})
 
 
+@app.route("/api/devices/<int:device_id>", methods=["PATCH"])
+def api_patch_device(device_id: int):
+    """Update editable device fields (currently: notes)."""
+    body = request.get_json(force=True)
+    notes = body.get("notes", "")
+    if notes is None:
+        notes = ""
+
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE devices SET notes=%s WHERE id=%s RETURNING id",
+            (None if not notes else notes, device_id),
+        )
+        if cur.rowcount == 0:
+            conn.close()
+            return jsonify({"error": "device not found"}), 404
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True})
+
+
 # --- API: Users ---
 
 @app.route("/api/users")

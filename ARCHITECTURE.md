@@ -643,6 +643,7 @@ else                                           → 'low'
 | GET | `/api/devices` | List all devices (includes owner, group membership) |
 | GET | `/api/devices/<id>` | Single device |
 | PUT | `/api/devices/<id>/status` | Change status: `trusted|quarantined|blocked|iot` — publishes `device_status_changed` |
+| PATCH | `/api/devices/<id>` | Update device fields — body `{"notes": "..."}` |
 | GET | `/api/devices/<id>/iot-allowlist` | Per-device FQDN allow-list entries |
 | POST | `/api/devices/<id>/iot-allowlist` | Add FQDN — body `{"fqdn": "..."}` |
 | DELETE | `/api/devices/<id>/iot-allowlist/<entry_id>` | Remove FQDN |

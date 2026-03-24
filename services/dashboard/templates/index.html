@@ -207,8 +207,9 @@
     .modal { background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); padding:24px; min-width:320px; max-width:520px; width:100%; max-height:90vh; overflow-y:auto; }
     .modal h3 { font-size:15px; font-weight:700; margin-bottom:16px; }
     .modal label { display:block; font-size:12px; color:var(--muted); margin-bottom:4px; margin-top:12px; }
-    .modal input, .modal select { width:100%; background:var(--bg); border:1px solid var(--border); border-radius:6px; padding:6px 10px; color:var(--text); font-size:13px; }
-    .modal input:focus, .modal select:focus { outline:none; border-color:var(--accent); }
+    .modal input, .modal select, .modal textarea { width:100%; background:var(--bg); border:1px solid var(--border); border-radius:6px; padding:6px 10px; color:var(--text); font-size:13px; }
+    .modal input:focus, .modal select:focus, .modal textarea:focus { outline:none; border-color:var(--accent); }
+    .modal textarea { resize:vertical; min-height:100px; font-family:inherit; }
     .modal-actions { display:flex; gap:8px; justify-content:flex-end; margin-top:20px; }
     .btn-primary { background:var(--accent); color:#fff; padding:6px 16px; font-size:13px; }
 
@@ -436,6 +437,20 @@
   </div>
 </div>
 
+<!-- Device Notes Modal -->
+<div class="modal-backdrop" id="notes-modal">
+  <div class="modal">
+    <h3>Device Notes</h3>
+    <input type="hidden" id="notes-device-id" />
+    <label>Notes</label>
+    <textarea id="notes-textarea" placeholder="Enter notes about this device…"></textarea>
+    <div class="modal-actions">
+      <button class="btn btn-ack" onclick="closeNotesModal()">Cancel</button>
+      <button class="btn btn-primary" onclick="confirmNotes()">Save</button>
+    </div>
+  </div>
+</div>
+
 <!-- Edit User Modal -->
 <div class="modal-backdrop" id="edit-user-modal">
   <div class="modal">
@@ -636,6 +651,7 @@ function renderDevices() {
         <button class="btn btn-block" onclick="setStatus(${d.id},'blocked')">Block</button>
         <button class="btn btn-iot"   onclick="setStatus(${d.id},'iot')">IoT</button>
         <button class="btn btn-user"  data-device-id="${d.id}" data-owner-id="${d.owner_id||''}" onclick="openAssignModalFromBtn(this)">👤</button>
+        <button class="btn" title="${escHtml(d.notes||'')}" data-device-id="${d.id}" data-notes="${escHtml(d.notes||'')}" onclick="openNotesModalFromBtn(this)">📝</button>
       </td>
     </tr>`;
   }).join('');
@@ -695,6 +711,38 @@ async function confirmAssign() {
     return;
   }
   closeAssignModal();
+  loadDevices();
+}
+
+// ── Device notes modal ────────────────────────────────────────────────────────
+function openNotesModalFromBtn(btn) {
+  openNotesModal(parseInt(btn.dataset.deviceId), btn.dataset.notes || '');
+}
+
+function openNotesModal(deviceId, currentNotes) {
+  document.getElementById('notes-device-id').value = deviceId;
+  document.getElementById('notes-textarea').value = currentNotes || '';
+  document.getElementById('notes-modal').classList.add('open');
+}
+
+function closeNotesModal() {
+  document.getElementById('notes-modal').classList.remove('open');
+}
+
+async function confirmNotes() {
+  const deviceId = document.getElementById('notes-device-id').value;
+  const notes = document.getElementById('notes-textarea').value;
+  try {
+    await api(`/api/devices/${deviceId}`, {
+      method:'PATCH', headers:{'Content-Type':'application/json'}, body: JSON.stringify({notes})
+    });
+  } catch(e) {
+    let msg = 'Failed to save notes.';
+    try { msg = JSON.parse(e.message).error || msg; } catch(_) {}
+    alert(msg);
+    return;
+  }
+  closeNotesModal();
   loadDevices();
 }
 
@@ -1132,6 +1180,9 @@ document.getElementById('edit-group-modal').addEventListener('click', function(e
 });
 document.getElementById('manage-group-modal').addEventListener('click', function(e) {
   if (e.target === this) closeManageGroupModal();
+});
+document.getElementById('notes-modal').addEventListener('click', function(e) {
+  if (e.target === this) closeNotesModal();
 });
 
 // ── Bootstrap ────────────────────────────────────────────────────────────────
