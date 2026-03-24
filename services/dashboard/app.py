@@ -62,7 +62,8 @@ def ensure_schema():
     """Create tables this service reads from or writes to.
 
     Scoped to: ``users``, ``devices``, ``iot_allowlist``, ``groups``,
-    ``user_groups``, ``device_groups``, ``alerts``, ``honeypot_events``.
+    ``user_groups``, ``device_groups``, ``alerts``, ``honeypot_events``,
+    ``scan_runs``.
     All DDL uses ``IF NOT EXISTS`` so this is safe to call on every startup.
     """
     statements = [
@@ -161,6 +162,16 @@ def ensure_schema():
             device_id         INTEGER REFERENCES devices(id),
             created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )""",
+        # scan_runs — discovery scan history, dashboard provides read-only view
+        """CREATE TABLE IF NOT EXISTS scan_runs (
+            id              SERIAL PRIMARY KEY,
+            started_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            finished_at     TIMESTAMPTZ,
+            network_range   VARCHAR(64) NOT NULL,
+            devices_found   INTEGER NOT NULL DEFAULT 0,
+            new_devices     INTEGER NOT NULL DEFAULT 0,
+            status          VARCHAR(32) NOT NULL DEFAULT 'running'
+        )""",
         "CREATE INDEX IF NOT EXISTS idx_devices_mac         ON devices(mac_address)",
         "CREATE INDEX IF NOT EXISTS idx_devices_ip          ON devices(ip_address)",
         "CREATE INDEX IF NOT EXISTS idx_devices_status      ON devices(status)",
@@ -186,6 +197,17 @@ def ensure_schema():
         "ALTER TABLE honeypot_events ADD COLUMN IF NOT EXISTS intent VARCHAR(32) NOT NULL DEFAULT 'scan'",
         "ALTER TABLE honeypot_events ADD COLUMN IF NOT EXISTS is_sweep BOOLEAN NOT NULL DEFAULT FALSE",
         "ALTER TABLE honeypot_events ADD COLUMN IF NOT EXISTS ports_scanned JSONB",
+        # scan_runs — populated by discovery after each nmap scan cycle
+        """CREATE TABLE IF NOT EXISTS scan_runs (
+            id              SERIAL PRIMARY KEY,
+            started_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            finished_at     TIMESTAMPTZ,
+            network_range   VARCHAR(64) NOT NULL,
+            devices_found   INTEGER NOT NULL DEFAULT 0,
+            new_devices     INTEGER NOT NULL DEFAULT 0,
+            status          VARCHAR(32) NOT NULL DEFAULT 'running'
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_scan_runs_started ON scan_runs(started_at)",
     ]
     conn = get_db()
     try:
@@ -248,12 +270,18 @@ def index():
 
 # --- API: Devices ---
 
+_VALID_DEVICE_STATUSES = frozenset(
+    {"new", "trusted", "quarantined", "blocked", "iot", "iot_learning"}
+)
+
+
 @app.route("/api/devices")
 def api_devices():
-    conn = get_db()
-    rows = rows_to_list(
-        conn,
-        """
+    status_filter = request.args.get("status", "").strip()
+    if status_filter and status_filter not in _VALID_DEVICE_STATUSES:
+        return jsonify({"error": f"invalid status filter: {status_filter}"}), 400
+
+    query = """
         SELECT d.*, u.username AS owner_username, u.display_name AS owner_display_name,
                COALESCE(
                    json_agg(json_build_object('id', g.id, 'name', g.name, 'pihole_group_name', g.pihole_group_name))
@@ -263,10 +291,19 @@ def api_devices():
         LEFT JOIN users u ON u.id = d.owner_id
         LEFT JOIN device_groups dg ON dg.device_id = d.id
         LEFT JOIN groups g ON g.id = dg.group_id
+        {where}
         GROUP BY d.id, u.username, u.display_name
         ORDER BY d.last_seen DESC
-        """,
-    )
+    """
+    conn = get_db()
+    if status_filter:
+        rows = rows_to_list(
+            conn,
+            query.format(where="WHERE d.status = %s"),
+            (status_filter,),
+        )
+    else:
+        rows = rows_to_list(conn, query.format(where=""))
     conn.close()
     return Response(json.dumps(rows, default=serialize), mimetype="application/json")
 
@@ -402,6 +439,26 @@ def api_iot_allowlist_remove(device_id: int, entry_id: int):
     conn = get_db()
     with conn.cursor() as cur:
         cur.execute("DELETE FROM iot_allowlist WHERE id=%s AND device_id=%s", (entry_id, device_id))
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/devices/<int:device_id>/notes", methods=["PUT"])
+def api_set_device_notes(device_id: int):
+    """Update the free-text notes field for a device."""
+    body = request.get_json(force=True)
+    notes = body.get("notes")  # None / null clears the notes field
+
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE devices SET notes=%s WHERE id=%s RETURNING id",
+            (notes, device_id),
+        )
+        if cur.rowcount == 0:
+            conn.close()
+            return jsonify({"error": "device not found"}), 404
     conn.commit()
     conn.close()
     return jsonify({"ok": True})
@@ -741,6 +798,20 @@ def api_ack_alert(alert_id: int):
     return jsonify({"ok": True})
 
 
+@app.route("/api/alerts/acknowledge-all", methods=["PUT"])
+def api_ack_all_alerts():
+    """Acknowledge every outstanding warning/critical alert in one request."""
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE alerts SET acknowledged=TRUE WHERE acknowledged=FALSE AND level IN ('warning','critical')"
+        )
+        updated = cur.rowcount
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True, "acknowledged": updated})
+
+
 # --- API: Honeypot events ---
 
 @app.route("/api/honeypot")
@@ -749,6 +820,21 @@ def api_honeypot():
     rows = rows_to_list(
         conn,
         "SELECT * FROM honeypot_events ORDER BY created_at DESC LIMIT 200",
+    )
+    conn.close()
+    return Response(json.dumps(rows, default=serialize), mimetype="application/json")
+
+
+# --- API: Scan runs ---
+
+@app.route("/api/scan-runs")
+def api_scan_runs():
+    conn = get_db()
+    rows = rows_to_list(
+        conn,
+        """SELECT id, started_at, finished_at, network_range,
+                  devices_found, new_devices, status
+           FROM scan_runs ORDER BY started_at DESC LIMIT 100""",
     )
     conn.close()
     return Response(json.dumps(rows, default=serialize), mimetype="application/json")
@@ -788,6 +874,24 @@ def api_honeypot_event(event_id: int):
     if not rows:
         return jsonify({"error": "not found"}), 404
     return Response(json.dumps(rows[0], default=serialize), mimetype="application/json")
+
+
+@app.route("/api/devices/<int:device_id>/honeypot")
+def api_device_honeypot(device_id: int):
+    """Return honeypot events associated with a specific device."""
+    conn = get_db()
+    # Verify the device exists
+    device_rows = rows_to_list(conn, "SELECT id FROM devices WHERE id=%s", (device_id,))
+    if not device_rows:
+        conn.close()
+        return jsonify({"error": "not found"}), 404
+    rows = rows_to_list(
+        conn,
+        "SELECT * FROM honeypot_events WHERE device_id=%s ORDER BY created_at DESC LIMIT 200",
+        (device_id,),
+    )
+    conn.close()
+    return Response(json.dumps(rows, default=serialize), mimetype="application/json")
 
 
 # --- Pi-hole helpers ---------------------------------------------------------
@@ -934,6 +1038,50 @@ def api_stats():
             "unacked_alerts": unacked,
         }
     )
+
+
+# --- API: Scan runs ---
+
+@app.route("/api/scan-runs")
+def api_scan_runs():
+    """Return the 50 most recent discovery scan-run records."""
+    conn = get_db()
+    rows = rows_to_list(
+        conn,
+        "SELECT * FROM scan_runs ORDER BY started_at DESC LIMIT 50",
+    )
+    conn.close()
+    return Response(json.dumps(rows, default=serialize), mimetype="application/json")
+
+
+# --- API: Health check ---
+
+@app.route("/api/health")
+def api_health():
+    """Return service health including database and Redis connectivity."""
+    checks: dict[str, str] = {}
+    ok = True
+
+    try:
+        conn = get_db()
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1")
+        conn.close()
+        checks["database"] = "ok"
+    except Exception as exc:  # pylint: disable=broad-except
+        checks["database"] = f"error: {exc}"
+        ok = False
+
+    try:
+        rdb = get_redis()
+        rdb.ping()
+        checks["redis"] = "ok"
+    except Exception as exc:  # pylint: disable=broad-except
+        checks["redis"] = f"error: {exc}"
+        ok = False
+
+    status_code = 200 if ok else 503
+    return jsonify({"status": "ok" if ok else "degraded", "checks": checks}), status_code
 
 
 # --- SSE stream ---
