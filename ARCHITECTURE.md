@@ -640,13 +640,15 @@ else                                           → 'low'
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/api/devices` | List all devices (includes owner, group membership) |
+| GET | `/api/devices` | List all devices (includes owner, group membership); optional `?status=` filter |
 | GET | `/api/devices/<id>` | Single device |
 | PUT | `/api/devices/<id>/status` | Change status: `trusted|quarantined|blocked|iot` — publishes `device_status_changed` |
+| PUT | `/api/devices/<id>/notes` | Update free-text notes — body `{"notes": "..."}` (null clears) |
 | GET | `/api/devices/<id>/iot-allowlist` | Per-device FQDN allow-list entries |
 | POST | `/api/devices/<id>/iot-allowlist` | Add FQDN — body `{"fqdn": "..."}` |
 | DELETE | `/api/devices/<id>/iot-allowlist/<entry_id>` | Remove FQDN |
 | PUT | `/api/devices/<id>/owner` | Assign owner — body `{"owner_id": N}` |
+| GET | `/api/devices/<id>/honeypot` | Honeypot events linked to this device (last 200) |
 
 **`PUT /status` special case:** first-time `iot` assignment sets `iot_learning` and publishes
 `iot_learning_start_requested`.  Subsequent `iot` assignments skip learning.
@@ -681,10 +683,13 @@ else                                           → 'low'
 |--------|------|-------------|
 | GET | `/api/alerts` | Last 200 alerts |
 | PUT | `/api/alerts/<id>/acknowledge` | Mark acknowledged |
+| PUT | `/api/alerts/acknowledge-all` | Bulk-acknowledge all open warning/critical alerts — returns `{"ok": true, "acknowledged": N}` |
 | GET | `/api/honeypot` | Last 200 honeypot events |
 | GET | `/api/honeypot/<id>` | Single event |
+| GET | `/api/scan-runs` | Last 50 discovery scan-run records |
 | GET | `/api/pihole` | Pi-hole stats: queries_total, queries_blocked, percent_blocked, domains_blocked, clients_active, clients_total, status |
 | GET | `/api/stats` | Summary: devices by status, honeypot_hits, unacked_alerts |
+| GET | `/api/health` | Health check: `{"status": "ok"|"degraded", "checks": {"database": "ok"|"error: ...", "redis": "ok"|"error: ..."}}` — 200 OK or 503 |
 | GET | `/api/events` | SSE stream (text/event-stream) |
 | GET | `/iot-allowlist.txt` | Plain-text IoT FQDN feed for Pi-hole adlist |
 
