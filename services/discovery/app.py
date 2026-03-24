@@ -15,13 +15,25 @@ Additional discovery methods:
     addresses and then upserted like any other discovered device.
   - SSDP/UPnP: sends multicast M-SEARCH probes and fetches UPnP device
     description XML to extract manufacturer, model, and friendly name.
+  - WSD/WS-Discovery: sends a WS-Discovery Probe to 239.255.255.250:3702 to
+    discover Windows PCs, network printers, and ONVIF-compliant IP cameras
+    that do not respond to SSDP.
   - mDNS/Zeroconf: browses common DNS-SD service types (Bonjour/Avahi) to
     discover Apple, Chromecast, printer, HomeKit, and other smart-home devices.
+    TXT record key/value pairs (md, am, model, ty, fn) are extracted to surface
+    exact model names and device-type hints.
   - NetBIOS: runs nmap's nbstat NSE script across the subnet to retrieve
     NetBIOS hostnames and workgroup info for Windows/Samba hosts.
   - HTTP/HTTPS banners: grabs the Server header from open HTTP ports and
     reads TLS certificate subject/SAN fields from open HTTPS ports to derive
     hostnames, vendor, and model information.
+  - DHCP fingerprinting: captures DHCP option 55 (Parameter Request List) from
+    client DISCOVER/REQUEST packets and submits the fingerprint to the
+    fingerbank.org API for device-name/type classification.  This is the most
+    accurate passive classification source — the option-55 sequence is unique
+    to the DHCP client stack compiled into a device's firmware.
+  - MAC randomization detection: locally-administered (private/random) MACs
+    are flagged as mobile devices when no vendor OUI match is found.
 """
 
 import csv
@@ -38,6 +50,7 @@ import ssl
 import subprocess
 import threading
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 from urllib.request import urlopen
@@ -102,6 +115,17 @@ DHCP_SNIFF_ENABLED = os.environ.get("DHCP_SNIFF_ENABLED", "true").lower() == "tr
 
 # ARP packet sniffing — real-time device detection between scan cycles
 ARP_SNIFF_ENABLED = os.environ.get("ARP_SNIFF_ENABLED", "true").lower() == "true"
+
+# WSD/WS-Discovery active probe (Windows PCs, printers, ONVIF cameras)
+WSD_ENABLED = os.environ.get("WSD_ENABLED", "true").lower() == "true"
+WSD_TIMEOUT = int(os.environ.get("WSD_TIMEOUT", "5"))
+
+# DHCP fingerprint classification via fingerbank.org
+# Enabled by default; set FINGERBANK_ENABLED=false to skip API calls.
+# FINGERBANK_API_KEY is optional — unauthenticated requests work but are
+# rate-limited to 100/day.  Get a free key at https://fingerbank.org/users/register
+FINGERBANK_ENABLED = os.environ.get("FINGERBANK_ENABLED", "true").lower() == "true"
+FINGERBANK_API_KEY = os.environ.get("FINGERBANK_API_KEY", "")
 
 # How often (seconds) to drain the passive sniff queues and run SSDP/mDNS
 # discovery between full scan cycles.  Defaults to 30 s so that newly-seen
@@ -199,6 +223,157 @@ def get_db():
 
 def get_redis():
     return redis.from_url(REDIS_URL, decode_responses=True)
+
+
+# ─── MAC randomization helper ────────────────────────────────────────────────
+
+def _is_locally_administered_mac(mac: str) -> bool:
+    """Return True if *mac* has the locally-administered (LA) bit set.
+
+    Modern iOS and Android devices rotate their MAC addresses using
+    locally-administered (private/random) MACs.  The LA bit is the
+    second-least-significant bit of the first octet.  A locally-administered
+    *unicast* MAC has first-octet bit1=1, bit0=0 — e.g. 02:xx, 0A:xx, etc.
+
+    When no OUI vendor match exists for such a MAC it is almost certainly a
+    mobile device using MAC address randomization, so :func:`guess_device_type`
+    uses this flag to classify it as ``mobile`` rather than ``unknown``.
+    """
+    try:
+        first_octet = int(mac.replace(":", "").replace("-", "")[:2], 16)
+        # bit1=1 (locally administered) AND bit0=0 (unicast)
+        return bool(first_octet & 0x02) and not bool(first_octet & 0x01)
+    except Exception:
+        return False
+
+
+# ─── Fingerbank DHCP-fingerprint classification ───────────────────────────────
+
+_FINGERBANK_API_URL = "https://api.fingerbank.org/api/v2/combinations/interrogate"
+
+# In-process cache: key = "fp|vci" → result dict (or empty dict for 404).
+# Persists for the lifetime of the process; typical home-lab networks have
+# only a handful of unique DHCP fingerprints so memory cost is negligible.
+_fingerbank_cache: dict[str, dict] = {}
+# Monotonic timestamp of the last API call — used to enforce a minimum
+# interval between calls to avoid exceeding the unauthenticated rate limit.
+_fingerbank_last_call: float = 0.0
+_FINGERBANK_MIN_INTERVAL = 1.1  # seconds between API calls
+# Lock protecting both the cache dict and the rate-limit timestamp so that
+# concurrent calls from the sniff-processor and scan threads cannot race.
+_fingerbank_lock = threading.Lock()
+
+# Map fingerbank top-level parent category names to our device_type strings.
+_FINGERBANK_CATEGORY_MAP: dict[str, str] = {
+    "mobile":         "mobile",
+    "smartphone":     "mobile",
+    "tablet":         "mobile",
+    "ios device":     "mobile",
+    "android":        "mobile",
+    "iot":            "iot",
+    "smart tv":       "iot",
+    "streaming":      "iot",
+    "printer":        "printer",
+    "network device": "network_device",
+    "router":         "network_device",
+    "switch":         "network_device",
+    "access point":   "network_device",
+    "nas":            "server",
+    "workstation":    "desktop",
+    "desktop":        "desktop",
+    "laptop":         "desktop",
+    "computer":       "desktop",
+    "server":         "server",
+    "virtual machine":"server",
+}
+
+
+def fingerbank_lookup(
+    dhcp_fingerprint: str,
+    vendor_class: str = "",
+    hostname: str = "",
+) -> dict | None:
+    """Query fingerbank.org to classify a device by its DHCP option-55 fingerprint.
+
+    The DHCP Parameter Request List (option 55) is a comma-separated list of
+    DHCP option codes that a client requests from the server.  The exact
+    sequence is unique to the TCP/IP stack compiled into the device's firmware
+    and is one of the most reliable passive classification signals.
+
+    Results are cached in-process by (fingerprint, vci) key so that repeated
+    DHCP renewals from the same device type do not trigger additional API calls.
+
+    Returns a dict with keys ``device_name``, ``device_type`` (one of our
+    canonical types), and ``score`` (0–100) on success, or ``None`` on API
+    failure or when fingerprinting is disabled.
+    """
+    if not FINGERBANK_ENABLED or not dhcp_fingerprint:
+        return None
+
+    cache_key = f"{dhcp_fingerprint}|{vendor_class}"
+
+    with _fingerbank_lock:
+        if cache_key in _fingerbank_cache:
+            cached = _fingerbank_cache[cache_key]
+            return cached if cached else None
+
+        # Rate-limit: enforce minimum interval between calls atomically so
+        # concurrent threads cannot both slip through at the same time.
+        global _fingerbank_last_call
+        elapsed = time.monotonic() - _fingerbank_last_call
+        if elapsed < _FINGERBANK_MIN_INTERVAL:
+            time.sleep(_FINGERBANK_MIN_INTERVAL - elapsed)
+        # Reserve the slot before releasing the lock.
+        _fingerbank_last_call = time.monotonic()
+
+    # Make the network call outside the lock so other threads can proceed
+    # with cache lookups while this request is in flight.
+    params: dict[str, str] = {"dhcp_fingerprint": dhcp_fingerprint}
+    if vendor_class:
+        params["vendor_class_identifier"] = vendor_class
+    if hostname:
+        params["hostname"] = hostname
+    if FINGERBANK_API_KEY:
+        params["key"] = FINGERBANK_API_KEY
+
+    try:
+        resp = requests.get(_FINGERBANK_API_URL, params=params, timeout=5)
+        if resp.status_code == 200:
+            data = resp.json()
+            device = data.get("device") or {}
+            parents = device.get("parents") or []
+            # Walk parents bottom-up to find a recognised category name.
+            device_type = "unknown"
+            for parent in reversed(parents):
+                pname = (parent.get("name") or "").lower()
+                if pname in _FINGERBANK_CATEGORY_MAP:
+                    device_type = _FINGERBANK_CATEGORY_MAP[pname]
+                    break
+            result: dict = {
+                "device_name": device.get("name", ""),
+                "device_type": device_type,
+                "score": data.get("score", 0),
+            }
+            with _fingerbank_lock:
+                _fingerbank_cache[cache_key] = result
+            log.debug(
+                "fingerbank_hit",
+                fingerprint=dhcp_fingerprint,
+                device=result["device_name"],
+                device_type=result["device_type"],
+                score=result["score"],
+            )
+            return result
+        if resp.status_code == 404:
+            # Unknown fingerprint — cache empty result to avoid retrying.
+            with _fingerbank_lock:
+                _fingerbank_cache[cache_key] = {}
+            return None
+        log.debug("fingerbank_http_error", status=resp.status_code)
+        return None
+    except Exception as exc:
+        log.debug("fingerbank_lookup_error", error=str(exc))
+        return None
 
 
 # ─── Schema bootstrap ────────────────────────────────────────────────────────
@@ -1212,11 +1387,15 @@ def _dhcp_packet_handler(pkt) -> None:
     Watches for DHCPDISCOVER (type 1) and DHCPREQUEST (type 3) packets,
     which are sent by clients and carry:
     - DHCP option 12 (hostname): the client's self-reported hostname.
+    - DHCP option 55 (param_req_list): the Parameter Request List, whose
+      exact sequence of option codes is unique to the client's TCP/IP stack
+      and is used by fingerbank.org for passive device classification.
     - DHCP option 60 (vendor_class_id): the firmware / DHCP-client name, a
       strong IoT indicator (e.g. "udhcp 1.30.0" for BusyBox-based devices).
 
-    Enqueues dicts with ``mac``, ``hostname``, and optionally ``ip`` and
-    ``dhcp_vendor_class`` for processing by :func:`process_dhcp_sniff_queue`.
+    Enqueues dicts with ``mac``, ``hostname``, and optionally ``ip``,
+    ``dhcp_vendor_class``, and ``dhcp_fingerprint`` for processing by
+    :func:`process_dhcp_sniff_queue`.
     """
     try:
         if not (pkt.haslayer(BOOTP) and pkt.haslayer(DHCP)):
@@ -1228,6 +1407,7 @@ def _dhcp_packet_handler(pkt) -> None:
         hostname: str | None = None
         req_ip: str | None = None
         vendor_class: str | None = None
+        dhcp_fingerprint: str | None = None
 
         for option in pkt[DHCP].options:
             if not isinstance(option, tuple):
@@ -1244,6 +1424,18 @@ def _dhcp_packet_handler(pkt) -> None:
                 # Strings like "udhcp 1.30.0", "espressif", "shelly" identify
                 # the firmware / DHCP-client stack, giving an extra IoT signal.
                 vendor_class = value.decode("utf-8", errors="replace") if isinstance(value, bytes) else str(value)
+            elif code == "param_req_list":
+                # DHCP option 55 — Parameter Request List.
+                # The sequence of option codes the client requests is specific
+                # to its TCP/IP stack; fingerbank.org uses this as the primary
+                # key for passive device-type classification.
+                try:
+                    if isinstance(value, (list, tuple)):
+                        dhcp_fingerprint = ",".join(str(v) for v in value)
+                    elif isinstance(value, bytes):
+                        dhcp_fingerprint = ",".join(str(b) for b in value)
+                except Exception:
+                    pass
 
         # Only process DHCPDISCOVER (1) and DHCPREQUEST (3) which are sent by
         # clients and typically include the hostname option.
@@ -1272,6 +1464,8 @@ def _dhcp_packet_handler(pkt) -> None:
             entry["ip"] = src_ip
         if vendor_class:
             entry["dhcp_vendor_class"] = vendor_class
+        if dhcp_fingerprint:
+            entry["dhcp_fingerprint"] = dhcp_fingerprint
         try:
             _dhcp_hostname_queue.put_nowait(entry)
         except queue.Full:
@@ -1310,17 +1504,19 @@ def start_dhcp_sniffer() -> threading.Thread:
 
 
 def process_dhcp_sniff_queue(conn) -> int:
-    """Drain the DHCP sniffer queue and update device hostnames in the DB.
+    """Drain the DHCP sniffer queue and update device records in the DB.
 
-    For each enqueued (mac, hostname, ip[, dhcp_vendor_class]) entry:
+    For each enqueued entry:
 
-    - If the device is already known (matched by MAC): update its hostname when
-      currently absent and back-fill a missing IP address.
-    - If the DHCP Vendor Class Identifier (option 60) matches a known IoT
-      firmware keyword and the device_type is still ``unknown``, update the
-      device_type to ``iot`` so it enters the learning pipeline sooner.
-    - If the device is not yet known: the main scan loop will discover it in
-      the next ARP sweep; the hint is applied after that via MAC match.
+    - Updates ``hostname`` when currently absent and back-fills a missing IP.
+    - When the DHCP Vendor Class Identifier (option 60) matches a known IoT
+      firmware keyword and the device_type is still ``unknown``, upgrades it
+      to ``iot`` immediately.
+    - When a DHCP option-55 fingerprint is present, queries fingerbank.org to
+      identify the device by its DHCP Parameter Request List sequence.  The
+      result is stored in ``extra_info.fingerbank_device_name`` and, when the
+      returned category differs from the current device_type, the device_type
+      is upgraded (never downgraded from a more-specific type).
 
     Returns the number of device rows updated.
     """
@@ -1342,25 +1538,75 @@ def process_dhcp_sniff_queue(conn) -> int:
         hostname = entry.get("hostname")
         ip = entry.get("ip")
         dhcp_vci = (entry.get("dhcp_vendor_class") or "").lower()
+        dhcp_fp = entry.get("dhcp_fingerprint") or ""
         if not mac or not hostname:
             continue
 
         vci_is_iot = bool(dhcp_vci and any(kw in dhcp_vci for kw in _IOT_DHCP_VCI_KEYWORDS))
 
+        # Query fingerbank if we have an option-55 fingerprint.
+        fb_result: dict | None = None
+        if dhcp_fp:
+            fb_result = fingerbank_lookup(dhcp_fp, vendor_class=dhcp_vci, hostname=hostname)
+
+        # Derive the best device_type hint from all signals.
+        # Priority: fingerbank > VCI IoT keyword.  Never set "unknown".
+        inferred_type: str | None = None
+        if fb_result and fb_result.get("device_type") and fb_result["device_type"] != "unknown":
+            inferred_type = fb_result["device_type"]
+        elif vci_is_iot:
+            inferred_type = "iot"
+
+        # Build extra_info patch with fingerbank results.
+        extra_patch: dict = {}
+        if fb_result and fb_result.get("device_name"):
+            extra_patch["fingerbank_device_name"] = fb_result["device_name"]
+            extra_patch["fingerbank_score"] = fb_result.get("score", 0)
+        if dhcp_fp:
+            extra_patch["dhcp_fingerprint"] = dhcp_fp
+
         with conn.cursor() as cur:
-            if vci_is_iot:
-                # Update hostname (if missing) and upgrade unknown → iot.
+            if inferred_type and extra_patch:
                 cur.execute(
                     """
                     UPDATE devices
                     SET hostname    = COALESCE(NULLIF(hostname, ''), %s),
                         ip_address  = COALESCE(ip_address, %s),
-                        device_type = CASE WHEN device_type = 'unknown' THEN 'iot' ELSE device_type END,
+                        device_type = CASE WHEN device_type = 'unknown' THEN %s ELSE device_type END,
+                        extra_info  = extra_info || %s::jsonb,
                         last_seen   = NOW()
                     WHERE mac_address = %s
-                      AND (hostname IS NULL OR hostname = '')
+                      AND (hostname IS NULL OR hostname = '' OR device_type = 'unknown'
+                           OR extra_info->>'fingerbank_device_name' IS NULL)
                     """,
-                    (hostname, ip, mac),
+                    (hostname, ip, inferred_type, json.dumps(extra_patch), mac),
+                )
+            elif inferred_type:
+                cur.execute(
+                    """
+                    UPDATE devices
+                    SET hostname    = COALESCE(NULLIF(hostname, ''), %s),
+                        ip_address  = COALESCE(ip_address, %s),
+                        device_type = CASE WHEN device_type = 'unknown' THEN %s ELSE device_type END,
+                        last_seen   = NOW()
+                    WHERE mac_address = %s
+                      AND (hostname IS NULL OR hostname = '' OR device_type = 'unknown')
+                    """,
+                    (hostname, ip, inferred_type, mac),
+                )
+            elif extra_patch:
+                cur.execute(
+                    """
+                    UPDATE devices
+                    SET hostname    = COALESCE(NULLIF(hostname, ''), %s),
+                        ip_address  = COALESCE(ip_address, %s),
+                        extra_info  = extra_info || %s::jsonb,
+                        last_seen   = NOW()
+                    WHERE mac_address = %s
+                      AND (hostname IS NULL OR hostname = ''
+                           OR extra_info->>'fingerbank_device_name' IS NULL)
+                    """,
+                    (hostname, ip, json.dumps(extra_patch), mac),
                 )
             else:
                 cur.execute(
@@ -1380,6 +1626,7 @@ def process_dhcp_sniff_queue(conn) -> int:
                     "dhcp_hostname_updated",
                     mac=mac, hostname=hostname, ip=ip,
                     dhcp_vci=dhcp_vci or None, vci_iot=vci_is_iot,
+                    fingerbank=fb_result.get("device_name") if fb_result else None,
                 )
 
     conn.commit()
@@ -1647,6 +1894,115 @@ def ssdp_discover(timeout: int = 5) -> dict[str, dict]:
     return responses
 
 
+# ─── WSD / WS-Discovery active probe ─────────────────────────────────────────
+
+_WSD_MULTICAST_ADDR = "239.255.255.250"
+_WSD_PORT = 3702
+
+# WS-Discovery Probe message (SOAP 1.2).  Sent to the WSD multicast group;
+# Windows PCs, network printers, and ONVIF-compliant IP cameras reply with
+# a ProbeMatch that includes device type strings, scope URIs, and HTTP
+# endpoint addresses even when they do not support SSDP/UPnP.
+# The {msg_uuid} placeholder is filled by uuid.uuid4() whose output is
+# restricted to hex digits and hyphens — no XML special characters.
+_WSD_PROBE_XML = (
+    '<?xml version="1.0" encoding="utf-8"?>'
+    '<soap:Envelope'
+    ' xmlns:soap="http://www.w3.org/2003/05/soap-envelope"'
+    ' xmlns:wsa="http://schemas.xmlsoap.org/ws/2004/08/addressing"'
+    ' xmlns:wsd="http://schemas.xmlsoap.org/ws/2005/04/discovery">'
+    "<soap:Header>"
+    "<wsa:To>urn:schemas-xmlsoap-org:ws:2005:04:discovery</wsa:To>"
+    "<wsa:Action>"
+    "http://schemas.xmlsoap.org/ws/2005/04/discovery/Probe"
+    "</wsa:Action>"
+    "<wsa:MessageID>urn:uuid:{msg_uuid}</wsa:MessageID>"
+    "</soap:Header>"
+    "<soap:Body><wsd:Probe><wsd:Types/></wsd:Probe></soap:Body>"
+    "</soap:Envelope>"
+)
+
+_WSD_NS = {
+    "soap": "http://www.w3.org/2003/05/soap-envelope",
+    "wsd":  "http://schemas.xmlsoap.org/ws/2005/04/discovery",
+    "wsa":  "http://schemas.xmlsoap.org/ws/2004/08/addressing",
+    "wsdp": "http://schemas.xmlsoap.org/ws/2006/02/devprof",
+}
+
+
+def wsd_discover(timeout: int = 5) -> dict[str, dict]:
+    """Discover WS-Discovery (WSD) devices via UDP multicast on port 3702.
+
+    Sends a WS-Discovery Probe to the standard multicast address
+    (239.255.255.250:3702) and waits *timeout* seconds for ProbeMatch
+    responses.  Windows PCs share device info via WSD even with SSDP
+    disabled; network printers and ONVIF cameras also respond here.
+
+    Each ProbeMatch yields:
+
+    - ``wsd_types``: space-separated device-type declarations, e.g.
+      ``wsdp:Device pub:NetworkVideoTransmitter`` (ONVIF camera),
+      ``wscn:ScanDeviceType wsdp:Device`` (scanner), ``pri:Printer`` (printer).
+    - ``wsd_scopes``: space-separated scope URIs, e.g.
+      ``onvif://www.onvif.org/name/AXIS%20P1448-LE``.
+    - ``wsd_xaddrs``: space-separated HTTP endpoint URLs (device service URLs).
+
+    Returns a dict mapping IP address → enrichment dict.
+    """
+    if not WSD_ENABLED:
+        return {}
+
+    probe = _WSD_PROBE_XML.format(msg_uuid=uuid.uuid4()).encode("utf-8")
+    responses: dict[str, dict] = {}
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+        sock.settimeout(timeout)
+        try:
+            sock.sendto(probe, (_WSD_MULTICAST_ADDR, _WSD_PORT))
+        except Exception as exc:
+            log.warning("wsd_send_error", error=str(exc))
+            return {}
+
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                data, addr = sock.recvfrom(65507)
+                ip = addr[0]
+                if ip in responses:
+                    continue
+                try:
+                    root = ET.fromstring(data.decode("utf-8", errors="replace"))
+                    types_el = root.find(".//wsd:Types", _WSD_NS)
+                    scopes_el = root.find(".//wsd:Scopes", _WSD_NS)
+                    xaddrs_el = root.find(".//wsd:XAddrs", _WSD_NS)
+                    entry: dict = {}
+                    if types_el is not None and types_el.text:
+                        entry["wsd_types"] = types_el.text.strip()
+                    if scopes_el is not None and scopes_el.text:
+                        entry["wsd_scopes"] = scopes_el.text.strip()
+                    if xaddrs_el is not None and xaddrs_el.text:
+                        entry["wsd_xaddrs"] = xaddrs_el.text.strip()
+                    if entry:
+                        responses[ip] = entry
+                except ET.ParseError as exc:
+                    log.debug("wsd_parse_error", ip=ip, error=str(exc))
+            except TimeoutError:
+                break
+            except OSError:
+                break
+            except Exception as exc:
+                log.debug("wsd_recv_error", error=str(exc))
+                break
+    finally:
+        sock.close()
+
+    log.info("wsd_discover_done", found=len(responses))
+    return responses
+
+
 # ─── mDNS / Zeroconf discovery ───────────────────────────────────────────────
 
 # Common DNS-SD service types that reveal useful device information.
@@ -1770,10 +2126,25 @@ def process_mdns_queue() -> dict[str, dict]:
 
     Returns a dict mapping IP address → enrichment dict with keys:
 
-    - ``mdns_services``: list of service entry dicts
-    - ``mdns_hostname``: the ``.local`` hostname from the first entry that
-      provides one
+    - ``mdns_services``: list of service entry dicts (including raw TXT properties)
+    - ``mdns_hostname``: the ``.local`` hostname from the first entry that provides one
+    - ``mdns_txt_model``: model name extracted from TXT record keys ``md``, ``model``, ``mn``
+    - ``mdns_txt_type``: device-type hint from TXT record keys ``ty``, ``dt``
+    - ``mdns_txt_friendly_name``: friendly name from TXT record key ``fn``
+
+    TXT record key/value pairs carry rich metadata on Apple HomeKit accessories
+    (``md`` = model, ``am`` = Apple model identifier), Chromecasts (``fn`` =
+    friendly name), printers (``ty`` = device type), and ESPHome devices.
+    Surfacing these as top-level fields lets :func:`guess_device_type` use them
+    without iterating nested service lists.
     """
+    # TXT record keys whose values represent a model name.
+    _MODEL_KEYS = {"md", "model", "mn", "am"}
+    # TXT record keys whose values represent a device type/category string.
+    _TYPE_KEYS = {"ty", "dt"}
+    # TXT record key for friendly/display name.
+    _FNAME_KEY = "fn"
+
     enrichment: dict[str, dict] = {}
     while True:
         try:
@@ -1793,6 +2164,21 @@ def process_mdns_queue() -> dict[str, dict]:
         )
         if entry.get("hostname") and not enrichment[ip]["mdns_hostname"]:
             enrichment[ip]["mdns_hostname"] = entry["hostname"]
+
+        # Extract high-value TXT record fields and promote to top-level keys.
+        props = entry.get("properties") or {}
+        for raw_key, raw_val in props.items():
+            key_l = raw_key.lower() if isinstance(raw_key, str) else ""
+            val_s = str(raw_val).strip() if raw_val else ""
+            if not val_s:
+                continue
+            if key_l in _MODEL_KEYS and not enrichment[ip].get("mdns_txt_model"):
+                enrichment[ip]["mdns_txt_model"] = val_s
+            elif key_l in _TYPE_KEYS and not enrichment[ip].get("mdns_txt_type"):
+                enrichment[ip]["mdns_txt_type"] = val_s
+            elif key_l == _FNAME_KEY and not enrichment[ip].get("mdns_txt_friendly_name"):
+                enrichment[ip]["mdns_txt_friendly_name"] = val_s
+
     return enrichment
 
 
@@ -2457,13 +2843,15 @@ def guess_device_type(
     os_guess: str | None,
     extra_info: str | None = None,
     hostname: str | None = None,
+    mac: str | None = None,
 ) -> str:
     """Heuristic device-type classifier.
 
     Uses MAC vendor string, nmap OS fingerprint, open port set, mDNS service
-    types, UPnP device/manufacturer fields, HTTP server banner, HTTP page
-    title, SNMP sysDescr/sysName, and hostname to produce a best-effort
-    device category.
+    types and TXT records, WSD device-type strings, UPnP device/manufacturer
+    fields, HTTP server banner, HTTP page title, SNMP sysDescr/sysName,
+    DHCP fingerbank results, MAC address randomization flag, and hostname to
+    produce a best-effort device category.
 
     Returns one of: ``iot``, ``desktop``, ``server``, ``mobile``,
     ``printer``, ``network_device``, or ``unknown``.
@@ -2498,6 +2886,39 @@ def guess_device_type(
             "_miio._udp",
         )):
             return "iot"
+
+    # ── mDNS TXT record hints (model / device-type strings from Bonjour TXTs) ─
+    # Keys like ``md`` (HomeKit model), ``ty`` (printer type), ``am`` (Apple
+    # model identifier like "iPhone14,2") expose the exact device identity.
+    mdns_txt_type_l = extra.get("mdns_txt_type", "").lower() if isinstance(extra.get("mdns_txt_type"), str) else ""
+    mdns_txt_model_l = extra.get("mdns_txt_model", "").lower() if isinstance(extra.get("mdns_txt_model"), str) else ""
+    if mdns_txt_type_l:
+        if any(kw in mdns_txt_type_l for kw in ("printer", "scanner", "fax")):
+            return "printer"
+        if any(kw in mdns_txt_type_l for kw in ("camera", "nvr", "iot", "smart")):
+            return "iot"
+    if mdns_txt_model_l:
+        # Apple model identifiers: "iPhone" / "iPad" → mobile; "MacBook" → desktop
+        if any(kw in mdns_txt_model_l for kw in ("iphone", "ipad", "ipod")):
+            return "mobile"
+        if any(kw in mdns_txt_model_l for kw in ("macbook", "imac", "mac mini", "mac pro")):
+            return "desktop"
+        if any(kw in mdns_txt_model_l for kw in _IOT_VENDOR_KEYWORDS):
+            return "iot"
+
+    # ── WSD device-type hints (Windows PCs, printers, ONVIF cameras) ──────────
+    wsd_types_l = extra.get("wsd_types", "").lower() if isinstance(extra.get("wsd_types"), str) else ""
+    wsd_scopes_l = extra.get("wsd_scopes", "").lower() if isinstance(extra.get("wsd_scopes"), str) else ""
+    if wsd_types_l:
+        if any(kw in wsd_types_l for kw in ("pri:printer", "printdevice", "wscn:")):
+            return "printer"
+        if any(kw in wsd_types_l for kw in ("networkvideotransmitter", "networkvideodisplay")):
+            return "iot"  # ONVIF IP camera
+        if "scandevicetype" in wsd_types_l:
+            return "printer"  # WS-Scan scanner
+    if wsd_scopes_l:
+        if "onvif" in wsd_scopes_l:
+            return "iot"  # ONVIF-capable camera/encoder
 
     # ── UPnP device-type hints ────────────────────────────────────────────────
     upnp_type = extra.get("upnp_device_type", "")
@@ -2579,6 +3000,12 @@ def guess_device_type(
     if "android" in os_l or "apple" in vendor_l or "ios" in os_l:
         return "mobile"
 
+    # ── MAC randomization → mobile device ────────────────────────────────────
+    # Locally-administered (private/random) MACs with no known OUI vendor are
+    # almost exclusively modern phones and tablets using MAC address rotation.
+    if mac and not vendor_l and _is_locally_administered_mac(mac):
+        return "mobile"
+
     # ── Open-port heuristics ──────────────────────────────────────────────────
     if 9100 in ports or "print" in vendor_l:
         return "printer"
@@ -2631,6 +3058,7 @@ def _enrich_and_classify(host: dict, extra_seed: dict | None = None) -> dict:
     host["device_type"] = guess_device_type(
         host.get("vendor"), host.get("open_ports", []),
         host.get("os_guess"), extra_info, host.get("hostname"),
+        mac=mac,
     )
     return host
 
@@ -2829,7 +3257,9 @@ def _process_mdns_standalone(conn) -> int:
 
     - Updates the ``hostname`` column when the device exists but currently has
       no hostname.
-    - Merges ``mdns_services`` and ``mdns_hostname`` into ``extra_info``.
+    - Merges ``mdns_services``, ``mdns_hostname``, and TXT-record fields
+      (``mdns_txt_model``, ``mdns_txt_type``, ``mdns_txt_friendly_name``) into
+      ``extra_info``.
 
     Called by :func:`_sniff_processor_loop` so that mDNS enrichment is applied
     between full scan cycles rather than only when :func:`run_scan` executes.
@@ -2849,6 +3279,10 @@ def _process_mdns_standalone(conn) -> int:
         extra_patch: dict = {"mdns_services": services}
         if hostname:
             extra_patch["mdns_hostname"] = hostname
+        # Propagate TXT record fields so guess_device_type can use them.
+        for txt_key in ("mdns_txt_model", "mdns_txt_type", "mdns_txt_friendly_name"):
+            if entry.get(txt_key):
+                extra_patch[txt_key] = entry[txt_key]
 
         with conn.cursor() as cur:
             cur.execute(
@@ -2869,13 +3303,57 @@ def _process_mdns_standalone(conn) -> int:
     return updated
 
 
+def _process_wsd_standalone(conn, rdb) -> int:
+    """Run WSD discovery and upsert newly found devices into the database.
+
+    Sends a WS-Discovery Probe and performs full enrichment (hostname, vendor,
+    nmap, banner grab) for any responding IP not yet tracked.  Called by
+    :func:`_sniff_processor_loop` so that WSD-discovered devices reach the
+    database between full scan cycles.
+
+    Returns the number of new devices added.
+    """
+    wsd_data = wsd_discover(timeout=WSD_TIMEOUT)
+    if not wsd_data:
+        return 0
+
+    log.info("wsd_standalone_process", candidates=len(wsd_data))
+    new_count = 0
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT ip_address FROM devices WHERE ip_address = ANY(%s)",
+            (list(wsd_data.keys()),),
+        )
+        known_ips: set[str] = {row["ip_address"] for row in cur.fetchall() if row["ip_address"]}
+
+    for ip, wsd_entry in wsd_data.items():
+        if ip in known_ips:
+            continue
+
+        mac = arp_resolve(ip)
+        if not mac:
+            log.debug("wsd_standalone_no_mac", ip=ip)
+            continue
+
+        host: dict = {"ip": ip, "mac": mac}
+        _enrich_and_classify(host, extra_seed=wsd_entry)
+
+        is_new = upsert_device(conn, rdb, host)
+        if is_new:
+            new_count += 1
+            log.info("wsd_standalone_new_device", ip=ip, mac=mac, wsd_types=wsd_entry.get("wsd_types"))
+
+    return new_count
+
+
 def _sniff_processor_loop() -> None:
     """Background thread that continuously processes sniff queues.
 
-    Drains the ARP, DNS, mDNS, and DHCP passive-sniff queues and runs SSDP
-    and mDNS/Zeroconf discovery at :data:`SNIFF_PROCESS_INTERVAL`-second
+    Drains the ARP, DNS, mDNS, and DHCP passive-sniff queues and runs SSDP,
+    WSD, and mDNS/Zeroconf discovery at :data:`SNIFF_PROCESS_INTERVAL`-second
     intervals.  This ensures that devices detected via passive sniffing (DHCP
-    offers, DNS queries, ARP broadcasts, mDNS announcements, SSDP responses)
+    offers, DNS queries, ARP broadcasts, mDNS announcements, SSDP/WSD responses)
     are written to the database promptly — without waiting for the next full
     ``SCAN_INTERVAL`` window.
 
@@ -2900,6 +3378,8 @@ def _sniff_processor_loop() -> None:
                     _process_mdns_standalone(conn)
                 if SSDP_ENABLED:
                     _process_ssdp_standalone(conn, rdb)
+                if WSD_ENABLED:
+                    _process_wsd_standalone(conn, rdb)
             finally:
                 conn.close()
         except Exception as exc:
@@ -2917,6 +3397,9 @@ def run_scan():
         # ── Cycle-level enrichment passes (run once per scan, not per host) ───────
         # SSDP/UPnP — send M-SEARCH multicast and fetch device descriptions.
         ssdp_data: dict[str, dict] = ssdp_discover(timeout=SSDP_TIMEOUT) if SSDP_ENABLED else {}
+
+        # WSD/WS-Discovery — Windows PCs, printers, ONVIF cameras on port 3702.
+        wsd_data: dict[str, dict] = wsd_discover(timeout=WSD_TIMEOUT) if WSD_ENABLED else {}
 
         # mDNS — drain whatever announcements arrived since the last scan.
         mdns_data: dict[str, dict] = process_mdns_queue() if MDNS_ENABLED else {}
@@ -2985,6 +3468,13 @@ def run_scan():
                     hosts.append(host)
                     host_by_ip[ip] = host
 
+            # ── Step 4b: WSD — add any IPs only found via WS-Discovery ───────────
+            for ip, wsd_entry in wsd_data.items():
+                if ip not in host_by_ip:
+                    host = {"ip": ip}
+                    hosts.append(host)
+                    host_by_ip[ip] = host
+
             # ── Step 5: NetBIOS/NBNS subnet scan ─────────────────────────────────
             netbios_data: dict[str, dict] = netbios_scan(network) if NETBIOS_ENABLED else {}
 
@@ -3027,10 +3517,18 @@ def run_scan():
                 if host["ip"] in ssdp_data:
                     extra_info.update(ssdp_data[host["ip"]])
 
+                # Merge WSD/WS-Discovery data for this host's IP.
+                if host["ip"] in wsd_data:
+                    extra_info.update(wsd_data[host["ip"]])
+
                 # Merge mDNS data for this host's IP.
                 if host["ip"] in mdns_data:
                     mdns_entry = mdns_data[host["ip"]]
                     extra_info["mdns_services"] = mdns_entry.get("mdns_services", [])
+                    # Promote mDNS TXT model/type fields to top-level extra_info.
+                    for txt_key in ("mdns_txt_model", "mdns_txt_type", "mdns_txt_friendly_name"):
+                        if mdns_entry.get(txt_key):
+                            extra_info[txt_key] = mdns_entry[txt_key]
                     # Prefer mDNS .local hostname over reverse-DNS if not already set.
                     if mdns_entry.get("mdns_hostname") and not host.get("hostname"):
                         host["hostname"] = mdns_entry["mdns_hostname"]
