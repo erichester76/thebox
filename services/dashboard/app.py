@@ -1273,6 +1273,27 @@ def get_pihole_stats() -> dict:
     gravity = data.get("gravity", {})
     clients = data.get("clients", {})
 
+    # Pi-hole v6 /api/stats/summary does not include a blocking status field.
+    # Fetch it separately from /api/dns/blocking.
+    status = "unknown"
+    try:
+        blocking_resp = requests.get(
+            f"{PIHOLE_URL}/api/dns/blocking",
+            params=params,
+            timeout=10,
+        )
+        if blocking_resp.status_code == 200:
+            blocking_data = blocking_resp.json()
+            blocking = blocking_data.get("blocking")
+            if blocking is True or blocking == "enabled":
+                status = "enabled"
+            elif blocking is False or blocking == "disabled":
+                status = "disabled"
+            else:
+                log.warning("pihole_blocking_status_unexpected", value=blocking)
+    except Exception as exc:
+        log.warning("pihole_blocking_status_failed", error=str(exc))
+
     return {
         "queries_total": queries.get("total", 0),
         "queries_blocked": queries.get("blocked", 0),
@@ -1280,7 +1301,7 @@ def get_pihole_stats() -> dict:
         "domains_blocked": gravity.get("domains_being_blocked", 0),
         "clients_active": clients.get("active", 0),
         "clients_total": clients.get("total", 0),
-        "status": data.get("status", "unknown"),
+        "status": status,
     }
 
 
