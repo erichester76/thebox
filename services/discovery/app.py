@@ -203,7 +203,61 @@ def ensure_schema():
     log.info("schema_ensured")
 
 
-# ─── ARP sweep ───────────────────────────────────────────────────────────────
+# ─── Settings helpers ────────────────────────────────────────────────────────
+
+def get_setting(key: str, default: str = "") -> str:
+    """Return the current value for *key* from the settings table.
+
+    Falls back to *default* when the key is absent or when the database is
+    unreachable (e.g. during very early startup before the schema exists).
+    """
+    try:
+        conn = get_db()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT value FROM settings WHERE key = %s", (key,))
+                row = cur.fetchone()
+                return row["value"] if row else default
+        finally:
+            conn.close()
+    except Exception as exc:
+        log.warning("get_setting_failed", key=key, error=str(exc))
+        return default
+
+
+def _load_settings() -> None:
+    """Read all tuneable settings from the database and update module globals.
+
+    Called once at startup *after* ``ensure_schema``.  Uses env-var values as
+    the fallback so that existing deployments keep working unchanged.
+    """
+    global NETWORK_RANGES, SCAN_INTERVAL, PIHOLE_URL, PIHOLE_PASSWORD
+    global IOT_LEARNING_HOURS, PIHOLE_IOT_GROUP, DASHBOARD_URL
+    global DNS_SNIFF_ENABLED, DNS_SNIFF_IFACE
+    global SSDP_ENABLED, SSDP_TIMEOUT
+    global MDNS_ENABLED, NETBIOS_ENABLED
+    global BANNER_GRAB_ENABLED, BANNER_GRAB_TIMEOUT
+    global DHCP_SNIFF_ENABLED, ARP_SNIFF_ENABLED
+
+    NETWORK_RANGES = [r.strip() for r in get_setting("NETWORK_RANGES", ",".join(NETWORK_RANGES)).split(",") if r.strip()]
+    SCAN_INTERVAL  = int(get_setting("SCAN_INTERVAL", str(SCAN_INTERVAL)))
+    PIHOLE_URL     = get_setting("PIHOLE_URL", PIHOLE_URL).rstrip("/")
+    PIHOLE_PASSWORD = get_setting("PIHOLE_PASSWORD", PIHOLE_PASSWORD)
+    IOT_LEARNING_HOURS = int(get_setting("IOT_LEARNING_HOURS", str(IOT_LEARNING_HOURS)))
+    PIHOLE_IOT_GROUP   = get_setting("PIHOLE_IOT_GROUP", PIHOLE_IOT_GROUP)
+    DASHBOARD_URL      = get_setting("DASHBOARD_URL", DASHBOARD_URL).rstrip("/")
+    DNS_SNIFF_ENABLED  = get_setting("DNS_SNIFF_ENABLED", str(DNS_SNIFF_ENABLED).lower()).lower() == "true"
+    dns_iface          = get_setting("DNS_SNIFF_IFACE", DNS_SNIFF_IFACE or "")
+    DNS_SNIFF_IFACE    = dns_iface or None
+    SSDP_ENABLED       = get_setting("SSDP_ENABLED", str(SSDP_ENABLED).lower()).lower() == "true"
+    SSDP_TIMEOUT       = int(get_setting("SSDP_TIMEOUT", str(SSDP_TIMEOUT)))
+    MDNS_ENABLED       = get_setting("MDNS_ENABLED", str(MDNS_ENABLED).lower()).lower() == "true"
+    NETBIOS_ENABLED    = get_setting("NETBIOS_ENABLED", str(NETBIOS_ENABLED).lower()).lower() == "true"
+    BANNER_GRAB_ENABLED  = get_setting("BANNER_GRAB_ENABLED", str(BANNER_GRAB_ENABLED).lower()).lower() == "true"
+    BANNER_GRAB_TIMEOUT  = float(get_setting("BANNER_GRAB_TIMEOUT", str(BANNER_GRAB_TIMEOUT)))
+    DHCP_SNIFF_ENABLED   = get_setting("DHCP_SNIFF_ENABLED", str(DHCP_SNIFF_ENABLED).lower()).lower() == "true"
+    ARP_SNIFF_ENABLED    = get_setting("ARP_SNIFF_ENABLED", str(ARP_SNIFF_ENABLED).lower()).lower() == "true"
+    log.info("settings_loaded", networks=NETWORK_RANGES, scan_interval=SCAN_INTERVAL)
 
 def arp_sweep(network: str) -> list[dict]:
     """Send ARP requests for every host in *network* and collect replies."""
@@ -2286,6 +2340,9 @@ def _discovery_subscribe_loop() -> None:
 
 
 def main():
+    ensure_schema()
+    _load_settings()
+
     log.info(
         "discovery_service_start",
         networks=NETWORK_RANGES,
@@ -2293,8 +2350,6 @@ def main():
         iot_learning_hours=IOT_LEARNING_HOURS,
         pihole_iot_group=PIHOLE_IOT_GROUP,
     )
-
-    ensure_schema()
 
     # Start the background DNS-packet sniffer (requires NET_RAW capability).
     # Also handles mDNS (port 5353) hostname extraction when DNS_SNIFF_ENABLED.

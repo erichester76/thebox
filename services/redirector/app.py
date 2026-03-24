@@ -204,6 +204,41 @@ def ensure_schema():
     log.info("schema_ensured")
 
 
+# ─── Settings helpers ────────────────────────────────────────────────────────
+
+def get_setting(key: str, default: str = "") -> str:
+    """Return the current value for *key* from the settings table."""
+    try:
+        conn = get_db()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT value FROM settings WHERE key = %s", (key,))
+                row = cur.fetchone()
+                return row["value"] if row else default
+        finally:
+            conn.close()
+    except Exception as exc:
+        log.warning("get_setting_failed", key=key, error=str(exc))
+        return default
+
+
+def _load_settings() -> None:
+    """Read redirector settings from the database, falling back to env vars."""
+    global REDIRECT_MODES, NETWORK_INTERFACE, GATEWAY_IP, NETWORK_RANGES
+    global PIHOLE_IP, BOX_IP, BLACKHOLE_QUARANTINED, ARP_REFRESH_INTERVAL
+
+    raw_mode = get_setting("REDIRECT_MODE", ",".join(REDIRECT_MODES) or "passive")
+    REDIRECT_MODES    = {m.strip().lower() for m in raw_mode.split(",") if m.strip()}
+    NETWORK_INTERFACE = get_setting("NETWORK_INTERFACE", NETWORK_INTERFACE)
+    GATEWAY_IP        = get_setting("GATEWAY_IP", GATEWAY_IP)
+    NETWORK_RANGES    = [r.strip() for r in get_setting("NETWORK_RANGES", ",".join(NETWORK_RANGES)).split(",") if r.strip()]
+    PIHOLE_IP         = get_setting("PIHOLE_IP", PIHOLE_IP)
+    BOX_IP            = get_setting("BOX_IP", BOX_IP)
+    BLACKHOLE_QUARANTINED = get_setting("BLACKHOLE_QUARANTINED", str(BLACKHOLE_QUARANTINED).lower()).lower() == "true"
+    ARP_REFRESH_INTERVAL  = int(get_setting("ARP_REFRESH_INTERVAL", str(ARP_REFRESH_INTERVAL)))
+    log.info("settings_loaded", redirect_modes=sorted(REDIRECT_MODES))
+
+
 def log_redirect_event(
     conn,
     action: str,
@@ -712,11 +747,10 @@ def sync_quarantine_targets(gateway_ip: str, gateway_mac: str):
 # ─── Main ────────────────────────────────────────────────────────────────────
 
 def main():
-    log.info("redirector_service_start", modes=sorted(REDIRECT_MODES))
-
-    # Ensure the redirect_events table exists (handles databases created before
-    # this table was added to init.sql).
     ensure_schema()
+    _load_settings()
+
+    log.info("redirector_service_start", modes=sorted(REDIRECT_MODES))
 
     # Resolve network identity
     own_ip = BOX_IP or get_own_ip()

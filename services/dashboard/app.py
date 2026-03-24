@@ -29,6 +29,57 @@ LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 PIHOLE_URL = os.environ.get("PIHOLE_URL", "").rstrip("/")
 PIHOLE_PASSWORD = os.environ.get("PIHOLE_PASSWORD", "")
 
+# ─── Settings catalogue ───────────────────────────────────────────────────────
+# Each entry: (key, env_default, category, description)
+# Used to seed the settings table on first startup and to validate API updates.
+_SETTINGS_CATALOGUE: list[tuple[str, str, str, str]] = [
+    # ── General ──
+    ("LOG_LEVEL",      os.environ.get("LOG_LEVEL", "INFO"),                  "general",    "Log level for all services (DEBUG, INFO, WARNING, ERROR)"),
+    ("DASHBOARD_URL",  os.environ.get("DASHBOARD_URL", "http://dashboard:3000"), "general", "Internal URL used by the discovery service to register the IoT allow-list feed with Pi-hole"),
+    # ── Pi-hole ──
+    ("PIHOLE_URL",      os.environ.get("PIHOLE_URL", ""),           "pihole", "Pi-hole v6 API base URL (e.g. http://pihole:80/api)"),
+    ("PIHOLE_PASSWORD", os.environ.get("PIHOLE_PASSWORD", ""),      "pihole", "Pi-hole admin password"),
+    ("PIHOLE_SID_TTL",  os.environ.get("PIHOLE_SID_TTL", "240"),    "pihole", "Seconds a Pi-hole v6 session ID is cached before re-authenticating"),
+    # ── Network Discovery ──
+    ("NETWORK_RANGES",       os.environ.get("NETWORK_RANGES", "192.168.1.0/24"),   "discovery", "Comma-separated list of CIDR ranges to scan"),
+    ("SCAN_INTERVAL",        os.environ.get("SCAN_INTERVAL", "300"),                "discovery", "Scan interval in seconds"),
+    ("DNS_SNIFF_ENABLED",    os.environ.get("DNS_SNIFF_ENABLED", "true"),           "discovery", "Enable DNS packet sniffing to discover devices from their DNS queries"),
+    ("DNS_SNIFF_IFACE",      os.environ.get("DNS_SNIFF_IFACE", ""),                 "discovery", "Network interface for DNS sniffing (empty = auto-detect)"),
+    ("SSDP_ENABLED",         os.environ.get("SSDP_ENABLED", "true"),                "discovery", "Enable SSDP/UPnP multicast discovery"),
+    ("SSDP_TIMEOUT",         os.environ.get("SSDP_TIMEOUT", "5"),                   "discovery", "Seconds to wait for SSDP responses per scan cycle"),
+    ("MDNS_ENABLED",         os.environ.get("MDNS_ENABLED", "true"),                "discovery", "Enable mDNS/Zeroconf (Bonjour/Avahi) service browser"),
+    ("NETBIOS_ENABLED",      os.environ.get("NETBIOS_ENABLED", "true"),             "discovery", "Enable NetBIOS/NBNS subnet scan via nmap nbstat"),
+    ("BANNER_GRAB_ENABLED",  os.environ.get("BANNER_GRAB_ENABLED", "true"),         "discovery", "Enable HTTP/HTTPS banner grabbing"),
+    ("BANNER_GRAB_TIMEOUT",  os.environ.get("BANNER_GRAB_TIMEOUT", "3"),            "discovery", "Timeout in seconds for banner grab connections"),
+    ("DHCP_SNIFF_ENABLED",   os.environ.get("DHCP_SNIFF_ENABLED", "true"),          "discovery", "Enable DHCP packet sniffing for real-time hostname extraction"),
+    ("ARP_SNIFF_ENABLED",    os.environ.get("ARP_SNIFF_ENABLED", "true"),           "discovery", "Enable ARP packet sniffing for real-time device detection"),
+    # ── Device Guardian ──
+    ("QUARANTINE_VLAN",  os.environ.get("QUARANTINE_VLAN", "192.168.99.0/24"),              "guardian", "CIDR range used for quarantined devices"),
+    ("TRUSTED_NETWORKS", os.environ.get("TRUSTED_NETWORKS", "192.168.1.0/24"),              "guardian", "Comma-separated list of trusted network ranges"),
+    ("AUTO_QUARANTINE",  os.environ.get("AUTO_QUARANTINE", "true"),                          "guardian", "Automatically quarantine new/unknown devices (true/false)"),
+    # ── IoT Learning ──
+    ("IOT_LEARNING_HOURS", os.environ.get("IOT_LEARNING_HOURS", "48"),  "iot", "Hours a new IoT device spends in the observation group before being moved to the IoT group"),
+    ("PIHOLE_IOT_GROUP",   os.environ.get("PIHOLE_IOT_GROUP", "iot"),   "iot", "Name of the Pi-hole group that IoT devices are placed in after the learning period"),
+    # ── Honeypot ──
+    ("HONEYPOT_PORTS",                    os.environ.get("HONEYPOT_PORTS", "21,22,23,25,53,80,110,135,143,389,443,445,1433,3306,3389,5432,5900,5985,6379,8080,8443,9200,11211,27017"), "honeypot", "Comma-separated list of ports the honeypot listens on"),
+    ("HONEYPOT_IGNORED_NETWORKS",         os.environ.get("HONEYPOT_IGNORED_NETWORKS", "172.16.0.0/12,127.0.0.0/8"), "honeypot", "Comma-separated IPs/CIDRs to silently ignore (e.g. Docker bridge gateway and loopback)"),
+    ("HONEYPOT_THRESHOLD_COUNT",          os.environ.get("HONEYPOT_THRESHOLD_COUNT", "3"),      "honeypot", "Hit count from a single IP within HONEYPOT_THRESHOLD_WINDOW seconds before severity escalation"),
+    ("HONEYPOT_THRESHOLD_WINDOW",         os.environ.get("HONEYPOT_THRESHOLD_WINDOW", "60"),    "honeypot", "Rolling window in seconds for hit-count threshold"),
+    ("HONEYPOT_SWEEP_THRESHOLD",          os.environ.get("HONEYPOT_SWEEP_THRESHOLD", "4"),      "honeypot", "Distinct ports a single IP must probe within the sweep window to be classified as a port sweep"),
+    ("HONEYPOT_SWEEP_WINDOW",             os.environ.get("HONEYPOT_SWEEP_WINDOW", "60"),        "honeypot", "Rolling window in seconds for port-sweep detection"),
+    ("HONEYPOT_RECV_TIMEOUT",             os.environ.get("HONEYPOT_RECV_TIMEOUT", "4"),         "honeypot", "Seconds the honeypot waits for data after sending the banner"),
+    ("HONEYPOT_MAX_PAYLOAD_LENGTH",       os.environ.get("HONEYPOT_MAX_PAYLOAD_LENGTH", "2000"), "honeypot", "Maximum characters stored as payload_preview in the database"),
+    ("HONEYPOT_CREDENTIAL_WINDOW_MULTIPLIER", os.environ.get("HONEYPOT_CREDENTIAL_WINDOW_MULTIPLIER", "5"), "honeypot", "Credential tracking window multiplier (THRESHOLD_WINDOW × this = credential TTL seconds)"),
+    # ── Redirector ──
+    ("REDIRECT_MODE",        os.environ.get("REDIRECT_MODE", "passive"),  "redirector", "Active redirect mode(s): passive, redirect_dns, arp_spoof, dhcp_advertise, dhcp_starvation, gateway_takeover"),
+    ("NETWORK_INTERFACE",    os.environ.get("NETWORK_INTERFACE", "eth0"), "redirector", "Network interface used for ARP/packet operations"),
+    ("GATEWAY_IP",           os.environ.get("GATEWAY_IP", ""),            "redirector", "Default gateway IP (auto-detected from routing table if empty)"),
+    ("PIHOLE_IP",            os.environ.get("PIHOLE_IP", ""),             "redirector", "Pi-hole IP address (defaults to BOX_IP if empty)"),
+    ("BOX_IP",               os.environ.get("BOX_IP", ""),                "redirector", "TheBox's own IP address (auto-detected from NETWORK_INTERFACE if empty)"),
+    ("BLACKHOLE_QUARANTINED", os.environ.get("BLACKHOLE_QUARANTINED", "false"), "redirector", "Drop all traffic from quarantined devices except DHCP and DNS (true/false)"),
+    ("ARP_REFRESH_INTERVAL", os.environ.get("ARP_REFRESH_INTERVAL", "10"), "redirector", "Seconds between ARP refresh packets for active spoof modes"),
+]
+
 # ─── Logging ─────────────────────────────────────────────────────────────────
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
 structlog.configure(
@@ -186,6 +237,15 @@ def ensure_schema():
         "ALTER TABLE honeypot_events ADD COLUMN IF NOT EXISTS intent VARCHAR(32) NOT NULL DEFAULT 'scan'",
         "ALTER TABLE honeypot_events ADD COLUMN IF NOT EXISTS is_sweep BOOLEAN NOT NULL DEFAULT FALSE",
         "ALTER TABLE honeypot_events ADD COLUMN IF NOT EXISTS ports_scanned JSONB",
+        # settings — runtime configuration key/value store
+        """CREATE TABLE IF NOT EXISTS settings (
+            key         VARCHAR(64)  NOT NULL PRIMARY KEY,
+            value       TEXT         NOT NULL,
+            description TEXT,
+            category    VARCHAR(32)  NOT NULL DEFAULT 'general',
+            updated_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_settings_category ON settings(category)",
     ]
     conn = get_db()
     try:
@@ -222,6 +282,72 @@ threading.Thread(target=redis_subscriber_loop, daemon=True).start()
 # Called at module level (not inside if __name__) so the schema is ensured
 # whether the app is run directly or served by a WSGI host (gunicorn, etc.).
 ensure_schema()
+
+
+# ─── Settings helpers ────────────────────────────────────────────────────────
+
+def bootstrap_settings() -> None:
+    """Seed the settings table from environment variables on first startup.
+
+    Each entry in ``_SETTINGS_CATALOGUE`` is inserted only if the key is not
+    already present in the database, so subsequent restarts never overwrite
+    values that were changed via the UI.
+    """
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            for key, default, category, description in _SETTINGS_CATALOGUE:
+                cur.execute(
+                    """INSERT INTO settings (key, value, category, description)
+                       VALUES (%s, %s, %s, %s)
+                       ON CONFLICT (key) DO NOTHING""",
+                    (key, default, category, description),
+                )
+        conn.commit()
+        log.info("settings_bootstrapped")
+    finally:
+        conn.close()
+
+
+def get_setting(key: str, default: str = "") -> str:
+    """Return the current value for *key* from the database.
+
+    Falls back to *default* when the key is absent (which should only happen
+    on a freshly deployed instance before ``bootstrap_settings`` has run).
+    Opens and closes its own connection so callers don't need to pass one in.
+    """
+    try:
+        conn = get_db()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT value FROM settings WHERE key = %s", (key,))
+                row = cur.fetchone()
+                return row["value"] if row else default
+        finally:
+            conn.close()
+    except Exception as exc:
+        log.warning("get_setting_failed", key=key, error=str(exc))
+        return default
+
+
+def _load_runtime_settings() -> None:
+    """Override module-level Pi-hole vars from the database.
+
+    Called once at startup *after* ``bootstrap_settings``.  This ensures that
+    any values updated via the UI survive service restarts, overriding the
+    original environment variables.
+    """
+    global PIHOLE_URL, PIHOLE_PASSWORD
+    db_url = get_setting("PIHOLE_URL", PIHOLE_URL).rstrip("/")
+    db_pw  = get_setting("PIHOLE_PASSWORD", PIHOLE_PASSWORD)
+    if db_url:
+        PIHOLE_URL = db_url
+    if db_pw:
+        PIHOLE_PASSWORD = db_pw
+
+
+bootstrap_settings()
+_load_runtime_settings()
 
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -774,7 +900,7 @@ def api_honeypot_event(event_id: int):
 _pihole_sid_cache: tuple[str, float] | None = None
 _pihole_sid_lock = threading.Lock()
 # Pi-hole v6 sessions last 300 s by default; refresh 60 s before expiry.
-# Tunable via PIHOLE_SID_TTL env var (seconds).
+# Tunable via the PIHOLE_SID_TTL setting in the database (seeded from env var).
 _PIHOLE_SID_TTL = float(os.environ.get("PIHOLE_SID_TTL", "240.0"))
 
 
@@ -912,6 +1038,87 @@ def api_stats():
             "unacked_alerts": unacked,
         }
     )
+
+
+# --- API: Settings ---
+
+# Build a quick-lookup set of valid setting keys from the catalogue.
+_VALID_SETTING_KEYS = {entry[0] for entry in _SETTINGS_CATALOGUE}
+
+
+@app.route("/api/settings")
+def api_settings():
+    """Return all settings grouped by category."""
+    conn = get_db()
+    rows = rows_to_list(conn, "SELECT key, value, category, description, updated_at FROM settings ORDER BY category, key")
+    conn.close()
+    # Group by category for the UI
+    grouped: dict[str, list[dict]] = {}
+    for row in rows:
+        cat = row["category"]
+        grouped.setdefault(cat, []).append(row)
+    return Response(json.dumps(grouped, default=serialize), mimetype="application/json")
+
+
+@app.route("/api/settings/<key>", methods=["PUT"])
+def api_update_setting(key: str):
+    """Update a single setting value."""
+    if key not in _VALID_SETTING_KEYS:
+        return jsonify({"error": f"Unknown setting key: {key}"}), 400
+    data = request.get_json(silent=True) or {}
+    if "value" not in data:
+        return jsonify({"error": "Missing 'value' field"}), 400
+    value = str(data["value"])
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """UPDATE settings SET value = %s, updated_at = NOW()
+                   WHERE key = %s""",
+                (value, key),
+            )
+            if cur.rowcount == 0:
+                conn.close()
+                return jsonify({"error": f"Setting '{key}' not found"}), 404
+        conn.commit()
+    finally:
+        conn.close()
+    # Apply Pi-hole credentials immediately so the current process benefits.
+    if key in ("PIHOLE_URL", "PIHOLE_PASSWORD"):
+        _load_runtime_settings()
+        # Invalidate the cached Pi-hole session so it re-authenticates.
+        global _pihole_sid_cache
+        with _pihole_sid_lock:
+            _pihole_sid_cache = None
+    return jsonify({"ok": True, "key": key, "value": value})
+
+
+@app.route("/api/settings", methods=["PUT"])
+def api_update_settings_bulk():
+    """Update multiple settings at once.  Body: {key: value, ...}"""
+    data = request.get_json(silent=True) or {}
+    if not data:
+        return jsonify({"error": "Empty request body"}), 400
+    unknown = [k for k in data if k not in _VALID_SETTING_KEYS]
+    if unknown:
+        return jsonify({"error": f"Unknown setting keys: {', '.join(unknown)}"}), 400
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            for k, v in data.items():
+                cur.execute(
+                    "UPDATE settings SET value = %s, updated_at = NOW() WHERE key = %s",
+                    (str(v), k),
+                )
+        conn.commit()
+    finally:
+        conn.close()
+    if any(k in ("PIHOLE_URL", "PIHOLE_PASSWORD") for k in data):
+        _load_runtime_settings()
+        global _pihole_sid_cache
+        with _pihole_sid_lock:
+            _pihole_sid_cache = None
+    return jsonify({"ok": True, "updated": list(data.keys())})
 
 
 # --- SSE stream ---

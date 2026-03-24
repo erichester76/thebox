@@ -116,7 +116,31 @@ def ensure_schema():
     log.info("schema_ensured")
 
 
-# ─── iptables / ipset helpers ────────────────────────────────────────────────
+# ─── Settings helpers ────────────────────────────────────────────────────────
+
+def get_setting(key: str, default: str = "") -> str:
+    """Return the current value for *key* from the settings table."""
+    try:
+        conn = get_db()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT value FROM settings WHERE key = %s", (key,))
+                row = cur.fetchone()
+                return row["value"] if row else default
+        finally:
+            conn.close()
+    except Exception as exc:
+        log.warning("get_setting_failed", key=key, error=str(exc))
+        return default
+
+
+def _load_settings() -> None:
+    """Read guardian settings from the database, falling back to env vars."""
+    global QUARANTINE_VLAN, TRUSTED_NETWORKS, AUTO_QUARANTINE
+    QUARANTINE_VLAN  = get_setting("QUARANTINE_VLAN", QUARANTINE_VLAN)
+    TRUSTED_NETWORKS = [n.strip() for n in get_setting("TRUSTED_NETWORKS", ",".join(TRUSTED_NETWORKS)).split(",") if n.strip()]
+    AUTO_QUARANTINE  = get_setting("AUTO_QUARANTINE", str(AUTO_QUARANTINE).lower()).lower() == "true"
+    log.info("settings_loaded", quarantine_vlan=QUARANTINE_VLAN, auto_quarantine=AUTO_QUARANTINE)
 
 # Set to False by bootstrap_iptables() when ipset hash:mac is unavailable.
 # When False, policy is enforced via per-IP iptables rules in THEBOX_POLICY.
@@ -488,6 +512,7 @@ def main():
     log.info("guardian_service_start")
 
     ensure_schema()
+    _load_settings()
 
     # Wait for iptables to be available (may not be in all environments)
     try:
