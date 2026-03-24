@@ -8,42 +8,46 @@
   <div class="card span-3">
     <div class="card-header">
       <h2>Dashboard Overview</h2>
-      <span id="pihole-status-badge" class="unknown" style="margin-left:6px">unknown</span>
       <button class="btn btn-ack ml-auto" onclick="loadStats();loadPihole()">Refresh</button>
     </div>
     <div id="stats-bar">
-      <!-- Device stats group -->
-      <div class="stats-group">
-        <span class="stats-group-label">Devices</span>
-        <div class="stats-group-items">
-          <div class="cstat trusted clickable"      title="Show trusted devices"      onclick="setDeviceFilter('trusted')">     <div class="val" id="s-trusted">–</div>       <div class="lbl">Trusted</div></div>
-          <div class="cstat quarantine clickable"   title="Show quarantined devices"  onclick="setDeviceFilter('quarantined')"> <div class="val" id="s-quarantine">–</div>   <div class="lbl">Quarantined</div></div>
-          <div class="cstat blocked clickable"      title="Show blocked devices"      onclick="setDeviceFilter('blocked')">     <div class="val" id="s-blocked">–</div>       <div class="lbl">Blocked</div></div>
-          <div class="cstat iot clickable"          title="Show IoT devices"          onclick="setDeviceFilter('iot')">         <div class="val" id="s-iot">–</div>           <div class="lbl">IoT</div></div>
-          <div class="cstat iot-learning clickable" title="Show IoT learning devices" onclick="setDeviceFilter('iot_learning')"><div class="val" id="s-iot-learning">–</div>  <div class="lbl">IoT Learning</div></div>
-          <div class="cstat new-dev clickable"      title="Show new devices"          onclick="setDeviceFilter('new')">         <div class="val" id="s-new">–</div>           <div class="lbl">New</div></div>
-          <div class="cstat clickable"              title="Show all devices"          onclick="setDeviceFilter('')">            <div class="val" id="s-total">–</div>         <div class="lbl">Total</div></div>
+      <!-- Row 1: Device stats + Activity stats -->
+      <div class="stats-row">
+        <!-- Device stats group -->
+        <div class="stats-group">
+          <span class="stats-group-label">Devices</span>
+          <div class="stats-group-items">
+            <div class="cstat trusted clickable"      title="Show trusted devices"      onclick="setDeviceFilter('trusted')">     <div class="val" id="s-trusted">–</div>       <div class="lbl">Trusted</div></div>
+            <div class="cstat quarantine clickable"   title="Show quarantined devices"  onclick="setDeviceFilter('quarantined')"> <div class="val" id="s-quarantine">–</div>   <div class="lbl">Quarantined</div></div>
+            <div class="cstat blocked clickable"      title="Show blocked devices"      onclick="setDeviceFilter('blocked')">     <div class="val" id="s-blocked">–</div>       <div class="lbl">Blocked</div></div>
+            <div class="cstat iot clickable"          title="Show IoT devices"          onclick="setDeviceFilter('iot')">         <div class="val" id="s-iot">–</div>           <div class="lbl">IoT</div></div>
+            <div class="cstat iot-learning clickable" title="Show IoT learning devices" onclick="setDeviceFilter('iot_learning')"><div class="val" id="s-iot-learning">–</div>  <div class="lbl">IoT Learning</div></div>
+            <div class="cstat new-dev clickable"      title="Show new devices"          onclick="setDeviceFilter('new')">         <div class="val" id="s-new">–</div>           <div class="lbl">New</div></div>
+            <div class="cstat clickable"              title="Show all devices"          onclick="setDeviceFilter('')">            <div class="val" id="s-total">–</div>         <div class="lbl">Total</div></div>
+          </div>
+        </div>
+        <!-- Activity stats group -->
+        <div class="stats-group">
+          <span class="stats-group-label">Activity</span>
+          <div class="stats-group-items">
+            <div class="cstat honeypot clickable"    title="View all honeypot events"  onclick="window.location='/honeypot'"><div class="val" id="s-honeypot">–</div>    <div class="lbl">HP Hits</div></div>
+            <div class="cstat hp-critical clickable" title="View critical HP events"   onclick="window.location='/honeypot'"><div class="val" id="s-hp-critical">–</div><div class="lbl">HP Critical</div></div>
+            <div class="cstat alerts clickable"      title="Scroll to alerts"          onclick="scrollToAlerts()">           <div class="val" id="s-alerts">–</div>     <div class="lbl">Open Alerts</div></div>
+            <div class="cstat clickable"             title="View scan history"         onclick="window.location='/scans'">   <div class="val" id="s-scans">–</div>      <div class="lbl">Scan Runs</div></div>
+          </div>
         </div>
       </div>
-      <!-- Activity stats group -->
-      <div class="stats-group">
-        <span class="stats-group-label">Activity</span>
-        <div class="stats-group-items">
-          <div class="cstat honeypot clickable"    title="View all honeypot events"  onclick="window.location='/honeypot'"><div class="val" id="s-honeypot">–</div>    <div class="lbl">HP Hits</div></div>
-          <div class="cstat hp-critical clickable" title="View critical HP events"   onclick="window.location='/honeypot'"><div class="val" id="s-hp-critical">–</div><div class="lbl">HP Critical</div></div>
-          <div class="cstat alerts clickable"      title="Scroll to alerts"          onclick="scrollToAlerts()">           <div class="val" id="s-alerts">–</div>     <div class="lbl">Open Alerts</div></div>
-          <div class="cstat clickable"             title="View scan history"         onclick="window.location='/scans'">   <div class="val" id="s-scans">–</div>      <div class="lbl">Scan Runs</div></div>
-        </div>
-      </div>
-      <!-- Pi-hole stats group -->
-      <div class="stats-group">
-        <span class="stats-group-label">Pi-hole DNS</span>
-        <div class="stats-group-items">
-          <div class="cstat">            <div class="val" id="ph-total">–</div>   <div class="lbl">DNS Queries</div></div>
-          <div class="cstat ph-blocked"> <div class="val" id="ph-blocked">–</div> <div class="lbl">DNS Blocked</div></div>
-          <div class="cstat ph-pct">     <div class="val" id="ph-pct">–</div>     <div class="lbl">% Blocked</div></div>
-          <div class="cstat ph-gravity"> <div class="val" id="ph-gravity">–</div> <div class="lbl">Block Lists</div></div>
-          <div class="cstat">            <div class="val" id="ph-clients">–</div> <div class="lbl">DNS Clients</div></div>
+      <!-- Row 2: Pi-hole DNS stats -->
+      <div class="stats-row">
+        <div class="stats-group" style="border-right:none">
+          <span class="stats-group-label" style="display:flex;align-items:center;justify-content:center;gap:6px">Pi-hole DNS <span id="pihole-status-badge" class="unknown">unknown</span></span>
+          <div class="stats-group-items">
+            <div class="cstat">            <div class="val" id="ph-total">–</div>   <div class="lbl">DNS Queries</div></div>
+            <div class="cstat ph-blocked"> <div class="val" id="ph-blocked">–</div> <div class="lbl">DNS Blocked</div></div>
+            <div class="cstat ph-pct">     <div class="val" id="ph-pct">–</div>     <div class="lbl">% Blocked</div></div>
+            <div class="cstat ph-gravity"> <div class="val" id="ph-gravity">–</div> <div class="lbl">Block Lists</div></div>
+            <div class="cstat">            <div class="val" id="ph-clients">–</div> <div class="lbl">DNS Clients</div></div>
+          </div>
         </div>
       </div>
     </div>
@@ -96,56 +100,6 @@
     <div class="card-body scrollable" id="alerts-list"><div class="empty">Loading…</div></div>
   </div>
 
-  <!-- Users management -->
-  <div class="card span-3">
-    <div class="card-header">
-      <h2>Users</h2>
-      <button class="btn btn-ack ml-auto" onclick="loadUsers()">Refresh</button>
-    </div>
-    <div class="card-body">
-      <div class="form-row" style="margin-bottom:16px">
-        <input id="new-username"    type="text"  placeholder="Username *" />
-        <input id="new-displayname" type="text"  placeholder="Display name" />
-        <input id="new-email"       type="email" placeholder="Email" />
-        <button class="btn btn-primary" onclick="createUser()">Add User</button>
-      </div>
-      <div class="scrollable">
-        <table id="users-table">
-          <thead><tr>
-            <th>Username</th><th>Display Name</th><th>Email</th>
-            <th>Groups</th><th>Devices</th><th>Created</th><th>Actions</th>
-          </tr></thead>
-          <tbody id="users-body"><tr><td colspan="7" class="empty">Loading…</td></tr></tbody>
-        </table>
-      </div>
-    </div>
-  </div>
-
-  <!-- Groups management -->
-  <div class="card span-3">
-    <div class="card-header">
-      <h2>Groups</h2>
-      <button class="btn btn-ack ml-auto" onclick="loadGroups()">Refresh</button>
-    </div>
-    <div class="card-body">
-      <div class="form-row" style="margin-bottom:16px">
-        <input id="new-groupname"        type="text" placeholder="Group name *" />
-        <input id="new-groupdesc"        type="text" placeholder="Description" />
-        <input id="new-pihole-groupname" type="text" placeholder="Pi-hole group name" />
-        <button class="btn btn-primary" onclick="createGroup()">Add Group</button>
-      </div>
-      <div class="scrollable">
-        <table id="groups-table">
-          <thead><tr>
-            <th>Name</th><th>Description</th><th>Pi-hole Group</th>
-            <th>Users</th><th>Devices</th><th>Actions</th>
-          </tr></thead>
-          <tbody id="groups-body"><tr><td colspan="6" class="empty">Loading…</td></tr></tbody>
-        </table>
-      </div>
-    </div>
-  </div>
-
 </main>
 {% endblock %}
 
@@ -174,54 +128,6 @@
     <div class="modal-actions">
       <button class="btn btn-ack" onclick="closeNotesModal()">Cancel</button>
       <button class="btn btn-primary" onclick="confirmNotes()">Save</button>
-    </div>
-  </div>
-</div>
-
-<!-- Edit User Modal -->
-<div class="modal-backdrop" id="edit-user-modal">
-  <div class="modal">
-    <h3>Edit User</h3>
-    <input type="hidden" id="edit-user-id" />
-    <label>Display Name</label>
-    <input id="edit-displayname" type="text" placeholder="Display name" />
-    <label>Email</label>
-    <input id="edit-email" type="email" placeholder="Email" />
-    <div class="modal-actions">
-      <button class="btn btn-ack" onclick="closeEditUserModal()">Cancel</button>
-      <button class="btn btn-primary" onclick="confirmEditUser()">Save</button>
-    </div>
-  </div>
-</div>
-
-<!-- Edit Group Modal -->
-<div class="modal-backdrop" id="edit-group-modal">
-  <div class="modal">
-    <h3>Edit Group</h3>
-    <input type="hidden" id="edit-group-id" />
-    <label>Description</label>
-    <input id="edit-group-desc" type="text" placeholder="Description" />
-    <label>Pi-hole Group Name</label>
-    <input id="edit-pihole-groupname" type="text" placeholder="Pi-hole group name" />
-    <div class="modal-actions">
-      <button class="btn btn-ack" onclick="closeEditGroupModal()">Cancel</button>
-      <button class="btn btn-primary" onclick="confirmEditGroup()">Save</button>
-    </div>
-  </div>
-</div>
-
-<!-- Manage Group Members Modal -->
-<div class="modal-backdrop" id="manage-group-modal">
-  <div class="modal">
-    <h3 id="manage-group-title">Manage Group Members</h3>
-    <input type="hidden" id="manage-group-id" />
-    <label>Users</label>
-    <div class="checklist" id="manage-group-users"></div>
-    <label>Devices</label>
-    <div class="checklist" id="manage-group-devices"></div>
-    <div class="modal-actions">
-      <button class="btn btn-ack" onclick="closeManageGroupModal()">Cancel</button>
-      <button class="btn btn-primary" onclick="confirmManageGroup()">Save</button>
     </div>
   </div>
 </div>
@@ -579,307 +485,9 @@ async function ackAllAlerts() {
   loadAlerts(); loadStats();
 }
 
-// ── Users ────────────────────────────────────────────────
-async function loadUsers() {
-  const users = await api('/api/users');
-  const tbody = document.getElementById('users-body');
-  if (!users.length) { tbody.innerHTML = '<tr><td colspan="7" class="empty">No users yet</td></tr>'; return; }
-  tbody.innerHTML = users.map(u => {
-    const groupBadges = (u.groups || []).map(g => `<span class="badge badge-group">${escHtml(g.name)}</span>`).join('');
-    return `
-    <tr>
-      <td style="font-weight:600">${escHtml(u.username)}</td>
-      <td>${escHtml(u.display_name)||'–'}</td>
-      <td>${escHtml(u.email)||'–'}</td>
-      <td>${groupBadges||'<span style="color:var(--muted)">–</span>'}</td>
-      <td>${u.device_count}</td>
-      <td>${fmtDate(u.created_at)}</td>
-      <td>
-        <button class="btn btn-user"
-          data-user-id="${u.id}"
-          data-display-name="${escHtml(u.display_name||'')}"
-          data-email="${escHtml(u.email||'')}"
-          onclick="openEditUserModalFromBtn(this)">Edit</button>
-        <button class="btn btn-danger"
-          data-user-id="${u.id}"
-          data-username="${escHtml(u.username)}"
-          onclick="deleteUserFromBtn(this)">Delete</button>
-      </td>
-    </tr>`;
-  }).join('');
-}
-
-async function createUser() {
-  const username    = document.getElementById('new-username').value.trim();
-  const displayName = document.getElementById('new-displayname').value.trim();
-  const email       = document.getElementById('new-email').value.trim();
-  if (!username) { alert('Username is required.'); return; }
-  try {
-    await api('/api/users', {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({username, display_name: displayName||null, email: email||null})
-    });
-  } catch(e) {
-    let msg = 'Failed to create user.';
-    try { msg = JSON.parse(e.message).error || msg; } catch(_) {}
-    alert(msg);
-    return;
-  }
-  document.getElementById('new-username').value    = '';
-  document.getElementById('new-displayname').value = '';
-  document.getElementById('new-email').value       = '';
-  loadUsers();
-}
-
-function openEditUserModalFromBtn(btn) {
-  openEditUserModal(parseInt(btn.dataset.userId), btn.dataset.displayName, btn.dataset.email);
-}
-
-function openEditUserModal(id, displayName, email) {
-  document.getElementById('edit-user-id').value     = id;
-  document.getElementById('edit-displayname').value = displayName;
-  document.getElementById('edit-email').value       = email;
-  document.getElementById('edit-user-modal').classList.add('open');
-}
-
-function closeEditUserModal() {
-  document.getElementById('edit-user-modal').classList.remove('open');
-}
-
-async function confirmEditUser() {
-  const id          = document.getElementById('edit-user-id').value;
-  const displayName = document.getElementById('edit-displayname').value.trim();
-  const email       = document.getElementById('edit-email').value.trim();
-  try {
-    await api(`/api/users/${id}`, {
-      method:'PUT', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({display_name: displayName||null, email: email||null})
-    });
-  } catch(e) {
-    let msg = 'Failed to update user.';
-    try { msg = JSON.parse(e.message).error || msg; } catch(_) {}
-    alert(msg);
-    return;
-  }
-  closeEditUserModal();
-  loadUsers();
-}
-
-async function deleteUserFromBtn(btn) {
-  deleteUser(parseInt(btn.dataset.userId), btn.dataset.username);
-}
-
-async function deleteUser(id, username) {
-  if (!confirm(`Delete user "${username}"? Their devices will become unassigned.`)) return;
-  try {
-    await api(`/api/users/${id}`, {method:'DELETE'});
-  } catch(e) {
-    let msg = 'Failed to delete user.';
-    try { msg = JSON.parse(e.message).error || msg; } catch(_) {}
-    alert(msg);
-    return;
-  }
-  loadUsers(); loadDevices();
-}
-
-// ── Groups ───────────────────────────────────────────────
-async function loadGroups() {
-  const groups = await api('/api/groups');
-  const tbody = document.getElementById('groups-body');
-  if (!groups.length) { tbody.innerHTML = '<tr><td colspan="6" class="empty">No groups yet</td></tr>'; return; }
-  tbody.innerHTML = groups.map(g => `
-    <tr>
-      <td style="font-weight:600">${escHtml(g.name)}</td>
-      <td>${escHtml(g.description)||'–'}</td>
-      <td>${g.pihole_group_name ? `<span class="badge badge-group">${escHtml(g.pihole_group_name)}</span>` : '<span style="color:var(--muted)">–</span>'}</td>
-      <td>${g.user_count}</td>
-      <td>${g.device_count}</td>
-      <td>
-        <button class="btn btn-user"
-          data-group-id="${g.id}"
-          data-description="${escHtml(g.description||'')}"
-          data-pihole-group-name="${escHtml(g.pihole_group_name||'')}"
-          onclick="openEditGroupModalFromBtn(this)">Edit</button>
-        <button class="btn btn-user"
-          data-group-id="${g.id}"
-          data-group-name="${escHtml(g.name)}"
-          onclick="openManageGroupModalFromBtn(this)">Members</button>
-        <button class="btn btn-danger"
-          data-group-id="${g.id}"
-          data-group-name="${escHtml(g.name)}"
-          onclick="deleteGroupFromBtn(this)">Delete</button>
-      </td>
-    </tr>`).join('');
-}
-
-async function createGroup() {
-  const name            = document.getElementById('new-groupname').value.trim();
-  const description     = document.getElementById('new-groupdesc').value.trim();
-  const piholeGroupName = document.getElementById('new-pihole-groupname').value.trim();
-  if (!name) { alert('Group name is required.'); return; }
-  try {
-    await api('/api/groups', {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({name, description: description||null, pihole_group_name: piholeGroupName||null})
-    });
-  } catch(e) {
-    let msg = 'Failed to create group.';
-    try { msg = JSON.parse(e.message).error || msg; } catch(_) {}
-    alert(msg);
-    return;
-  }
-  document.getElementById('new-groupname').value        = '';
-  document.getElementById('new-groupdesc').value        = '';
-  document.getElementById('new-pihole-groupname').value = '';
-  loadGroups();
-}
-
-function openEditGroupModalFromBtn(btn) {
-  openEditGroupModal(parseInt(btn.dataset.groupId), btn.dataset.description, btn.dataset.piholeGroupName);
-}
-
-function openEditGroupModal(id, description, piholeGroupName) {
-  document.getElementById('edit-group-id').value         = id;
-  document.getElementById('edit-group-desc').value       = description;
-  document.getElementById('edit-pihole-groupname').value = piholeGroupName;
-  document.getElementById('edit-group-modal').classList.add('open');
-}
-
-function closeEditGroupModal() {
-  document.getElementById('edit-group-modal').classList.remove('open');
-}
-
-async function confirmEditGroup() {
-  const id              = document.getElementById('edit-group-id').value;
-  const description     = document.getElementById('edit-group-desc').value.trim();
-  const piholeGroupName = document.getElementById('edit-pihole-groupname').value.trim();
-  try {
-    await api(`/api/groups/${id}`, {
-      method:'PUT', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({description: description||null, pihole_group_name: piholeGroupName||null})
-    });
-  } catch(e) {
-    let msg = 'Failed to update group.';
-    try { msg = JSON.parse(e.message).error || msg; } catch(_) {}
-    alert(msg);
-    return;
-  }
-  closeEditGroupModal();
-  loadGroups();
-}
-
-async function deleteGroupFromBtn(btn) {
-  deleteGroup(parseInt(btn.dataset.groupId), btn.dataset.groupName);
-}
-
-async function deleteGroup(id, name) {
-  if (!confirm(`Delete group "${name}"? Members will be unlinked.`)) return;
-  try {
-    await api(`/api/groups/${id}`, {method:'DELETE'});
-  } catch(e) {
-    let msg = 'Failed to delete group.';
-    try { msg = JSON.parse(e.message).error || msg; } catch(_) {}
-    alert(msg);
-    return;
-  }
-  loadGroups(); loadUsers(); loadDevices();
-}
-
-// ── Manage group members modal ──────────────────────────────────
-async function openManageGroupModalFromBtn(btn) {
-  openManageGroupModal(parseInt(btn.dataset.groupId), btn.dataset.groupName);
-}
-
-async function openManageGroupModal(groupId, groupName) {
-  document.getElementById('manage-group-id').value          = groupId;
-  document.getElementById('manage-group-title').textContent = `Manage Members — ${groupName}`;
-
-  const [allUsers, allDevices, memberUsers, memberDevices] = await Promise.all([
-    api('/api/users'),
-    api('/api/devices'),
-    api(`/api/groups/${groupId}/users`),
-    api(`/api/groups/${groupId}/devices`),
-  ]);
-
-  const memberUserIds   = new Set(memberUsers.map(u => u.id));
-  const memberDeviceIds = new Set(memberDevices.map(d => d.id));
-
-  const usersEl = document.getElementById('manage-group-users');
-  usersEl.innerHTML = allUsers.length
-    ? allUsers.map(u => `
-        <label>
-          <input type="checkbox" value="${u.id}" ${memberUserIds.has(u.id)?'checked':''} />
-          ${escHtml(u.display_name||u.username)} (@${escHtml(u.username)})
-        </label>`).join('')
-    : '<span style="color:var(--muted);font-size:12px">No users</span>';
-
-  const devicesEl = document.getElementById('manage-group-devices');
-  devicesEl.innerHTML = allDevices.length
-    ? allDevices.map(d => `
-        <label>
-          <input type="checkbox" value="${d.id}" ${memberDeviceIds.has(d.id)?'checked':''} />
-          ${escHtml(d.ip_address||d.mac_address)} ${d.hostname ? `(${escHtml(d.hostname)})` : ''}
-        </label>`).join('')
-    : '<span style="color:var(--muted);font-size:12px">No devices</span>';
-
-  document.getElementById('manage-group-modal').classList.add('open');
-}
-
-function closeManageGroupModal() {
-  document.getElementById('manage-group-modal').classList.remove('open');
-}
-
-async function confirmManageGroup() {
-  const groupId = document.getElementById('manage-group-id').value;
-
-  const userChecks   = document.querySelectorAll('#manage-group-users input[type=checkbox]');
-  const deviceChecks = document.querySelectorAll('#manage-group-devices input[type=checkbox]');
-
-  const [currentMembers, currentDevices] = await Promise.all([
-    api(`/api/groups/${groupId}/users`),
-    api(`/api/groups/${groupId}/devices`),
-  ]);
-  const currentUserIds   = new Set(currentMembers.map(u => u.id));
-  const currentDeviceIds = new Set(currentDevices.map(d => d.id));
-
-  const ops = [];
-  userChecks.forEach(cb => {
-    const uid = parseInt(cb.value);
-    if (cb.checked && !currentUserIds.has(uid))
-      ops.push(api(`/api/groups/${groupId}/users/${uid}`, {method:'PUT'}));
-    else if (!cb.checked && currentUserIds.has(uid))
-      ops.push(api(`/api/groups/${groupId}/users/${uid}`, {method:'DELETE'}));
-  });
-  deviceChecks.forEach(cb => {
-    const did = parseInt(cb.value);
-    if (cb.checked && !currentDeviceIds.has(did))
-      ops.push(api(`/api/groups/${groupId}/devices/${did}`, {method:'PUT'}));
-    else if (!cb.checked && currentDeviceIds.has(did))
-      ops.push(api(`/api/groups/${groupId}/devices/${did}`, {method:'DELETE'}));
-  });
-
-  try { await Promise.all(ops); } catch(e) {
-    let msg = 'Failed to save group members.';
-    try { msg = JSON.parse(e.message).error || msg; } catch(_) {}
-    alert(msg);
-    return;
-  }
-  closeManageGroupModal();
-  loadGroups(); loadUsers(); loadDevices();
-}
-
 // ── Close modals on backdrop click ───────────────────────────────
 document.getElementById('assign-modal').addEventListener('click', function(e) {
   if (e.target === this) closeAssignModal();
-});
-document.getElementById('edit-user-modal').addEventListener('click', function(e) {
-  if (e.target === this) closeEditUserModal();
-});
-document.getElementById('edit-group-modal').addEventListener('click', function(e) {
-  if (e.target === this) closeEditGroupModal();
-});
-document.getElementById('manage-group-modal').addEventListener('click', function(e) {
-  if (e.target === this) closeManageGroupModal();
 });
 document.getElementById('notes-modal').addEventListener('click', function(e) {
   if (e.target === this) closeNotesModal();
@@ -890,7 +498,7 @@ document.getElementById('device-detail-modal').addEventListener('click', functio
 
 // ── Bootstrap ────────────────────────────────────────────────
 (async () => {
-  await Promise.all([loadStats(), loadPihole(), loadDevices(), loadAlerts(), loadUsers(), loadGroups()]);
+  await Promise.all([loadStats(), loadPihole(), loadDevices(), loadAlerts()]);
   connectSSE((ev) => {
     if (ev.type === 'new_device') { loadDevices(); loadStats(); loadAlerts(); }
     if (ev.type === 'device_status_changed') { loadDevices(); loadStats(); }
