@@ -186,6 +186,17 @@ def ensure_schema():
         "ALTER TABLE honeypot_events ADD COLUMN IF NOT EXISTS intent VARCHAR(32) NOT NULL DEFAULT 'scan'",
         "ALTER TABLE honeypot_events ADD COLUMN IF NOT EXISTS is_sweep BOOLEAN NOT NULL DEFAULT FALSE",
         "ALTER TABLE honeypot_events ADD COLUMN IF NOT EXISTS ports_scanned JSONB",
+        # scan_runs — populated by discovery after each nmap scan cycle
+        """CREATE TABLE IF NOT EXISTS scan_runs (
+            id              SERIAL PRIMARY KEY,
+            started_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            finished_at     TIMESTAMPTZ,
+            network_range   VARCHAR(64) NOT NULL,
+            devices_found   INTEGER NOT NULL DEFAULT 0,
+            new_devices     INTEGER NOT NULL DEFAULT 0,
+            status          VARCHAR(32) NOT NULL DEFAULT 'running'
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_scan_runs_started ON scan_runs(started_at)",
     ]
     conn = get_db()
     try:
@@ -727,6 +738,21 @@ def api_honeypot():
     rows = rows_to_list(
         conn,
         "SELECT * FROM honeypot_events ORDER BY created_at DESC LIMIT 200",
+    )
+    conn.close()
+    return Response(json.dumps(rows, default=serialize), mimetype="application/json")
+
+
+# --- API: Scan runs ---
+
+@app.route("/api/scan-runs")
+def api_scan_runs():
+    conn = get_db()
+    rows = rows_to_list(
+        conn,
+        """SELECT id, started_at, finished_at, network_range,
+                  devices_found, new_devices, status
+           FROM scan_runs ORDER BY started_at DESC LIMIT 100""",
     )
     conn.close()
     return Response(json.dumps(rows, default=serialize), mimetype="application/json")
