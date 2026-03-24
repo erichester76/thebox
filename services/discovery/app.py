@@ -198,7 +198,7 @@ def get_redis():
 # ─── Schema bootstrap ────────────────────────────────────────────────────────
 
 _MIGRATIONS_DIR = "/app/migrations"
-REQUIRED_MIGRATIONS = ["0001", "0002", "0003"]
+REQUIRED_MIGRATIONS = ["0001", "0002", "0003", "0006"]
 
 
 def apply_migrations(required_versions):
