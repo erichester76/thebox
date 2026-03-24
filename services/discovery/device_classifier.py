@@ -35,14 +35,15 @@ When the model is not found or confidence is below *RF_MIN_CONFIDENCE*
 
 from __future__ import annotations
 
-import logging
 import os
 from typing import TYPE_CHECKING
+
+import structlog
 
 if TYPE_CHECKING:
     pass
 
-log = logging.getLogger(__name__)
+log = structlog.get_logger()
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
