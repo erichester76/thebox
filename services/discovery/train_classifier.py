@@ -364,16 +364,22 @@ def _build_samples_from_fingerbank_db(path: str) -> tuple[list[list[float]], lis
 
         curl -k -o fingerbank.db "https://api.fingerbank.org/api/v2/download/db?key=<YOUR_API_KEY>"
 
-    Expected schema:
+    Actual schema used:
 
-    * ``devices``         – columns: ``id``, ``name``, ``parent_id``
-    * ``dhcp_fingerprints`` – columns: ``id``, ``value``, ``device_id``
+    * ``device``           – ``id``, ``name``, ``parent_id`` (device-type hierarchy)
+    * ``dhcp_fingerprint`` – ``id``, ``value``, ``ignored``  (DHCP opt-55 strings)
+    * ``mac_vendor``       – ``id``, ``name``                (OUI vendor names)
+    * ``combination``      – ``dhcp_fingerprint_id``, ``mac_vendor_id``, ``device_id``
+                             (links fingerprints + vendor to a classified device)
 
-    This function walks the ``devices`` hierarchy to resolve a root-category
-    label for each fingerprint row and emits (features, label) pairs that use
-    the same :func:`extract_features` contract as the synthetic dataset.
-    Only rows whose root parent maps to a known :data:`DEVICE_TYPES` label
-    are included.
+    Each ``combination`` row becomes one training sample.  The DHCP option-55
+    string comes from the joined ``dhcp_fingerprint`` row; the vendor name comes
+    from the joined ``mac_vendor`` row (may be NULL).  The device label is
+    resolved by walking the ``device`` hierarchy until a root node whose
+    ``name`` matches a known :data:`DEVICE_TYPES` category is found.
+
+    Rows are deduplicated on ``(dhcp_fp, vendor, device_id)`` to avoid
+    inflating the training set with repeated identical combinations.
     """
     # Rough top-level Fingerbank category name → our label mapping.
     _FB_CATEGORY_MAP = {
@@ -407,13 +413,13 @@ def _build_samples_from_fingerbank_db(path: str) -> tuple[list[list[float]], lis
     # Build device-id → {name, parent_id} index.
     devices: dict[int, dict] = {}
     try:
-        for row in con.execute("SELECT id, name, parent_id FROM devices"):
+        for row in con.execute("SELECT id, name, parent_id FROM device"):
             devices[row["id"]] = {
                 "name": (row["name"] or "").lower(),
                 "parent": row["parent_id"],
             }
     except sqlite3.OperationalError as exc:
-        log.error("fingerbank_db_devices_error error=%s", exc)
+        log.error("fingerbank_db_device_error error=%s", exc)
         con.close()
         return [], []
 
@@ -431,30 +437,58 @@ def _build_samples_from_fingerbank_db(path: str) -> tuple[list[list[float]], lis
             did = parent
         return None
 
+    # Join combination → dhcp_fingerprint (for the opt-55 string) and
+    # mac_vendor (for the OUI vendor name).  Rows with ignored fingerprints
+    # or no device_id are excluded by the WHERE clause.
+    _QUERY = """
+        SELECT
+            df.value  AS dhcp_fp,
+            mv.name   AS vendor_name,
+            c.device_id
+        FROM combination c
+        LEFT JOIN dhcp_fingerprint df ON df.id = c.dhcp_fingerprint_id
+        LEFT JOIN mac_vendor        mv ON mv.id = c.mac_vendor_id
+        WHERE c.device_id IS NOT NULL
+          AND (df.ignored IS NULL OR df.ignored = 0)
+    """
+
     X: list[list[float]] = []
     y: list[str] = []
     skipped = 0
+    seen_samples: set[tuple] = set()
     try:
-        for row in con.execute("SELECT value, device_id FROM dhcp_fingerprints"):
-            dhcp_fp: str = row["value"] or ""
-            if not dhcp_fp:
+        for row in con.execute(_QUERY):
+            dhcp_fp: str = row["dhcp_fp"] or ""
+            vendor: str | None = row["vendor_name"] or None
+            device_id: int = row["device_id"]
+
+            # Skip combinations that carry no useful signal at all.
+            if not dhcp_fp and vendor is None:
                 skipped += 1
                 continue
-            device_id = row["device_id"]
-            label = _root_category(device_id) if device_id is not None else None
+
+            label = _root_category(device_id)
             if label is None:
                 skipped += 1
                 continue
+
+            # Deduplicate identical (dhcp_fp, vendor, device_id) tuples.
+            key = (dhcp_fp, vendor, device_id)
+            if key in seen_samples:
+                skipped += 1
+                continue
+            seen_samples.add(key)
+
             feats = extract_features(
-                vendor=None,
+                vendor=vendor,
                 open_ports=[],
                 extra_info=None,
-                dhcp_fingerprint=dhcp_fp,
+                dhcp_fingerprint=dhcp_fp if dhcp_fp else None,
             )
             X.append(feats)
             y.append(label)
     except sqlite3.OperationalError as exc:
-        log.error("fingerbank_db_fingerprints_error error=%s", exc)
+        log.error("fingerbank_db_combination_error error=%s", exc)
     finally:
         con.close()
 
