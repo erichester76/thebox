@@ -368,18 +368,23 @@ def _build_samples_from_fingerbank_db(path: str) -> tuple[list[list[float]], lis
 
     * ``device``           – ``id``, ``name``, ``parent_id`` (device-type hierarchy)
     * ``dhcp_fingerprint`` – ``id``, ``value``, ``ignored``  (DHCP opt-55 strings)
-    * ``mac_vendor``       – ``id``, ``name``                (OUI vendor names)
+    * ``mac_vendor``       – ``id``, ``name``, ``device_id`` (OUI vendor names, direct device link)
     * ``combination``      – ``dhcp_fingerprint_id``, ``mac_vendor_id``, ``device_id``
                              (links fingerprints + vendor to a classified device)
 
-    Each ``combination`` row becomes one training sample.  The DHCP option-55
-    string comes from the joined ``dhcp_fingerprint`` row; the vendor name comes
-    from the joined ``mac_vendor`` row (may be NULL).  The device label is
-    resolved by walking the ``device`` hierarchy until a root node whose
-    ``name`` matches a known :data:`DEVICE_TYPES` category is found.
+    Two sources of labeled samples are used:
 
-    Rows are deduplicated on ``(dhcp_fp, vendor, device_id)`` to avoid
-    inflating the training set with repeated identical combinations.
+    1. **combination** (primary) – each row joins ``dhcp_fingerprint`` and
+       ``mac_vendor`` to produce a sample carrying both the DHCP opt-55 string
+       and the vendor name.  This table may be empty in some DB snapshots; the
+       loader handles that gracefully.
+    2. **mac_vendor** (fallback) – rows whose ``device_id`` is non-NULL provide
+       vendor-only samples.  This is always populated and ensures the model
+       receives vendor signal even when ``combination`` is empty.
+
+    Both sources share a deduplication set keyed on ``(dhcp_fp, vendor,
+    device_id)`` so vendor entries already covered by ``combination`` rows are
+    not double-counted.
     """
     # Rough top-level Fingerbank category name → our label mapping.
     _FB_CATEGORY_MAP = {
@@ -439,8 +444,10 @@ def _build_samples_from_fingerbank_db(path: str) -> tuple[list[list[float]], lis
 
     # Join combination → dhcp_fingerprint (for the opt-55 string) and
     # mac_vendor (for the OUI vendor name).  Rows with ignored fingerprints
-    # or no device_id are excluded by the WHERE clause.
-    _QUERY = """
+    # or no device_id are excluded by the WHERE clause.  This table may be
+    # empty in some DB snapshots; errors are logged and we fall through to
+    # the mac_vendor fallback below.
+    _COMBO_QUERY = """
         SELECT
             df.value  AS dhcp_fp,
             mv.name   AS vendor_name,
@@ -457,7 +464,7 @@ def _build_samples_from_fingerbank_db(path: str) -> tuple[list[list[float]], lis
     skipped = 0
     seen_samples: set[tuple] = set()
     try:
-        for row in con.execute(_QUERY):
+        for row in con.execute(_COMBO_QUERY):
             dhcp_fp: str = row["dhcp_fp"] or ""
             vendor: str | None = row["vendor_name"] or None
             device_id: int = row["device_id"]
@@ -489,10 +496,54 @@ def _build_samples_from_fingerbank_db(path: str) -> tuple[list[list[float]], lis
             y.append(label)
     except sqlite3.OperationalError as exc:
         log.error("fingerbank_db_combination_error error=%s", exc)
+
+    combo_loaded = len(y)
+    log.info("fingerbank_db_combination_loaded count=%d", combo_loaded)
+
+    # Fallback: pull vendor-only samples directly from mac_vendor.device_id.
+    # This table is always populated and is the only source of labelled data
+    # when combination is empty.
+    try:
+        for row in con.execute(
+            "SELECT name, device_id FROM mac_vendor WHERE device_id IS NOT NULL"
+        ):
+            vendor: str | None = (row["name"] or "").strip() or None
+            device_id: int = row["device_id"]
+            if vendor is None:
+                skipped += 1
+                continue
+
+            label = _root_category(device_id)
+            if label is None:
+                skipped += 1
+                continue
+
+            key = ("", vendor, device_id)
+            if key in seen_samples:
+                skipped += 1
+                continue
+            seen_samples.add(key)
+
+            feats = extract_features(
+                vendor=vendor,
+                open_ports=[],
+                extra_info=None,
+                dhcp_fingerprint=None,
+            )
+            X.append(feats)
+            y.append(label)
+    except sqlite3.OperationalError as exc:
+        log.error("fingerbank_db_mac_vendor_error error=%s", exc)
     finally:
         con.close()
 
-    log.info("fingerbank_db_load_done loaded=%d skipped=%d", len(y), skipped)
+    log.info(
+        "fingerbank_db_load_done loaded=%d combo=%d mac_vendor=%d skipped=%d",
+        len(y),
+        combo_loaded,
+        len(y) - combo_loaded,
+        skipped,
+    )
     return X, y
 
 
