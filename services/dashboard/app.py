@@ -6,6 +6,7 @@ services.  Uses Server-Sent Events (SSE) to push live alerts to the browser
 and exposes a REST API for the front-end JavaScript.
 """
 
+import functools
 import json
 import logging
 import os
@@ -19,7 +20,8 @@ import psycopg2.extras
 import redis
 import requests
 import structlog
-from flask import Flask, Response, jsonify, render_template, request
+from flask import Flask, Response, jsonify, redirect, render_template, request, session, url_for
+from werkzeug.security import check_password_hash, generate_password_hash
 
 # ─── Configuration ───────────────────────────────────────────────────────────
 DATABASE_URL = os.environ["DATABASE_URL"]
@@ -186,6 +188,8 @@ def ensure_schema():
         "ALTER TABLE honeypot_events ADD COLUMN IF NOT EXISTS intent VARCHAR(32) NOT NULL DEFAULT 'scan'",
         "ALTER TABLE honeypot_events ADD COLUMN IF NOT EXISTS is_sweep BOOLEAN NOT NULL DEFAULT FALSE",
         "ALTER TABLE honeypot_events ADD COLUMN IF NOT EXISTS ports_scanned JSONB",
+        # Migration: add password_hash for dashboard login
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash VARCHAR(255)",
     ]
     conn = get_db()
     try:
@@ -239,9 +243,59 @@ def serialize(obj):
     raise TypeError(f"Type {type(obj)} not serialisable")
 
 
+def login_required(f):
+    """Decorator that enforces an active session.
+
+    API routes (path starts with /api/) receive a JSON 401 response.
+    Browser routes are redirected to /login.
+    """
+    @functools.wraps(f)
+    def wrapper(*args, **kwargs):
+        if not session.get("user_id"):
+            if request.path.startswith("/api/"):
+                return jsonify({"error": "authentication required"}), 401
+            return redirect(url_for("login", next=request.path))
+        return f(*args, **kwargs)
+    return wrapper
+
+
 # ─── Routes ──────────────────────────────────────────────────────────────────
 
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    error = None
+    if request.method == "POST":
+        username = (request.form.get("username") or "").strip()
+        password = request.form.get("password") or ""
+        conn = get_db()
+        rows = rows_to_list(
+            conn,
+            "SELECT id, username, display_name, password_hash FROM users WHERE username=%s",
+            (username,),
+        )
+        conn.close()
+        if rows and rows[0].get("password_hash") and check_password_hash(rows[0]["password_hash"], password):
+            session.clear()
+            session["user_id"] = rows[0]["id"]
+            session["username"] = rows[0]["username"]
+            session["display_name"] = rows[0]["display_name"] or rows[0]["username"]
+            next_url = request.form.get("next") or request.args.get("next") or ""
+            # Guard against open-redirect: only allow relative paths on this host.
+            if not next_url or not next_url.startswith("/") or next_url.startswith("//"):
+                next_url = url_for("index")
+            return redirect(next_url)
+        error = "Invalid username or password."
+    return render_template("login.html", error=error, next=request.args.get("next", ""))
+
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
+
+
 @app.route("/")
+@login_required
 def index():
     return render_template("index.html")
 
@@ -249,6 +303,7 @@ def index():
 # --- API: Devices ---
 
 @app.route("/api/devices")
+@login_required
 def api_devices():
     conn = get_db()
     rows = rows_to_list(
@@ -272,6 +327,7 @@ def api_devices():
 
 
 @app.route("/api/devices/<int:device_id>", methods=["GET"])
+@login_required
 def api_device(device_id: int):
     conn = get_db()
     rows = rows_to_list(
@@ -291,6 +347,7 @@ def api_device(device_id: int):
 
 
 @app.route("/api/devices/<int:device_id>/status", methods=["PUT"])
+@login_required
 def api_set_device_status(device_id: int):
     """Allow the UI to trust / quarantine / block / promote-to-IoT a device.
 
@@ -373,6 +430,7 @@ def api_set_device_status(device_id: int):
 
 
 @app.route("/api/devices/<int:device_id>/iot-allowlist", methods=["GET"])
+@login_required
 def api_iot_allowlist(device_id: int):
     conn = get_db()
     rows = rows_to_list(conn, "SELECT * FROM iot_allowlist WHERE device_id=%s ORDER BY fqdn", (device_id,))
@@ -381,6 +439,7 @@ def api_iot_allowlist(device_id: int):
 
 
 @app.route("/api/devices/<int:device_id>/iot-allowlist", methods=["POST"])
+@login_required
 def api_iot_allowlist_add(device_id: int):
     body = request.get_json(force=True)
     fqdn = (body.get("fqdn") or "").strip()
@@ -398,6 +457,7 @@ def api_iot_allowlist_add(device_id: int):
 
 
 @app.route("/api/devices/<int:device_id>/iot-allowlist/<int:entry_id>", methods=["DELETE"])
+@login_required
 def api_iot_allowlist_remove(device_id: int, entry_id: int):
     conn = get_db()
     with conn.cursor() as cur:
@@ -408,6 +468,7 @@ def api_iot_allowlist_remove(device_id: int, entry_id: int):
 
 
 @app.route("/api/devices/<int:device_id>/owner", methods=["PUT"])
+@login_required
 def api_set_device_owner(device_id: int):
     """Assign or unassign a user as the owner of a device."""
     body = request.get_json(force=True)
@@ -438,6 +499,7 @@ def api_set_device_owner(device_id: int):
 # --- API: Users ---
 
 @app.route("/api/users")
+@login_required
 def api_users():
     conn = get_db()
     rows = rows_to_list(
@@ -461,6 +523,7 @@ def api_users():
 
 
 @app.route("/api/users/<int:user_id>", methods=["GET"])
+@login_required
 def api_user(user_id: int):
     conn = get_db()
     rows = rows_to_list(conn, "SELECT * FROM users WHERE id=%s", (user_id,))
@@ -471,11 +534,14 @@ def api_user(user_id: int):
 
 
 @app.route("/api/users", methods=["POST"])
+@login_required
 def api_create_user():
     body = request.get_json(force=True)
     username = (body.get("username") or "").strip()
     display_name = (body.get("display_name") or "").strip() or None
     email = (body.get("email") or "").strip() or None
+    password = (body.get("password") or "").strip()
+    password_hash = generate_password_hash(password) if password else None
 
     if not username:
         return jsonify({"error": "username required"}), 400
@@ -484,8 +550,8 @@ def api_create_user():
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO users (username, display_name, email) VALUES (%s,%s,%s) RETURNING id",
-                (username, display_name, email),
+                "INSERT INTO users (username, display_name, email, password_hash) VALUES (%s,%s,%s,%s) RETURNING id",
+                (username, display_name, email, password_hash),
             )
             new_id = cur.fetchone()["id"]
         conn.commit()
@@ -498,17 +564,25 @@ def api_create_user():
 
 
 @app.route("/api/users/<int:user_id>", methods=["PUT"])
+@login_required
 def api_update_user(user_id: int):
     body = request.get_json(force=True)
     display_name = (body.get("display_name") or "").strip() or None
     email = (body.get("email") or "").strip() or None
+    password = (body.get("password") or "").strip()
 
     conn = get_db()
     with conn.cursor() as cur:
-        cur.execute(
-            "UPDATE users SET display_name=%s, email=%s, updated_at=NOW() WHERE id=%s RETURNING id",
-            (display_name, email, user_id),
-        )
+        if password:
+            cur.execute(
+                "UPDATE users SET display_name=%s, email=%s, password_hash=%s, updated_at=NOW() WHERE id=%s RETURNING id",
+                (display_name, email, generate_password_hash(password), user_id),
+            )
+        else:
+            cur.execute(
+                "UPDATE users SET display_name=%s, email=%s, updated_at=NOW() WHERE id=%s RETURNING id",
+                (display_name, email, user_id),
+            )
         if cur.rowcount == 0:
             conn.close()
             return jsonify({"error": "not found"}), 404
@@ -518,6 +592,7 @@ def api_update_user(user_id: int):
 
 
 @app.route("/api/users/<int:user_id>", methods=["DELETE"])
+@login_required
 def api_delete_user(user_id: int):
     conn = get_db()
     with conn.cursor() as cur:
@@ -533,6 +608,7 @@ def api_delete_user(user_id: int):
 # --- API: Groups ---
 
 @app.route("/api/groups")
+@login_required
 def api_groups():
     conn = get_db()
     rows = rows_to_list(
@@ -553,6 +629,7 @@ def api_groups():
 
 
 @app.route("/api/groups/<int:group_id>", methods=["GET"])
+@login_required
 def api_group(group_id: int):
     conn = get_db()
     rows = rows_to_list(conn, "SELECT * FROM groups WHERE id=%s", (group_id,))
@@ -563,6 +640,7 @@ def api_group(group_id: int):
 
 
 @app.route("/api/groups", methods=["POST"])
+@login_required
 def api_create_group():
     body = request.get_json(force=True)
     name = (body.get("name") or "").strip()
@@ -590,6 +668,7 @@ def api_create_group():
 
 
 @app.route("/api/groups/<int:group_id>", methods=["PUT"])
+@login_required
 def api_update_group(group_id: int):
     body = request.get_json(force=True)
     description = (body.get("description") or "").strip() or None
@@ -610,6 +689,7 @@ def api_update_group(group_id: int):
 
 
 @app.route("/api/groups/<int:group_id>", methods=["DELETE"])
+@login_required
 def api_delete_group(group_id: int):
     conn = get_db()
     with conn.cursor() as cur:
@@ -623,6 +703,7 @@ def api_delete_group(group_id: int):
 
 
 @app.route("/api/groups/<int:group_id>/users", methods=["GET"])
+@login_required
 def api_group_users(group_id: int):
     conn = get_db()
     rows = rows_to_list(
@@ -640,6 +721,7 @@ def api_group_users(group_id: int):
 
 
 @app.route("/api/groups/<int:group_id>/users/<int:user_id>", methods=["PUT"])
+@login_required
 def api_group_add_user(group_id: int, user_id: int):
     conn = get_db()
     with conn.cursor() as cur:
@@ -650,6 +732,7 @@ def api_group_add_user(group_id: int, user_id: int):
 
 
 @app.route("/api/groups/<int:group_id>/users/<int:user_id>", methods=["DELETE"])
+@login_required
 def api_group_remove_user(group_id: int, user_id: int):
     conn = get_db()
     with conn.cursor() as cur:
@@ -660,6 +743,7 @@ def api_group_remove_user(group_id: int, user_id: int):
 
 
 @app.route("/api/groups/<int:group_id>/devices", methods=["GET"])
+@login_required
 def api_group_devices(group_id: int):
     conn = get_db()
     rows = rows_to_list(
@@ -677,6 +761,7 @@ def api_group_devices(group_id: int):
 
 
 @app.route("/api/groups/<int:group_id>/devices/<int:device_id>", methods=["PUT"])
+@login_required
 def api_group_add_device(group_id: int, device_id: int):
     conn = get_db()
     with conn.cursor() as cur:
@@ -687,6 +772,7 @@ def api_group_add_device(group_id: int, device_id: int):
 
 
 @app.route("/api/groups/<int:group_id>/devices/<int:device_id>", methods=["DELETE"])
+@login_required
 def api_group_remove_device(group_id: int, device_id: int):
     conn = get_db()
     with conn.cursor() as cur:
@@ -699,6 +785,7 @@ def api_group_remove_device(group_id: int, device_id: int):
 # --- API: Alerts ---
 
 @app.route("/api/alerts")
+@login_required
 def api_alerts():
     conn = get_db()
     rows = rows_to_list(
@@ -710,6 +797,7 @@ def api_alerts():
 
 
 @app.route("/api/alerts/<int:alert_id>/acknowledge", methods=["PUT"])
+@login_required
 def api_ack_alert(alert_id: int):
     conn = get_db()
     with conn.cursor() as cur:
@@ -722,6 +810,7 @@ def api_ack_alert(alert_id: int):
 # --- API: Honeypot events ---
 
 @app.route("/api/honeypot")
+@login_required
 def api_honeypot():
     conn = get_db()
     rows = rows_to_list(
@@ -755,6 +844,7 @@ def iot_allowlist_txt():
     return Response(text, mimetype="text/plain")
   
 @app.route("/api/honeypot/<int:event_id>")
+@login_required
 def api_honeypot_event(event_id: int):
     conn = get_db()
     rows = rows_to_list(
@@ -869,6 +959,7 @@ def get_pihole_stats() -> dict:
 # --- API: Pi-hole statistics ---
 
 @app.route("/api/pihole")
+@login_required
 def api_pihole():
     stats = get_pihole_stats()
     if not stats:
@@ -879,6 +970,7 @@ def api_pihole():
 # --- API: Stats summary ---
 
 @app.route("/api/stats")
+@login_required
 def api_stats():
     conn = get_db()
     with conn.cursor() as cur:

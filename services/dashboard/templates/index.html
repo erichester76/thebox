@@ -276,6 +276,7 @@
   <span style="margin-left:auto;display:flex;align-items:center;gap:12px;font-size:12px;color:var(--muted)">
     <span style="display:flex;align-items:center"><span id="live-dot"></span><span id="live-label">Connecting…</span></span>
     <button id="theme-toggle" onclick="toggleTheme()" title="Toggle dark/light mode">☀️</button>
+    <a href="/logout" style="color:var(--muted);text-decoration:none;padding:4px 8px;border:1px solid var(--border);border-radius:4px;" title="Sign out">Sign out</a>
   </span>
 </header>
 
@@ -505,6 +506,7 @@ applyTheme(localStorage.getItem('thebox-theme') || 'dark');
 // ── API helpers ──────────────────────────────────────────────────────────────
 async function api(path, opts={}) {
   const r = await fetch(path, opts);
+  if (r.status === 401) { window.location.href = '/login'; throw new Error('Unauthenticated'); }
   if (!r.ok) throw new Error(await r.text());
   return r.json();
 }
