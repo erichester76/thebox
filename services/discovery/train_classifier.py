@@ -449,11 +449,16 @@ def _build_samples_from_fingerbank_api(
 ) -> tuple[list[list[float]], list[str]]:
     """Pull labelled DHCP fingerprint data directly from the Fingerbank REST API.
 
-    Uses the ``GET /api/v2/devices/base_info`` endpoint with
-    ``fields=id,name,parent_id,details`` to fetch the complete device hierarchy
-    and each device's associated DHCP fingerprints in a single request.  This
-    replaces the old paginated ``/devices`` + ``/dhcp_fingerprints`` approach;
-    those endpoints do not exist in the Fingerbank v2 API and always return 404.
+    Makes two requests:
+
+    1. ``GET /api/v2/devices/base_info?fields=id,name,parent_id`` to fetch the
+       complete device hierarchy in a single response (~2 MB JSON).
+    2. ``GET /api/v2/dhcp_fingerprints?fields=value,device_id`` to fetch all
+       DHCP opt-55 fingerprint strings with their associated device IDs.
+
+    The ``details`` field returned by ``base_info`` is a plain-text description
+    string (e.g. ``"Auto created via the UPnP User-Agent import script"``), not
+    structured fingerprint data, so fingerprints must be fetched separately.
 
     The API key can be obtained for free at https://fingerbank.org/users/register
     (also exposed as the ``FINGERBANK_API_KEY`` env var used by the discovery
@@ -501,11 +506,11 @@ def _build_samples_from_fingerbank_api(
 
     log.info("fingerbank_api_load_start base_url=%s", base_url)
 
-    # ── Fetch complete device hierarchy + DHCP fingerprint details ────────────
+    # ── 1. Fetch device hierarchy ─────────────────────────────────────────────
     # GET /api/v2/devices/base_info returns every device in one response
-    # (typically 3-4 MB JSON).  The ``details`` field contains each device's
-    # associated DHCP opt-55 fingerprint strings.
-    params = urllib.parse.urlencode({"key": api_key, "fields": "id,name,parent_id,details"})
+    # (typically 2-3 MB JSON).  We only need id/name/parent_id to build the
+    # category hierarchy; ``details`` is a plain text description, not data.
+    params = urllib.parse.urlencode({"key": api_key, "fields": "id,name,parent_id"})
     url = f"{base_url}/devices/base_info?{params}"
     try:
         with urllib.request.urlopen(url, timeout=120) as resp:  # noqa: S310
@@ -530,7 +535,6 @@ def _build_samples_from_fingerbank_api(
         log.error("fingerbank_api_unexpected_format endpoint=devices/base_info type=%s", type(data).__name__)
         return [], []
 
-    # ── 1. Build device lookup ────────────────────────────────────────────────
     devices: dict[int, dict] = {}
     for dev in data:
         did = dev.get("id")
@@ -556,15 +560,48 @@ def _build_samples_from_fingerbank_api(
             did = parent
         return None
 
-    # ── 2. Extract DHCP fingerprints from each device's details ──────────────
+    # ── 2. Fetch DHCP fingerprints ────────────────────────────────────────────
+    # GET /api/v2/dhcp_fingerprints returns all fingerprints with their
+    # associated device_id.  Each entry has ``value`` (the comma-separated
+    # option-55 string) and ``device_id`` (links back to the device hierarchy).
+    fp_params = urllib.parse.urlencode({"key": api_key, "fields": "value,device_id"})
+    fp_url = f"{base_url}/dhcp_fingerprints?{fp_params}"
+    try:
+        with urllib.request.urlopen(fp_url, timeout=120) as resp:  # noqa: S310
+            fp_raw = resp.read().decode()
+    except urllib.error.HTTPError as exc:
+        log.error("fingerbank_api_http_error endpoint=dhcp_fingerprints status=%d", exc.code)
+        return [], []
+    except Exception as exc:
+        log.error("fingerbank_api_error endpoint=dhcp_fingerprints error=%s", exc)
+        return [], []
+
+    try:
+        fp_data = json.loads(fp_raw)
+    except json.JSONDecodeError as exc:
+        log.error(
+            "fingerbank_api_json_error endpoint=dhcp_fingerprints error=%s body_prefix=%.200s",
+            exc, fp_raw,
+        )
+        return [], []
+
+    if not isinstance(fp_data, list):
+        log.error("fingerbank_api_unexpected_format endpoint=dhcp_fingerprints type=%s", type(fp_data).__name__)
+        return [], []
+
+    log.info("fingerbank_api_fingerprints_loaded count=%d", len(fp_data))
+
+    # ── 3. Build feature samples ──────────────────────────────────────────────
     X: list[list[float]] = []
     y: list[str] = []
     skipped = 0
     seen_samples: set[tuple] = set()
 
-    for dev in data:
-        device_id = dev.get("id")
-        if not device_id:
+    for fp_entry in fp_data:
+        device_id = fp_entry.get("device_id")
+        dhcp_fp = (fp_entry.get("value") or "").strip()
+
+        if not device_id or not dhcp_fp:
             skipped += 1
             continue
 
@@ -573,36 +610,20 @@ def _build_samples_from_fingerbank_api(
             skipped += 1
             continue
 
-        details = dev.get("details") or {}
-        # The API returns DHCP fingerprints as a list of strings or dicts.
-        raw_fps = details.get("dhcp_fingerprints") or []
-        for fp_entry in raw_fps:
-            if isinstance(fp_entry, str):
-                dhcp_fp = fp_entry.strip()
-            elif isinstance(fp_entry, dict):
-                dhcp_fp = (fp_entry.get("value") or "").strip()
-            else:
-                skipped += 1
-                continue
+        key = (dhcp_fp, device_id)
+        if key in seen_samples:
+            skipped += 1
+            continue
+        seen_samples.add(key)
 
-            if not dhcp_fp:
-                skipped += 1
-                continue
-
-            key = (dhcp_fp, device_id)
-            if key in seen_samples:
-                skipped += 1
-                continue
-            seen_samples.add(key)
-
-            feats = extract_features(
-                vendor=None,
-                open_ports=[],
-                extra_info=None,
-                dhcp_fingerprint=dhcp_fp,
-            )
-            X.append(feats)
-            y.append(label)
+        feats = extract_features(
+            vendor=None,
+            open_ports=[],
+            extra_info=None,
+            dhcp_fingerprint=dhcp_fp,
+        )
+        X.append(feats)
+        y.append(label)
 
     log.info("fingerbank_api_load_done loaded=%d skipped=%d", len(y), skipped)
     return X, y
