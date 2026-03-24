@@ -351,6 +351,8 @@ _SYNTHETIC_DATA: list[dict] = [
     # Unambiguous network device vendors
     {"label": "network_device", "os_family": "embedded", "vendor": "Cisco Systems",       "open_ports": [], "extra_info": {}, "dhcp_fingerprint": None},
     {"label": "network_device", "os_family": "embedded", "vendor": "Ubiquiti Inc",        "open_ports": [], "extra_info": {}, "dhcp_fingerprint": None},
+    {"label": "network_device", "os_family": "embedded", "vendor": "Ubiquiti Inc.",       "open_ports": [], "extra_info": {}, "dhcp_fingerprint": None},
+    {"label": "network_device", "os_family": "embedded", "vendor": "Ubiquiti Networks",   "open_ports": [], "extra_info": {}, "dhcp_fingerprint": None},
     {"label": "network_device", "os_family": "embedded", "vendor": "Aruba Networks",       "open_ports": [], "extra_info": {}, "dhcp_fingerprint": None},
     {"label": "network_device", "os_family": "embedded", "vendor": "Fortinet Inc.",        "open_ports": [], "extra_info": {}, "dhcp_fingerprint": None},
     {"label": "network_device", "os_family": "embedded", "vendor": "Juniper Networks",     "open_ports": [], "extra_info": {}, "dhcp_fingerprint": None},
@@ -363,6 +365,12 @@ _SYNTHETIC_DATA: list[dict] = [
     # NAS vendors
     {"label": "server",         "os_family": "linux",    "vendor": "Synology Inc.",        "open_ports": [], "extra_info": {}, "dhcp_fingerprint": None},
     {"label": "server",         "os_family": "linux",    "vendor": "QNAP Systems, Inc.",   "open_ports": [], "extra_info": {}, "dhcp_fingerprint": None},
+    {"label": "server",         "os_family": "linux",    "vendor": "QNAP Systems",         "open_ports": [], "extra_info": {}, "dhcp_fingerprint": None},
+    {"label": "server",         "os_family": "linux",    "vendor": "Western Digital",      "open_ports": [], "extra_info": {}, "dhcp_fingerprint": None},
+    # IoT module / chip-maker OUI vendors
+    {"label": "iot",            "os_family": "embedded", "vendor": "Smart Innovation LLC", "open_ports": [], "extra_info": {}, "dhcp_fingerprint": None},
+    {"label": "iot",            "os_family": "embedded", "vendor": "Hui Zhou Gaoshengda Technology Co.,LTD", "open_ports": [], "extra_info": {}, "dhcp_fingerprint": None},
+    {"label": "iot",            "os_family": "embedded", "vendor": "Hui Zhou Gaoshengda Technology", "open_ports": [], "extra_info": {}, "dhcp_fingerprint": None},
 
     # ── mDNS-only (no DHCP, no open ports, vendor optional) ──────────────────
     # Devices discovered via passive mDNS / DNS-SD browsing.  These service
@@ -447,6 +455,23 @@ _SYNTHETIC_DATA: list[dict] = [
     {"label": "iot",            "os_family": "embedded", "vendor": None,              "open_ports": [],              "extra_info": {"upnp_manufacturer": "Roku", "upnp_device_type": "urn:roku-com:device:player:1-0"}, "dhcp_fingerprint": None},
     {"label": "iot",            "os_family": "embedded", "vendor": None,              "open_ports": [],              "extra_info": {"upnp_manufacturer": "TCL"},  "dhcp_fingerprint": None},
     {"label": "iot",            "os_family": "embedded", "vendor": None,              "open_ports": [],              "extra_info": {"upnp_manufacturer": "Sonos"}, "dhcp_fingerprint": None},
+    # Roku / TCL streaming player: chip OEM vendor + UPnP + mDNS (real-world combination)
+    {"label": "iot",            "os_family": "embedded", "vendor": "Hui Zhou Gaoshengda Technology Co.,LTD", "open_ports": [],
+     "extra_info": _mh("_airplay._tcp", "_spotify-connect._tcp", upnp_manufacturer="TCL"),   "dhcp_fingerprint": None},
+    {"label": "iot",            "os_family": "embedded", "vendor": "Hui Zhou Gaoshengda Technology Co.,LTD", "open_ports": [],
+     "extra_info": {"upnp_manufacturer": "TCL"},                                              "dhcp_fingerprint": None},
+    {"label": "iot",            "os_family": "embedded", "vendor": "Smart Innovation LLC", "open_ports": _p(80),
+     "extra_info": {},                                                                        "dhcp_fingerprint": None},
+    {"label": "iot",            "os_family": "embedded", "vendor": "Smart Innovation LLC", "open_ports": [],
+     "extra_info": {},                                                                        "dhcp_fingerprint": None},
+    # Ubiquiti gateway/router with no open ports (ARP-discovered, static IP, no management ports exposed)
+    {"label": "network_device", "os_family": "embedded", "vendor": "Ubiquiti Inc",   "open_ports": [],
+     "extra_info": {},                                                                        "dhcp_fingerprint": None},
+    {"label": "network_device", "os_family": "embedded", "vendor": "Ubiquiti Inc.",  "open_ports": [],
+     "extra_info": {},                                                                        "dhcp_fingerprint": None},
+    # Ubiquiti UniFi gateway with only hostname hint (no open ports to scanner)
+    {"label": "network_device", "os_family": "embedded", "vendor": "Ubiquiti Inc",   "open_ports": _p(80),
+     "extra_info": {},                                                                        "dhcp_fingerprint": None},
 ]
 # fmt: on
 

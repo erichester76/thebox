@@ -2628,6 +2628,15 @@ def vendor_lookup(mac: str) -> str | None:
 # All entries are matched as case-insensitive substrings of the vendor field,
 # so a short prefix like "espressif" covers "Espressif Systems, Inc." and any
 # future variant reported by MAC-vendor databases.
+#
+# Note: a subset of these keywords also appears in ``device_classifier.py``'s
+# ``VENDOR_KEYWORDS`` list, which is the RF classifier's binary feature set.
+# The two lists serve different roles: ``VENDOR_KEYWORDS`` drives the trained
+# model (must be kept short for tractable feature counts), while
+# ``_IOT_VENDOR_KEYWORDS`` drives the heuristic rule engine (can be as broad
+# as needed, no size constraint).  Both sets must be updated when adding new
+# IoT module / chip OEM keywords so that both the RF classifier and the
+# heuristic fallback benefit from the new signal.
 _IOT_VENDOR_KEYWORDS: frozenset[str] = frozenset({
     # Microcontroller / embedded-SoC manufacturers
     "espressif", "espressif systems", "raspberry pi", "raspberrypi",
@@ -2670,6 +2679,11 @@ _IOT_VENDOR_KEYWORDS: frozenset[str] = frozenset({
     "withings", "netatmo", "eve systems", "elgato",
     "somfy", "hunter douglas", "velux",
     "chamberlain", "liftmaster", "genie company",
+    # IoT module / chip makers whose OUI appears on commodity IoT hardware
+    "smart innovation",   # Smart Innovation LLC — IoT WiFi modules
+    "hui zhou gaoshengda",  # Hui Zhou Gaoshengda Technology — IoT/media module OEM
+    "shenzhen aisens",
+    "shenzhen bilian",
 })
 
 # OS / firmware fingerprint substrings that indicate embedded systems.
@@ -2801,6 +2815,9 @@ _IOT_UPNP_MANUFACTURERS: frozenset[str] = frozenset({
     "wemo", "kasa", "switchbot", "broadlink", "hikvision", "dahua",
     "axis", "amcrest", "reolink", "foscam", "wyze", "eufy", "blink",
     "arlo", "august", "chamberlain", "liftmaster",
+    # Streaming / smart-TV manufacturers advertised via UPnP
+    "roku", "tcl", "hisense", "vizio", "tivo", "directv", "samsung",
+    "lg electronics", "lg", "sony", "sharp", "panasonic",
 })
 
 # HTML page title substrings (from nmap ``http-title`` NSE script) that
@@ -2866,6 +2883,44 @@ _SNMP_IOT_KEYWORDS: frozenset[str] = frozenset({
     "raspberry pi", "raspbian",
 })
 
+# OUI vendor strings that reliably identify dedicated network infrastructure.
+# These are distinct from IoT vendors — they do NOT appear in _IOT_VENDOR_KEYWORDS.
+_NETWORK_DEVICE_VENDOR_KEYWORDS: frozenset[str] = frozenset({
+    "ubiquiti", "ubnt",
+    "cisco systems", "cisco",
+    "juniper networks", "juniper",
+    "aruba networks", "aruba",
+    "mikrotik", "routerboard",
+    "zyxel",
+    "fortinet",
+    "meraki",
+    "ruckus",
+    "aerohive",
+    "sophos",
+    "watchguard",
+    "barracuda",
+    "sonicwall",
+    "palo alto",
+    "extreme networks",
+    "cambium networks",
+    "cradlepoint",
+})
+
+# OUI vendor strings that reliably identify NAS / storage appliances.
+_NAS_SERVER_VENDOR_KEYWORDS: frozenset[str] = frozenset({
+    "synology",
+    "qnap",
+    "western digital",
+    "wd connected",
+    "drobo",
+    "asustor",
+    "buffalo",
+    "netgear ready",  # ReadyNAS
+    "seagate technology",
+    "promise technology",
+    "overland-tandberg",
+})
+
 def guess_device_type(
     vendor: str | None,
     open_ports: list[dict],
@@ -2893,27 +2948,52 @@ def guess_device_type(
     extra = extra_info or {}
 
     # ── mDNS service-type hints (highest specificity) ─────────────────────────
-    for svc in extra.get("mdns_services", []):
-        stype = svc.get("service_type", "")
-        if "_googlecast._tcp" in stype or "_cast._tcp" in stype:
+    # Collect ALL advertised service types before applying rules so that
+    # multi-service combinations (e.g. _airplay + _spotify-connect) are
+    # evaluated together rather than returning on the first matching service.
+    _mdns_stypes: set[str] = {
+        svc.get("service_type", "") for svc in extra.get("mdns_services", [])
+    }
+    if _mdns_stypes:
+        _has_companion = any("_companion-link._tcp" in s for s in _mdns_stypes)
+        _has_workstation = any("_workstation._tcp" in s for s in _mdns_stypes)
+        _has_ssh_mdns = any("_ssh._tcp" in s for s in _mdns_stypes)
+
+        if any("_googlecast._tcp" in s or "_cast._tcp" in s for s in _mdns_stypes):
             return "iot"
-        if "_airplay._tcp" in stype or "_raop._tcp" in stype or "_companion-link._tcp" in stype:
-            return "mobile"
-        if "_homekit._tcp" in stype or "_hap._tcp" in stype or "_matter._tcp" in stype:
+        if any("_homekit._tcp" in s or "_hap._tcp" in s or "_matter._tcp" in s for s in _mdns_stypes):
             return "iot"
-        if "_printer._tcp" in stype or "_ipp._tcp" in stype or "_ipps._tcp" in stype:
+        if any("_printer._tcp" in s or "_ipp._tcp" in s or "_ipps._tcp" in s for s in _mdns_stypes):
             return "printer"
-        if "_workstation._tcp" in stype:
+        if _has_workstation:
             return "desktop"
-        if "_smb._tcp" in stype or "_afpovertcp._tcp" in stype:
+        if any("_smb._tcp" in s or "_afpovertcp._tcp" in s for s in _mdns_stypes):
             return "desktop"
+        # Streaming / media device indicators (e.g. Roku, Sonos, Android TV) —
+        # check before _airplay._tcp so these devices are not misclassified as mobile.
+        if any("_spotify-connect._tcp" in s for s in _mdns_stypes):
+            return "iot"
         # Additional IoT-specific mDNS service types
-        if any(kw in stype for kw in (
-            "_hue._tcp", "_deconz._tcp", "_wled._tcp", "_elg._tcp",
-            "_axis-video._tcp", "_androidtvremote._tcp", "_viziocast._tcp",
-            "_nvstream._tcp", "_spotify-connect._tcp", "_amazon-setup._tcp",
-            "_miio._udp",
-        )):
+        if any(
+            kw in s
+            for s in _mdns_stypes
+            for kw in (
+                "_hue._tcp", "_deconz._tcp", "_wled._tcp", "_elg._tcp",
+                "_axis-video._tcp", "_androidtvremote._tcp", "_viziocast._tcp",
+                "_nvstream._tcp", "_amazon-setup._tcp", "_miio._udp",
+            )
+        ):
+            return "iot"
+        # _companion-link._tcp is an iOS/iPadOS Continuity protocol.  A device
+        # advertising it without desktop-class mDNS (_workstation, _ssh) is a
+        # phone or tablet.
+        if _has_companion and not (_has_workstation or _has_ssh_mdns):
+            return "mobile"
+        # _airplay._tcp / _raop._tcp without _companion-link → Apple TV, HomePod,
+        # or a third-party AirPlay receiver (Roku, Android TV).  Classify as iot
+        # rather than mobile; macOS laptops with AirPlay will have been caught
+        # earlier by _workstation._tcp or the RF classifier.
+        if any("_airplay._tcp" in s or "_raop._tcp" in s for s in _mdns_stypes):
             return "iot"
 
     # ── mDNS TXT record hints (model / device-type strings from Bonjour TXTs) ─
@@ -2978,6 +3058,15 @@ def guess_device_type(
         return "iot"
     if any(kw in hostname_l for kw in _IOT_HOSTNAME_KEYWORDS):
         return "iot"
+
+    # ── Dedicated network infrastructure vendors ──────────────────────────────
+    # Checked after IoT (Ubiquiti is never IoT; Cisco, Aruba, etc. likewise).
+    if any(kw in vendor_l for kw in _NETWORK_DEVICE_VENDOR_KEYWORDS):
+        return "network_device"
+
+    # ── NAS / storage appliance vendors ──────────────────────────────────────
+    if any(kw in vendor_l for kw in _NAS_SERVER_VENDOR_KEYWORDS):
+        return "server"
 
     # ── HTTP server banner hints ──────────────────────────────────────────────
     http_server_l = extra.get("http_server", "").lower() if isinstance(extra.get("http_server"), str) else ""
