@@ -227,7 +227,7 @@ def _load_settings() -> None:
     global REDIRECT_MODES, NETWORK_INTERFACE, GATEWAY_IP, NETWORK_RANGES
     global PIHOLE_IP, BOX_IP, BLACKHOLE_QUARANTINED, ARP_REFRESH_INTERVAL
 
-    raw_mode = get_setting("REDIRECT_MODE", ",".join(REDIRECT_MODES) or "passive")
+    raw_mode = get_setting("REDIRECT_MODE", ",".join(REDIRECT_MODES) if REDIRECT_MODES else "passive")
     REDIRECT_MODES    = {m.strip().lower() for m in raw_mode.split(",") if m.strip()}
     NETWORK_INTERFACE = get_setting("NETWORK_INTERFACE", NETWORK_INTERFACE)
     GATEWAY_IP        = get_setting("GATEWAY_IP", GATEWAY_IP)

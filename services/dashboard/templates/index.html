@@ -1243,7 +1243,7 @@ async function loadSettings() {
               <div class="setting-key">${escHtml(s.key)}</div>
               ${s.description ? `<div class="setting-desc">${escHtml(s.description)}</div>` : ''}
             </div>
-            <input class="setting-input" id="setting-${escHtml(s.key)}" type="text" value="${escHtml(s.value)}" />
+            <input class="setting-input" id="setting-${escHtml(s.key)}" type="text" value="${escHtml(s.value)}" aria-label="${escHtml(s.key)}" />
             <button class="setting-save-btn" data-key="${escHtml(s.key)}" onclick="saveSetting(this)">Save</button>
           </div>`).join('')}
       </div>`).join('');
