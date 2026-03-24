@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import queue
+import re
 import threading
 import time
 from datetime import datetime, timezone
@@ -29,56 +30,139 @@ LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 PIHOLE_URL = os.environ.get("PIHOLE_URL", "").rstrip("/")
 PIHOLE_PASSWORD = os.environ.get("PIHOLE_PASSWORD", "")
 
-# ─── Settings catalogue ───────────────────────────────────────────────────────
-# Each entry: (key, env_default, category, description)
-# Used to seed the settings table on first startup and to validate API updates.
-_SETTINGS_CATALOGUE: list[tuple[str, str, str, str]] = [
-    # ── General ──
-    ("LOG_LEVEL",      os.environ.get("LOG_LEVEL", "INFO"),                  "general",    "Log level for all services (DEBUG, INFO, WARNING, ERROR)"),
-    ("DASHBOARD_URL",  os.environ.get("DASHBOARD_URL", "http://dashboard:3000"), "general", "Internal URL used by the discovery service to register the IoT allow-list feed with Pi-hole"),
-    # ── Pi-hole ──
-    ("PIHOLE_URL",      os.environ.get("PIHOLE_URL", ""),           "pihole", "Pi-hole v6 API base URL (e.g. http://pihole:80/api)"),
-    ("PIHOLE_PASSWORD", os.environ.get("PIHOLE_PASSWORD", ""),      "pihole", "Pi-hole admin password"),
-    ("PIHOLE_SID_TTL",  os.environ.get("PIHOLE_SID_TTL", "240"),    "pihole", "Seconds a Pi-hole v6 session ID is cached before re-authenticating"),
-    # ── Network Discovery ──
-    ("NETWORK_RANGES",       os.environ.get("NETWORK_RANGES", "192.168.1.0/24"),   "discovery", "Comma-separated list of CIDR ranges to scan"),
-    ("SCAN_INTERVAL",        os.environ.get("SCAN_INTERVAL", "300"),                "discovery", "Scan interval in seconds"),
-    ("DNS_SNIFF_ENABLED",    os.environ.get("DNS_SNIFF_ENABLED", "true"),           "discovery", "Enable DNS packet sniffing to discover devices from their DNS queries"),
-    ("DNS_SNIFF_IFACE",      os.environ.get("DNS_SNIFF_IFACE", ""),                 "discovery", "Network interface for DNS sniffing (empty = auto-detect)"),
-    ("SSDP_ENABLED",         os.environ.get("SSDP_ENABLED", "true"),                "discovery", "Enable SSDP/UPnP multicast discovery"),
-    ("SSDP_TIMEOUT",         os.environ.get("SSDP_TIMEOUT", "5"),                   "discovery", "Seconds to wait for SSDP responses per scan cycle"),
-    ("MDNS_ENABLED",         os.environ.get("MDNS_ENABLED", "true"),                "discovery", "Enable mDNS/Zeroconf (Bonjour/Avahi) service browser"),
-    ("NETBIOS_ENABLED",      os.environ.get("NETBIOS_ENABLED", "true"),             "discovery", "Enable NetBIOS/NBNS subnet scan via nmap nbstat"),
-    ("BANNER_GRAB_ENABLED",  os.environ.get("BANNER_GRAB_ENABLED", "true"),         "discovery", "Enable HTTP/HTTPS banner grabbing"),
-    ("BANNER_GRAB_TIMEOUT",  os.environ.get("BANNER_GRAB_TIMEOUT", "3"),            "discovery", "Timeout in seconds for banner grab connections"),
-    ("DHCP_SNIFF_ENABLED",   os.environ.get("DHCP_SNIFF_ENABLED", "true"),          "discovery", "Enable DHCP packet sniffing for real-time hostname extraction"),
-    ("ARP_SNIFF_ENABLED",    os.environ.get("ARP_SNIFF_ENABLED", "true"),           "discovery", "Enable ARP packet sniffing for real-time device detection"),
-    # ── Device Guardian ──
-    ("QUARANTINE_VLAN",  os.environ.get("QUARANTINE_VLAN", "192.168.99.0/24"),              "guardian", "CIDR range used for quarantined devices"),
-    ("TRUSTED_NETWORKS", os.environ.get("TRUSTED_NETWORKS", "192.168.1.0/24"),              "guardian", "Comma-separated list of trusted network ranges"),
-    ("AUTO_QUARANTINE",  os.environ.get("AUTO_QUARANTINE", "true"),                          "guardian", "Automatically quarantine new/unknown devices (true/false)"),
-    # ── IoT Learning ──
-    ("IOT_LEARNING_HOURS", os.environ.get("IOT_LEARNING_HOURS", "48"),  "iot", "Hours a new IoT device spends in the observation group before being moved to the IoT group"),
-    ("PIHOLE_IOT_GROUP",   os.environ.get("PIHOLE_IOT_GROUP", "iot"),   "iot", "Name of the Pi-hole group that IoT devices are placed in after the learning period"),
-    # ── Honeypot ──
-    ("HONEYPOT_PORTS",                    os.environ.get("HONEYPOT_PORTS", "21,22,23,25,53,80,110,135,143,389,443,445,1433,3306,3389,5432,5900,5985,6379,8080,8443,9200,11211,27017"), "honeypot", "Comma-separated list of ports the honeypot listens on"),
-    ("HONEYPOT_IGNORED_NETWORKS",         os.environ.get("HONEYPOT_IGNORED_NETWORKS", "172.16.0.0/12,127.0.0.0/8"), "honeypot", "Comma-separated IPs/CIDRs to silently ignore (e.g. Docker bridge gateway and loopback)"),
-    ("HONEYPOT_THRESHOLD_COUNT",          os.environ.get("HONEYPOT_THRESHOLD_COUNT", "3"),      "honeypot", "Hit count from a single IP within HONEYPOT_THRESHOLD_WINDOW seconds before severity escalation"),
-    ("HONEYPOT_THRESHOLD_WINDOW",         os.environ.get("HONEYPOT_THRESHOLD_WINDOW", "60"),    "honeypot", "Rolling window in seconds for hit-count threshold"),
-    ("HONEYPOT_SWEEP_THRESHOLD",          os.environ.get("HONEYPOT_SWEEP_THRESHOLD", "4"),      "honeypot", "Distinct ports a single IP must probe within the sweep window to be classified as a port sweep"),
-    ("HONEYPOT_SWEEP_WINDOW",             os.environ.get("HONEYPOT_SWEEP_WINDOW", "60"),        "honeypot", "Rolling window in seconds for port-sweep detection"),
-    ("HONEYPOT_RECV_TIMEOUT",             os.environ.get("HONEYPOT_RECV_TIMEOUT", "4"),         "honeypot", "Seconds the honeypot waits for data after sending the banner"),
-    ("HONEYPOT_MAX_PAYLOAD_LENGTH",       os.environ.get("HONEYPOT_MAX_PAYLOAD_LENGTH", "2000"), "honeypot", "Maximum characters stored as payload_preview in the database"),
-    ("HONEYPOT_CREDENTIAL_WINDOW_MULTIPLIER", os.environ.get("HONEYPOT_CREDENTIAL_WINDOW_MULTIPLIER", "5"), "honeypot", "Credential tracking window multiplier (THRESHOLD_WINDOW × this = credential TTL seconds)"),
-    # ── Redirector ──
-    ("REDIRECT_MODE",        os.environ.get("REDIRECT_MODE", "passive"),  "redirector", "Active redirect mode(s): passive, redirect_dns, arp_spoof, dhcp_advertise, dhcp_starvation, gateway_takeover"),
-    ("NETWORK_INTERFACE",    os.environ.get("NETWORK_INTERFACE", "eth0"), "redirector", "Network interface used for ARP/packet operations"),
-    ("GATEWAY_IP",           os.environ.get("GATEWAY_IP", ""),            "redirector", "Default gateway IP (auto-detected from routing table if empty)"),
-    ("PIHOLE_IP",            os.environ.get("PIHOLE_IP", ""),             "redirector", "Pi-hole IP address (defaults to BOX_IP if empty)"),
-    ("BOX_IP",               os.environ.get("BOX_IP", ""),                "redirector", "TheBox's own IP address (auto-detected from NETWORK_INTERFACE if empty)"),
-    ("BLACKHOLE_QUARANTINED", os.environ.get("BLACKHOLE_QUARANTINED", "false"), "redirector", "Drop all traffic from quarantined devices except DHCP and DNS (true/false)"),
-    ("ARP_REFRESH_INTERVAL", os.environ.get("ARP_REFRESH_INTERVAL", "10"), "redirector", "Seconds between ARP refresh packets for active spoof modes"),
-]
+# ─── Dynamic settings catalogue (sourced from .env.example) ──────────────────
+# Paths inside the container.  Both files are bind-mounted read-only from the
+# repo root by docker-compose.yml so the parser always sees the latest version.
+_ENV_EXAMPLE_PATH = os.environ.get("ENV_EXAMPLE_PATH", "/app/.env.example")
+_ENV_PATH         = os.environ.get("ENV_PATH",         "/app/.env")
+
+# Keys present in .env.example that must NOT appear in the runtime settings
+# table because they are infrastructure-level or security-critical values that
+# must be set at deploy time and cannot be safely changed via the UI.
+_ENV_EXAMPLE_SKIP_KEYS: frozenset[str] = frozenset({
+    "TZ",
+    "POSTGRES_DB", "POSTGRES_USER", "POSTGRES_PASSWORD",
+    "PIHOLE_DNS_PORT", "PIHOLE_WEB_PORT",
+    "DASHBOARD_PORT",
+    "SECRET_KEY",
+})
+
+# Regex that matches section-header comments like:  # ─── Name ─────────────
+# The ─ characters are U+2500 BOX DRAWINGS LIGHT HORIZONTAL.
+_SECTION_HEADER_RE = re.compile(r"^#\s*─+\s+(.+?)\s+─+")
+
+
+def _section_to_category(section_name: str) -> str:
+    """Map a .env.example section header text to an internal category slug."""
+    s = section_name.lower()
+    if "postgresql" in s:
+        return "general"        # all keys in this section are skipped anyway
+    if "pi-hole" in s or "pihole" in s:
+        return "pihole"
+    if "dashboard" in s:
+        return "pihole"         # only PIHOLE_SID_TTL lives in this section
+    if "discovery" in s:
+        return "discovery"
+    if "guardian" in s:
+        return "guardian"
+    if "iot" in s:
+        return "iot"
+    if any(w in s for w in ("honeypot", "sweep", "protocol interaction", "severity")):
+        return "honeypot"
+    if "redirector" in s:
+        return "redirector"
+    if "logging" in s:
+        return "general"
+    return "general"
+
+
+def _parse_env_example() -> list[tuple[str, str, str, str]]:
+    """Parse .env.example and return ``(key, value, category, description)`` tuples.
+
+    The ``value`` in each tuple is the raw default taken from the ``.env.example``
+    file.  Callers should override this with values from ``os.environ`` or the
+    ``.env`` file before writing to the database.
+
+    * Section-header lines (``# ─── Name ───``) set the current category.
+    * Consecutive comment lines directly above a ``KEY=value`` line are joined
+      into the description for that key.
+    * An empty line resets the accumulated description.
+    * Keys in ``_ENV_EXAMPLE_SKIP_KEYS`` are omitted from the output.
+
+    Returns an empty list when the file cannot be found (fails silently so that
+    a missing mount does not crash the dashboard on startup).
+    """
+    entries: list[tuple[str, str, str, str]] = []
+    if not os.path.exists(_ENV_EXAMPLE_PATH):
+        return entries
+
+    current_category = "general"
+    pending_comments: list[str] = []
+
+    with open(_ENV_EXAMPLE_PATH, encoding="utf-8") as fh:
+        for raw_line in fh:
+            line = raw_line.rstrip("\n")
+
+            # ── Section header?
+            m = _SECTION_HEADER_RE.match(line)
+            if m:
+                current_category = _section_to_category(m.group(1).strip())
+                pending_comments = []
+                continue
+
+            # ── Empty line → reset pending description
+            if not line.strip():
+                pending_comments = []
+                continue
+
+            # ── Comment line (not a section header)
+            if line.startswith("#"):
+                text = line.lstrip("#").strip()
+                if text:
+                    pending_comments.append(text)
+                continue
+
+            # ── KEY=value line
+            if "=" in line:
+                key, _, raw_val = line.partition("=")
+                key = key.strip()
+                if key and key not in _ENV_EXAMPLE_SKIP_KEYS:
+                    description = " ".join(pending_comments)
+                    entries.append((key, raw_val.strip(), current_category, description))
+                pending_comments = []
+
+    return entries
+
+
+def _read_env_file() -> dict[str, str]:
+    """Read ``KEY=value`` pairs from the ``.env`` file.
+
+    Returns an empty dict when the file does not exist (e.g. on a fresh install
+    before the user has created it) or cannot be read.  Shell-style quoting is
+    not evaluated — values are returned exactly as written in the file.
+    """
+    env: dict[str, str] = {}
+    if not os.path.exists(_ENV_PATH):
+        return env
+    try:
+        with open(_ENV_PATH, encoding="utf-8") as fh:
+            for raw_line in fh:
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" in line:
+                    k, _, v = line.partition("=")
+                    env[k.strip()] = v.strip()
+    except OSError as exc:
+        # Log at warning level; the DB will already have correct values from a
+        # previous successful bootstrap so this is non-fatal.
+        logging.getLogger(__name__).warning("env_file_read_failed path=%s error=%s", _ENV_PATH, exc)
+    return env
+
+
+# Valid setting keys — populated from .env.example by bootstrap_settings().
+# Used to reject unknown keys in the PUT /api/settings endpoints.
+_VALID_SETTING_KEYS: frozenset[str] = frozenset()
 
 # ─── Logging ─────────────────────────────────────────────────────────────────
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
@@ -287,26 +371,65 @@ ensure_schema()
 # ─── Settings helpers ────────────────────────────────────────────────────────
 
 def bootstrap_settings() -> None:
-    """Seed the settings table from environment variables on first startup.
+    """Seed the settings table from ``.env.example`` (and ``.env``) on every startup.
 
-    Each entry in ``_SETTINGS_CATALOGUE`` is inserted only if the key is not
-    already present in the database, so subsequent restarts never overwrite
-    values that were changed via the UI.
+    How new keys are handled
+    ------------------------
+    On *every* dashboard restart the catalogue is re-read from ``.env.example``.
+    Keys that are **missing** from the ``settings`` table are inserted using the
+    best available value:
+
+      1. ``os.environ[key]``  — set by docker-compose from ``.env`` (highest priority)
+      2. ``.env`` file value  — for vars not forwarded to this container's env
+      3. ``.env.example`` default — absolute fallback
+
+    Keys that **already exist** in the table keep their current ``value`` so that
+    any changes made through the UI survive restarts.  Only ``category`` and
+    ``description`` are refreshed from ``.env.example`` so that documentation
+    improvements are always picked up.
+
+    Effect
+    ------
+    Newly added variables in ``.env.example`` are automatically inserted into
+    the DB on the next dashboard restart without any manual migration.
+
+    The global ``_VALID_SETTING_KEYS`` is also updated so that the API
+    immediately accepts the new keys.
     """
+    global _VALID_SETTING_KEYS
+
+    catalogue = _parse_env_example()
+    if not catalogue:
+        log.warning("settings_catalogue_empty",
+                    msg=".env.example not found or empty; settings table may be incomplete",
+                    path=_ENV_EXAMPLE_PATH)
+        return
+
+    env_file = _read_env_file()
+
     conn = get_db()
     try:
         with conn.cursor() as cur:
-            for key, default, category, description in _SETTINGS_CATALOGUE:
+            for key, example_default, category, description in catalogue:
+                # Value priority: process env (docker-compose) → .env file
+                # (for vars not forwarded to this container) → .env.example default.
+                value = os.environ.get(key) or env_file.get(key) or example_default
                 cur.execute(
                     """INSERT INTO settings (key, value, category, description)
                        VALUES (%s, %s, %s, %s)
-                       ON CONFLICT (key) DO NOTHING""",
-                    (key, default, category, description),
+                       ON CONFLICT (key) DO UPDATE SET
+                         category    = EXCLUDED.category,
+                         description = EXCLUDED.description""",
+                    (key, value, category, description),
                 )
         conn.commit()
-        log.info("settings_bootstrapped")
+        log.info("settings_bootstrapped", count=len(catalogue))
     finally:
         conn.close()
+
+    # Refresh valid-key set so the PUT /api/settings endpoints accept any key
+    # that was just added to .env.example.
+    _VALID_SETTING_KEYS = frozenset(key for key, _, _, _ in catalogue)
 
 
 def get_setting(key: str, default: str = "") -> str:
@@ -1042,8 +1165,8 @@ def api_stats():
 
 # --- API: Settings ---
 
-# Build a quick-lookup set of valid setting keys from the catalogue.
-_VALID_SETTING_KEYS = {entry[0] for entry in _SETTINGS_CATALOGUE}
+# _VALID_SETTING_KEYS is populated by bootstrap_settings() which runs at
+# module load time.  It contains every key parsed from .env.example.
 
 
 @app.route("/api/settings")
@@ -1063,8 +1186,6 @@ def api_settings():
 @app.route("/api/settings/<key>", methods=["PUT"])
 def api_update_setting(key: str):
     """Update a single setting value."""
-    if key not in _VALID_SETTING_KEYS:
-        return jsonify({"error": f"Unknown setting key: {key}"}), 400
     data = request.get_json(silent=True) or {}
     if "value" not in data:
         return jsonify({"error": "Missing 'value' field"}), 400
@@ -1079,7 +1200,7 @@ def api_update_setting(key: str):
             )
             if cur.rowcount == 0:
                 conn.close()
-                return jsonify({"error": f"Setting '{key}' not found"}), 404
+                return jsonify({"error": f"Unknown setting: {key}"}), 404
         conn.commit()
     finally:
         conn.close()
@@ -1099,10 +1220,16 @@ def api_update_settings_bulk():
     data = request.get_json(silent=True) or {}
     if not data:
         return jsonify({"error": "Empty request body"}), 400
-    unknown = [k for k in data if k not in _VALID_SETTING_KEYS]
-    if unknown:
-        return jsonify({"error": f"Unknown setting keys: {', '.join(unknown)}"}), 400
+    # Validate against known keys.  If _VALID_SETTING_KEYS is empty (e.g.
+    # .env.example was not found at startup) skip the check and rely on the
+    # DB UPDATE's rowcount to detect unknown keys below.
+    if _VALID_SETTING_KEYS:
+        unknown = [k for k in data if k not in _VALID_SETTING_KEYS]
+        if unknown:
+            return jsonify({"error": f"Unknown setting keys: {', '.join(unknown)}"}), 400
     conn = get_db()
+    updated: list[str] = []
+    not_found: list[str] = []
     try:
         with conn.cursor() as cur:
             for k, v in data.items():
@@ -1110,15 +1237,24 @@ def api_update_settings_bulk():
                     "UPDATE settings SET value = %s, updated_at = NOW() WHERE key = %s",
                     (str(v), k),
                 )
+                if cur.rowcount:
+                    updated.append(k)
+                else:
+                    not_found.append(k)
         conn.commit()
     finally:
         conn.close()
-    if any(k in ("PIHOLE_URL", "PIHOLE_PASSWORD") for k in data):
+    if not updated:
+        return jsonify({"error": f"No settings updated; unknown keys: {', '.join(not_found)}"}), 404
+    if any(k in ("PIHOLE_URL", "PIHOLE_PASSWORD") for k in updated):
         _load_runtime_settings()
         global _pihole_sid_cache
         with _pihole_sid_lock:
             _pihole_sid_cache = None
-    return jsonify({"ok": True, "updated": list(data.keys())})
+    result: dict = {"ok": True, "updated": updated}
+    if not_found:
+        result["not_found"] = not_found
+    return jsonify(result)
 
 
 # --- SSE stream ---
