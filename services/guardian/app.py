@@ -109,14 +109,6 @@ def ensure_schema():
         # Migration: add ipv6_address column if the table already exists without it.
         "ALTER TABLE devices ADD COLUMN IF NOT EXISTS ipv6_address VARCHAR(45)",
         "CREATE INDEX IF NOT EXISTS idx_devices_ipv6   ON devices(ipv6_address)",
-        # Migration tracking — ensure the table exists and record all versions
-        # covered by this service's schema management.
-        """CREATE TABLE IF NOT EXISTS schema_migrations (
-            version     VARCHAR(16) NOT NULL PRIMARY KEY,
-            applied_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )""",
-        "INSERT INTO schema_migrations (version) VALUES ('0001') ON CONFLICT (version) DO NOTHING",
-        "INSERT INTO schema_migrations (version) VALUES ('0003') ON CONFLICT (version) DO NOTHING",
     ]
     conn = get_db()
     try:
