@@ -2377,6 +2377,11 @@ def upsert_device(conn, rdb, device: dict) -> bool:
                 )
                 synthetic_row = cur.fetchone()
                 if synthetic_row is not None:
+                    # Replace the synthetic MAC with the real one.  Use only
+                    # mac_address in the WHERE clause (it is UNIQUE) so the
+                    # update succeeds even when the stored ip_address was
+                    # changed by a concurrent scan/sniffer between the SELECT
+                    # above and this UPDATE.
                     cur.execute(
                         """
                         UPDATE devices
@@ -2385,7 +2390,7 @@ def upsert_device(conn, rdb, device: dict) -> bool:
                             hostname=%s, vendor=%s, device_type=%s,
                             os_guess=%s, open_ports=%s, extra_info=%s,
                             last_seen=NOW()
-                        WHERE mac_address=%s AND ip_address=%s
+                        WHERE mac_address=%s
                         """,
                         (
                             device["mac"],
@@ -2398,16 +2403,36 @@ def upsert_device(conn, rdb, device: dict) -> bool:
                             json.dumps(device.get("open_ports", [])),
                             json.dumps(device.get("extra_info", {})),
                             synthetic_mac,
-                            device["ip"],
                         ),
                     )
-                    conn.commit()
-                    log.info(
-                        "synthetic_mac_replaced",
+                    if cur.rowcount > 0:
+                        conn.commit()
+                        log.info(
+                            "synthetic_mac_replaced",
+                            ip=device["ip"],
+                            old_mac=synthetic_mac,
+                            new_mac=device["mac"],
+                            vendor=device.get("vendor"),
+                        )
+                        return False
+                    # rowcount == 0 means the synthetic row was concurrently
+                    # removed (e.g. promoted by another thread) between our
+                    # SELECT and this UPDATE.  Fall through to a normal INSERT.
+                    conn.rollback()
+            else:
+                # We are about to insert a synthetic-MAC placeholder.  Guard
+                # against a race where a concurrent scan/sniffer has ALREADY
+                # promoted this IP to a real MAC — we must not re-create a
+                # stale synthetic row alongside the real one.
+                cur.execute(
+                    "SELECT id FROM devices WHERE ip_address = %s AND mac_address NOT LIKE '02:%%'",
+                    (device["ip"],),
+                )
+                if cur.fetchone() is not None:
+                    log.debug(
+                        "synthetic_mac_skipped_real_exists",
                         ip=device["ip"],
-                        old_mac=synthetic_mac,
-                        new_mac=device["mac"],
-                        vendor=device.get("vendor"),
+                        mac=device["mac"],
                     )
                     return False
 
