@@ -39,9 +39,9 @@ import subprocess
 import threading
 import time
 from datetime import datetime, timedelta, timezone
-import xml.etree.ElementTree as ET
-from datetime import datetime, timezone
+from urllib.parse import urlparse
 from urllib.request import urlopen
+import xml.etree.ElementTree as ET
 
 import nmap
 import psycopg2
@@ -291,6 +291,7 @@ def _load_settings() -> None:
     global MDNS_ENABLED, NETBIOS_ENABLED
     global BANNER_GRAB_ENABLED, BANNER_GRAB_TIMEOUT
     global DHCP_SNIFF_ENABLED, ARP_SNIFF_ENABLED
+    global SNIFF_PROCESS_INTERVAL
 
     NETWORK_RANGES = [r.strip() for r in get_setting("NETWORK_RANGES", ",".join(NETWORK_RANGES)).split(",") if r.strip()]
     SCAN_INTERVAL  = int(get_setting("SCAN_INTERVAL", str(SCAN_INTERVAL)))
@@ -310,6 +311,7 @@ def _load_settings() -> None:
     BANNER_GRAB_TIMEOUT  = float(get_setting("BANNER_GRAB_TIMEOUT", str(BANNER_GRAB_TIMEOUT)))
     DHCP_SNIFF_ENABLED   = get_setting("DHCP_SNIFF_ENABLED", str(DHCP_SNIFF_ENABLED).lower()).lower() == "true"
     ARP_SNIFF_ENABLED    = get_setting("ARP_SNIFF_ENABLED", str(ARP_SNIFF_ENABLED).lower()).lower() == "true"
+    SNIFF_PROCESS_INTERVAL = int(get_setting("SNIFF_PROCESS_INTERVAL", str(SNIFF_PROCESS_INTERVAL)))
     log.info("settings_loaded", networks=NETWORK_RANGES, scan_interval=SCAN_INTERVAL)
 
 def arp_sweep(network: str) -> list[dict]:
@@ -1100,18 +1102,7 @@ def process_dns_sniff_queue(conn, rdb) -> int:
             continue
 
         host: dict = {"ip": ip, "mac": mac}
-        host["hostname"] = resolve_hostname(ip)
-        host["vendor"] = vendor_lookup(mac)
-        scan_data = nmap_scan(ip)
-        host.update(scan_data)
-        extra_info: dict = enrich_from_banners(ip, host.get("open_ports", []))
-        if extra_info.get("tls_cn") and not host.get("hostname"):
-            host["hostname"] = extra_info["tls_cn"]
-        host["extra_info"] = extra_info
-        host["device_type"] = guess_device_type(
-            host.get("vendor"), host.get("open_ports", []), host.get("os_guess"), extra_info,
-            host.get("hostname"),
-        )
+        _enrich_and_classify(host)
 
         is_new = upsert_device(conn, rdb, host)
         if is_new:
@@ -1200,11 +1191,11 @@ def process_mdns_sniff_queue(conn) -> int:
                     """,
                     (device_type, ip),
                 )
-        if cur.rowcount > 0:
-            updated += 1
-            log.info("mdns_sniff_hint_applied", ip=ip, hostname=hostname, device_type=device_type)
-        conn.commit()
+            if cur.rowcount > 0:
+                updated += 1
+                log.info("mdns_sniff_hint_applied", ip=ip, hostname=hostname, device_type=device_type)
 
+    conn.commit()
     return updated
 
 
@@ -1390,8 +1381,8 @@ def process_dhcp_sniff_queue(conn) -> int:
                     mac=mac, hostname=hostname, ip=ip,
                     dhcp_vci=dhcp_vci or None, vci_iot=vci_is_iot,
                 )
-        conn.commit()
 
+    conn.commit()
     return updated
 
 
@@ -1513,18 +1504,7 @@ def process_arp_sniff_queue(conn, rdb) -> int:
             continue
 
         # New device — run full enrichment then upsert
-        host["hostname"] = resolve_hostname(host["ip"])
-        host["vendor"] = vendor_lookup(mac)
-        scan_data = nmap_scan(host["ip"])
-        host.update(scan_data)
-        extra_info: dict = enrich_from_banners(host["ip"], host.get("open_ports", []))
-        if extra_info.get("tls_cn") and not host.get("hostname"):
-            host["hostname"] = extra_info["tls_cn"]
-        host["extra_info"] = extra_info
-        host["device_type"] = guess_device_type(
-            host.get("vendor"), host.get("open_ports", []), host.get("os_guess"), extra_info,
-            host.get("hostname"),
-        )
+        _enrich_and_classify(host)
 
         is_new = upsert_device(conn, rdb, host)
         if is_new:
@@ -1560,7 +1540,6 @@ def _validate_ssdp_location(location: str, responding_ip: str) -> bool:
     if not _SSDP_LOCATION_RE.match(location):
         return False
     try:
-        from urllib.parse import urlparse  # stdlib — no extra dep
         parsed = urlparse(location)
         host = parsed.hostname or ""
         # Reject any non-IP host (hostnames could resolve to unexpected addresses)
@@ -1600,68 +1579,70 @@ def ssdp_discover(timeout: int = 5) -> dict[str, dict]:
 
     responses: dict[str, dict] = {}
 
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
     try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
         sock.settimeout(timeout)
-        sock.sendto(msg, (_SSDP_MULTICAST_ADDR, _SSDP_PORT))
-    except Exception as exc:
-        log.warning("ssdp_send_error", error=str(exc))
-        return {}
-
-    deadline = time.time() + timeout
-    while time.time() < deadline:
         try:
-            data, addr = sock.recvfrom(65507)
-            ip = addr[0]
-            if ip in responses:
-                continue
-            response_text = data.decode("utf-8", errors="replace")
-            location: str | None = None
-            for line in response_text.split("\r\n"):
-                if line.upper().startswith("LOCATION:"):
-                    location = line.split(":", 1)[1].strip()
-                    break
-            entry: dict = {}
-            if location and _validate_ssdp_location(location, ip):
-                entry["upnp_location"] = location
-                try:
-                    with urlopen(location, timeout=3) as resp:  # noqa: S310
-                        xml_data = resp.read()
-                    root = ET.fromstring(xml_data)
-                    ns = {"d": "urn:schemas-upnp-org:device-1-0"}
-                    device_el = root.find(".//d:device", ns)
-                    if device_el is not None:
-                        for attr, tag in (
-                            ("upnp_friendly_name", "d:friendlyName"),
-                            ("upnp_manufacturer", "d:manufacturer"),
-                            ("upnp_manufacturer_url", "d:manufacturerURL"),
-                            ("upnp_model_name", "d:modelName"),
-                            ("upnp_model_number", "d:modelNumber"),
-                            ("upnp_model_description", "d:modelDescription"),
-                            ("upnp_serial_number", "d:serialNumber"),
-                            ("upnp_device_type", "d:deviceType"),
-                            ("upnp_udn", "d:UDN"),
-                        ):
-                            val = _xml_text(device_el, tag, ns)
-                            if val:
-                                entry[attr] = val
-                except ET.ParseError as exc:
-                    log.debug("ssdp_xml_parse_error", ip=ip, error=str(exc))
-                except Exception as exc:
-                    log.debug("ssdp_description_fetch_error", ip=ip, location=location, error=str(exc))
-            if entry:
-                responses[ip] = entry
-        except TimeoutError:
-            break
-        except OSError:
-            break
+            sock.sendto(msg, (_SSDP_MULTICAST_ADDR, _SSDP_PORT))
         except Exception as exc:
-            log.debug("ssdp_recv_error", error=str(exc))
-            break
+            log.warning("ssdp_send_error", error=str(exc))
+            return {}
 
-    sock.close()
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                data, addr = sock.recvfrom(65507)
+                ip = addr[0]
+                if ip in responses:
+                    continue
+                response_text = data.decode("utf-8", errors="replace")
+                location: str | None = None
+                for line in response_text.split("\r\n"):
+                    if line.upper().startswith("LOCATION:"):
+                        location = line.split(":", 1)[1].strip()
+                        break
+                entry: dict = {}
+                if location and _validate_ssdp_location(location, ip):
+                    entry["upnp_location"] = location
+                    try:
+                        with urlopen(location, timeout=3) as resp:  # noqa: S310
+                            xml_data = resp.read()
+                        root = ET.fromstring(xml_data)
+                        ns = {"d": "urn:schemas-upnp-org:device-1-0"}
+                        device_el = root.find(".//d:device", ns)
+                        if device_el is not None:
+                            for attr, tag in (
+                                ("upnp_friendly_name", "d:friendlyName"),
+                                ("upnp_manufacturer", "d:manufacturer"),
+                                ("upnp_manufacturer_url", "d:manufacturerURL"),
+                                ("upnp_model_name", "d:modelName"),
+                                ("upnp_model_number", "d:modelNumber"),
+                                ("upnp_model_description", "d:modelDescription"),
+                                ("upnp_serial_number", "d:serialNumber"),
+                                ("upnp_device_type", "d:deviceType"),
+                                ("upnp_udn", "d:UDN"),
+                            ):
+                                val = _xml_text(device_el, tag, ns)
+                                if val:
+                                    entry[attr] = val
+                    except ET.ParseError as exc:
+                        log.debug("ssdp_xml_parse_error", ip=ip, error=str(exc))
+                    except Exception as exc:
+                        log.debug("ssdp_description_fetch_error", ip=ip, location=location, error=str(exc))
+                if entry:
+                    responses[ip] = entry
+            except TimeoutError:
+                break
+            except OSError:
+                break
+            except Exception as exc:
+                log.debug("ssdp_recv_error", error=str(exc))
+                break
+    finally:
+        sock.close()
+
     log.info("ssdp_discover_done", found=len(responses))
     return responses
 
@@ -2388,8 +2369,7 @@ def guess_device_type(
         return "printer"
     if "WLANAccessPoint" in upnp_type or "WANDevice" in upnp_type:
         return "network_device"
-    _iot_upnp_mfrs = _IOT_UPNP_MANUFACTURERS
-    if any(v in upnp_mfr for v in _iot_upnp_mfrs):
+    if any(v in upnp_mfr for v in _IOT_UPNP_MANUFACTURERS):
         return "iot"
     # Also check UPnP friendly name and model for IoT keywords
     upnp_combined = f"{upnp_friendly} {upnp_model}"
@@ -2434,6 +2414,51 @@ def guess_device_type(
         return "network_device"
 
     return "unknown"
+
+
+# ─── Per-host enrichment helper ──────────────────────────────────────────────
+
+def _enrich_and_classify(host: dict, extra_seed: dict | None = None) -> dict:
+    """Run the full enrichment pipeline for a single host dict.
+
+    Mutates *host* in-place: populates ``hostname``, ``vendor``,
+    ``open_ports``, ``os_guess``, ``extra_info``, and ``device_type``.
+    Returns the same *host* object for convenience (not a copy).
+
+    Any pre-existing values (e.g. a hostname from Pi-hole or DHCP) are kept
+    and only filled in when absent.
+
+    *extra_seed* is an optional dict of already-collected enrichment data
+    (e.g. SSDP UPnP fields or SSDP/mDNS/NetBIOS data from the scan loop)
+    that is merged into ``extra_info`` before the ``device_type`` classifier
+    runs.  If *host* already has an ``extra_info`` key, *extra_seed* is
+    merged on top of it so neither source is lost.
+    """
+    ip = host["ip"]
+    mac = host.get("mac", "")
+
+    host["hostname"] = host.get("hostname") or resolve_hostname(ip)
+    host["vendor"] = host.get("vendor") or vendor_lookup(mac)
+
+    scan_data = nmap_scan(ip)
+    host.update(scan_data)
+
+    extra_info: dict = host.get("extra_info") or {}
+    if extra_seed:
+        extra_info.update(extra_seed)
+
+    banner_data = enrich_from_banners(ip, host.get("open_ports", []))
+    if banner_data:
+        extra_info.update(banner_data)
+        if banner_data.get("tls_cn") and not host.get("hostname"):
+            host["hostname"] = banner_data["tls_cn"]
+
+    host["extra_info"] = extra_info
+    host["device_type"] = guess_device_type(
+        host.get("vendor"), host.get("open_ports", []),
+        host.get("os_guess"), extra_info, host.get("hostname"),
+    )
+    return host
 
 
 # ─── Persistence ─────────────────────────────────────────────────────────────
@@ -2612,19 +2637,7 @@ def _process_ssdp_standalone(conn, rdb) -> int:
             continue
 
         host: dict = {"ip": ip, "mac": mac}
-        host["hostname"] = resolve_hostname(ip)
-        host["vendor"] = vendor_lookup(mac)
-        scan_data = nmap_scan(ip)
-        host.update(scan_data)
-        extra_info: dict = enrich_from_banners(ip, host.get("open_ports", []))
-        extra_info.update(ssdp_entry)
-        if extra_info.get("tls_cn") and not host.get("hostname"):
-            host["hostname"] = extra_info["tls_cn"]
-        host["extra_info"] = extra_info
-        host["device_type"] = guess_device_type(
-            host.get("vendor"), host.get("open_ports", []), host.get("os_guess"), extra_info,
-            host.get("hostname"),
-        )
+        _enrich_and_classify(host, extra_seed=ssdp_entry)
 
         is_new = upsert_device(conn, rdb, host)
         if is_new:
@@ -2726,178 +2739,164 @@ def run_scan():
     conn = get_db()
     rdb = get_redis()
 
-    # ── Cycle-level enrichment passes (run once per scan, not per host) ───────
-    # SSDP/UPnP — send M-SEARCH multicast and fetch device descriptions.
-    ssdp_data: dict[str, dict] = ssdp_discover(timeout=SSDP_TIMEOUT) if SSDP_ENABLED else {}
+    try:
+        # ── Cycle-level enrichment passes (run once per scan, not per host) ───────
+        # SSDP/UPnP — send M-SEARCH multicast and fetch device descriptions.
+        ssdp_data: dict[str, dict] = ssdp_discover(timeout=SSDP_TIMEOUT) if SSDP_ENABLED else {}
 
-    # mDNS — drain whatever announcements arrived since the last scan.
-    mdns_data: dict[str, dict] = process_mdns_queue() if MDNS_ENABLED else {}
+        # mDNS — drain whatever announcements arrived since the last scan.
+        mdns_data: dict[str, dict] = process_mdns_queue() if MDNS_ENABLED else {}
 
-    for network in NETWORK_RANGES:
-        # Record scan start
-        with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO scan_runs (network_range) VALUES (%s) RETURNING id",
-                (network,),
-            )
-            scan_id = cur.fetchone()["id"]
-        conn.commit()
+        for network in NETWORK_RANGES:
+            # Record scan start
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO scan_runs (network_range) VALUES (%s) RETURNING id",
+                    (network,),
+                )
+                scan_id = cur.fetchone()["id"]
+            conn.commit()
 
-        # ── Step 1: Layer-3 discovery — nmap ping sweep ───────────────────────
-        # Works across Docker NAT, macOS bridge, and host networking alike.
-        # Discovers hosts via ICMP/TCP/UDP probes without needing direct LAN
-        # (layer-2) access.
-        hosts = nmap_ping_sweep(network)
-        host_by_ip: dict[str, dict] = {h["ip"]: h for h in hosts}
-        log.info("nmap_sweep_done", network=network, found=len(hosts))
+            # ── Step 1: Layer-3 discovery — nmap ping sweep ───────────────────────
+            # Works across Docker NAT, macOS bridge, and host networking alike.
+            # Discovers hosts via ICMP/TCP/UDP probes without needing direct LAN
+            # (layer-2) access.
+            hosts = nmap_ping_sweep(network)
+            host_by_ip: dict[str, dict] = {h["ip"]: h for h in hosts}
+            log.info("nmap_sweep_done", network=network, found=len(hosts))
 
-        # ── Step 2: Pi-hole client list (also layer 3) ────────────────────────
-        # Pi-hole records every device that has queried DNS, and often includes
-        # the MAC address from DHCP lease data.  Merge in any IPs not already
-        # found by nmap and back-fill missing MACs/hostnames.
-        pihole_clients = query_pihole_clients()
-        if pihole_clients:
-            for client in pihole_clients:
-                ip = client["ip"]
+            # ── Step 2: Pi-hole client list (also layer 3) ────────────────────────
+            # Pi-hole records every device that has queried DNS, and often includes
+            # the MAC address from DHCP lease data.  Merge in any IPs not already
+            # found by nmap and back-fill missing MACs/hostnames.
+            pihole_clients = query_pihole_clients()
+            if pihole_clients:
+                for client in pihole_clients:
+                    ip = client["ip"]
+                    if ip not in host_by_ip:
+                        hosts.append(client)
+                        host_by_ip[ip] = client
+                    else:
+                        if client.get("mac") and not host_by_ip[ip].get("mac"):
+                            host_by_ip[ip]["mac"] = client["mac"]
+                        if client.get("hostname") and not host_by_ip[ip].get("hostname"):
+                            host_by_ip[ip]["hostname"] = client["hostname"]
+                log.info("pihole_merge_done", total_after_merge=len(hosts))
+
+            # ── Step 3: ARP sweep (layer 2) — augment with authoritative MACs ────
+            # ARP provides the ground-truth MAC address for every host on the same
+            # broadcast domain.  When the container runs with network_mode: host on
+            # Linux (see docker-compose.linux.yml) the sweep reaches all LAN devices
+            # directly.  When behind Docker NAT it may only see the gateway; we
+            # still merge in whatever ARP replies we do receive to back-fill MACs
+            # and pick up any hosts that nmap/Pi-hole missed.
+            arp_hosts = arp_sweep(network)
+            if arp_hosts:
+                for arp_host in arp_hosts:
+                    ip = arp_host["ip"]
+                    if ip in host_by_ip:
+                        # ARP gives us the authoritative MAC; always overwrite.
+                        host_by_ip[ip]["mac"] = arp_host["mac"]
+                    else:
+                        hosts.append(arp_host)
+                        host_by_ip[ip] = arp_host
+                log.info("arp_augment_done", arp_found=len(arp_hosts), total_after_augment=len(hosts))
+            else:
+                log.info("arp_sweep_empty", network=network, note="continuing with layer3 results only")
+
+            # ── Step 4: SSDP/UPnP — add any IPs only found via SSDP ─────────────
+            for ip, ssdp_entry in ssdp_data.items():
                 if ip not in host_by_ip:
-                    hosts.append(client)
-                    host_by_ip[ip] = client
-                else:
-                    if client.get("mac") and not host_by_ip[ip].get("mac"):
-                        host_by_ip[ip]["mac"] = client["mac"]
-                    if client.get("hostname") and not host_by_ip[ip].get("hostname"):
-                        host_by_ip[ip]["hostname"] = client["hostname"]
-            log.info("pihole_merge_done", total_after_merge=len(hosts))
+                    host: dict = {"ip": ip}
+                    hosts.append(host)
+                    host_by_ip[ip] = host
 
-        # ── Step 3: ARP sweep (layer 2) — augment with authoritative MACs ────
-        # ARP provides the ground-truth MAC address for every host on the same
-        # broadcast domain.  When the container runs with network_mode: host on
-        # Linux (see docker-compose.linux.yml) the sweep reaches all LAN devices
-        # directly.  When behind Docker NAT it may only see the gateway; we
-        # still merge in whatever ARP replies we do receive to back-fill MACs
-        # and pick up any hosts that nmap/Pi-hole missed.
-        arp_hosts = arp_sweep(network)
-        if arp_hosts:
-            for arp_host in arp_hosts:
-                ip = arp_host["ip"]
-                if ip in host_by_ip:
-                    # ARP gives us the authoritative MAC; always overwrite.
-                    host_by_ip[ip]["mac"] = arp_host["mac"]
-                else:
-                    hosts.append(arp_host)
-                    host_by_ip[ip] = arp_host
-            log.info("arp_augment_done", arp_found=len(arp_hosts), total_after_augment=len(hosts))
-        else:
-            log.info("arp_sweep_empty", network=network, note="continuing with layer3 results only")
+            # ── Step 5: NetBIOS/NBNS subnet scan ─────────────────────────────────
+            netbios_data: dict[str, dict] = netbios_scan(network) if NETBIOS_ENABLED else {}
 
-        # ── Step 4: SSDP/UPnP — add any IPs only found via SSDP ─────────────
-        for ip, ssdp_entry in ssdp_data.items():
-            if ip not in host_by_ip:
-                host: dict = {"ip": ip}
-                hosts.append(host)
-                host_by_ip[ip] = host
+            # ── Step 6: NDP table — back-fill IPv6 addresses ─────────────────────
+            # Read the kernel Neighbour Discovery Protocol (NDP) cache to obtain
+            # the globally-routable IPv6 address for each device we have already
+            # resolved to a MAC address.  This is a best-effort step; devices
+            # without IPv6 connectivity (or behind NAT64) will simply have no entry.
+            ndp_cache: dict[str, str] = ndp_table()  # MAC (upper) → IPv6 address
 
-        # ── Step 5: NetBIOS/NBNS subnet scan ─────────────────────────────────
-        netbios_data: dict[str, dict] = netbios_scan(network) if NETBIOS_ENABLED else {}
+            new_count = 0
 
-        # ── Step 6: NDP table — back-fill IPv6 addresses ─────────────────────
-        # Read the kernel Neighbour Discovery Protocol (NDP) cache to obtain
-        # the globally-routable IPv6 address for each device we have already
-        # resolved to a MAC address.  This is a best-effort step; devices
-        # without IPv6 connectivity (or behind NAT64) will simply have no entry.
-        ndp_cache: dict[str, str] = ndp_table()  # MAC (upper) → IPv6 address
+            for host in hosts:
+                # Ensure every host has a MAC address.  nmap ping-sweep hosts may
+                # arrive without one; try ARP resolution first, then fall back to
+                # a synthetic locally-administered MAC derived from the IP so that
+                # every reachable device can still be tracked and stored.
+                if not host.get("mac"):
+                    mac = arp_resolve(host["ip"])
+                    if mac:
+                        host["mac"] = mac
+                    else:
+                        host["mac"] = _synthetic_mac_for_ip(host["ip"])
+                        log.debug(
+                            "synthetic_mac_assigned",
+                            ip=host["ip"],
+                            mac=host["mac"],
+                            reason="arp_unavailable",
+                        )
 
-        new_count = 0
+                # Back-fill IPv6 address from NDP cache (keyed by upper-cased MAC).
+                if not host.get("ipv6"):
+                    host["ipv6"] = ndp_cache.get(host["mac"].upper(), "")
 
-        for host in hosts:
-            # Ensure every host has a MAC address.  nmap ping-sweep hosts may
-            # arrive without one; try ARP resolution first, then fall back to
-            # a synthetic locally-administered MAC derived from the IP so that
-            # every reachable device can still be tracked and stored.
-            if not host.get("mac"):
-                mac = arp_resolve(host["ip"])
-                if mac:
-                    host["mac"] = mac
-                else:
-                    host["mac"] = _synthetic_mac_for_ip(host["ip"])
-                    log.debug(
-                        "synthetic_mac_assigned",
-                        ip=host["ip"],
-                        mac=host["mac"],
-                        reason="arp_unavailable",
-                    )
+                # ── Per-host enrichment ───────────────────────────────────────────
+                # Build the extra_info dict from all enrichment sources.
+                extra_info: dict = host.get("extra_info") or {}
 
-            # Back-fill IPv6 address from NDP cache (keyed by upper-cased MAC).
-            if not host.get("ipv6"):
-                host["ipv6"] = ndp_cache.get(host["mac"].upper(), "")
+                # Merge SSDP/UPnP data for this host's IP.
+                if host["ip"] in ssdp_data:
+                    extra_info.update(ssdp_data[host["ip"]])
 
-            # ── Per-host enrichment ───────────────────────────────────────────
-            # Build the extra_info dict from all enrichment sources.
-            extra_info: dict = host.get("extra_info") or {}
+                # Merge mDNS data for this host's IP.
+                if host["ip"] in mdns_data:
+                    mdns_entry = mdns_data[host["ip"]]
+                    extra_info["mdns_services"] = mdns_entry.get("mdns_services", [])
+                    # Prefer mDNS .local hostname over reverse-DNS if not already set.
+                    if mdns_entry.get("mdns_hostname") and not host.get("hostname"):
+                        host["hostname"] = mdns_entry["mdns_hostname"]
+                        extra_info["mdns_hostname"] = mdns_entry["mdns_hostname"]
 
-            # Merge SSDP/UPnP data for this host's IP.
-            if host["ip"] in ssdp_data:
-                extra_info.update(ssdp_data[host["ip"]])
+                # Merge NetBIOS data for this host's IP.
+                if host["ip"] in netbios_data:
+                    nb_entry = netbios_data[host["ip"]]
+                    extra_info.update(nb_entry)
+                    # Use NetBIOS name as hostname if nothing better is available.
+                    if nb_entry.get("netbios_name") and not host.get("hostname"):
+                        host["hostname"] = nb_entry["netbios_name"]
 
-            # Merge mDNS data for this host's IP.
-            if host["ip"] in mdns_data:
-                mdns_entry = mdns_data[host["ip"]]
-                extra_info["mdns_services"] = mdns_entry.get("mdns_services", [])
-                # Prefer mDNS .local hostname over reverse-DNS if not already set.
-                if mdns_entry.get("mdns_hostname") and not host.get("hostname"):
-                    host["hostname"] = mdns_entry["mdns_hostname"]
-                    extra_info["mdns_hostname"] = mdns_entry["mdns_hostname"]
+                # nmap port/OS scan + banner/cert grab + device-type classification.
+                # Pass the SSDP/mDNS/NetBIOS-merged dict as extra_seed so the
+                # helper merges banner results on top of it before classifying.
+                _enrich_and_classify(host, extra_seed=extra_info)
 
-            # Merge NetBIOS data for this host's IP.
-            if host["ip"] in netbios_data:
-                nb_entry = netbios_data[host["ip"]]
-                extra_info.update(nb_entry)
-                # Use NetBIOS name as hostname if nothing better is available.
-                if nb_entry.get("netbios_name") and not host.get("hostname"):
-                    host["hostname"] = nb_entry["netbios_name"]
+                is_new = upsert_device(conn, rdb, host)
+                if is_new:
+                    new_count += 1
 
-            host["hostname"] = host.get("hostname") or resolve_hostname(host["ip"])
-            host["vendor"] = host.get("vendor") or vendor_lookup(host["mac"])
+            # Check for IoT learning sessions that have passed the observation window.
+            process_completed_learnings(conn, rdb)
 
-            # nmap port/OS scan
-            scan_data = nmap_scan(host["ip"])
-            host.update(scan_data)
+            # Update scan record
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE scan_runs
+                    SET finished_at=NOW(), devices_found=%s, new_devices=%s, status='completed'
+                    WHERE id=%s
+                    """,
+                    (len(hosts), new_count, scan_id),
+                )
+            conn.commit()
+            log.info("scan_cycle_done", network=network, total=len(hosts), new=new_count)
 
-            # HTTP/HTTPS banner grabbing
-            banner_data = enrich_from_banners(host["ip"], host.get("open_ports", []))
-            if banner_data:
-                extra_info.update(banner_data)
-                # TLS cert CN can serve as a more accurate hostname.
-                if banner_data.get("tls_cn") and not host.get("hostname"):
-                    host["hostname"] = banner_data["tls_cn"]
-
-            host["extra_info"] = extra_info
-            host["device_type"] = guess_device_type(
-                host.get("vendor"), host.get("open_ports", []), host.get("os_guess"), extra_info,
-                host.get("hostname"),
-            )
-
-            is_new = upsert_device(conn, rdb, host)
-            if is_new:
-                new_count += 1
-
-        # Check for IoT learning sessions that have passed the observation window.
-        process_completed_learnings(conn, rdb)
-
-        # Update scan record
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                UPDATE scan_runs
-                SET finished_at=NOW(), devices_found=%s, new_devices=%s, status='completed'
-                WHERE id=%s
-                """,
-                (len(hosts), new_count, scan_id),
-            )
-        conn.commit()
-        log.info("scan_cycle_done", network=network, total=len(hosts), new=new_count)
-
-    conn.close()
+    finally:
+        conn.close()
 
 
 # ─── Redis subscriber (dashboard-triggered events) ───────────────────────────
