@@ -448,7 +448,25 @@ def logout():
 @app.route("/")
 @login_required
 def index():
-    return render_template("index.html")
+    return render_template("index.html", active_page="dashboard")
+
+
+@app.route("/honeypot")
+@login_required
+def honeypot_page():
+    return render_template("honeypot.html", active_page="honeypot")
+
+
+@app.route("/scans")
+@login_required
+def scans_page():
+    return render_template("scans.html", active_page="scans")
+
+
+@app.route("/settings")
+@login_required
+def settings_page():
+    return render_template("settings.html", active_page="settings")
 
 
 # --- API: Devices ---
@@ -1233,12 +1251,13 @@ def api_stats():
         cur.execute(
             """
             SELECT
-                COUNT(*) FILTER (WHERE status='trusted')     AS trusted,
-                COUNT(*) FILTER (WHERE status='quarantined') AS quarantined,
-                COUNT(*) FILTER (WHERE status='blocked')     AS blocked,
-                COUNT(*) FILTER (WHERE status='iot')         AS iot,
-                COUNT(*) FILTER (WHERE status='new')         AS new_devices,
-                COUNT(*)                                     AS total
+                COUNT(*) FILTER (WHERE status='trusted')      AS trusted,
+                COUNT(*) FILTER (WHERE status='quarantined')  AS quarantined,
+                COUNT(*) FILTER (WHERE status='blocked')      AS blocked,
+                COUNT(*) FILTER (WHERE status='iot')          AS iot,
+                COUNT(*) FILTER (WHERE status='iot_learning') AS iot_learning,
+                COUNT(*) FILTER (WHERE status='new')          AS new_devices,
+                COUNT(*)                                      AS total
             FROM devices
             """
         )
@@ -1248,16 +1267,26 @@ def api_stats():
         hp_total = cur.fetchone()["total"]
 
         cur.execute(
+            "SELECT COUNT(*) AS critical FROM honeypot_events WHERE severity IN ('critical','high')"
+        )
+        hp_critical = cur.fetchone()["critical"]
+
+        cur.execute(
             "SELECT COUNT(*) AS unacked FROM alerts WHERE acknowledged=FALSE AND level IN ('warning','critical')"
         )
         unacked = cur.fetchone()["unacked"]
+
+        cur.execute("SELECT COUNT(*) AS total FROM scan_runs")
+        scan_runs = cur.fetchone()["total"]
 
     conn.close()
     return jsonify(
         {
             "devices": device_stats,
             "honeypot_hits": hp_total,
+            "honeypot_critical": hp_critical,
             "unacked_alerts": unacked,
+            "scan_runs": scan_runs,
         }
     )
 

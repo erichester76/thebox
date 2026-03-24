@@ -1,358 +1,7 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8"/>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>TheBox — Network Command Center</title>
-  <style>
-    /* ── Reset & base ───────────────────────────────── */
-    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+{% extends "base.html" %}
+{% block title %}Dashboard{% endblock %}
 
-    /* ── Dark theme (default) ───────────────────────── */
-    :root {
-      --bg:       #0d1117;
-      --surface:  #161b22;
-      --border:   #30363d;
-      --accent:   #58a6ff;
-      --success:  #3fb950;
-      --warning:  #d29922;
-      --danger:   #f85149;
-      --muted:    #8b949e;
-      --text:     #c9d1d9;
-      --radius:   8px;
-      --shadow:   0 1px 3px rgba(0,0,0,.4);
-    }
-
-    /* ── Light theme ────────────────────────────────── */
-    body.light {
-      --bg:       #f6f8fa;
-      --surface:  #ffffff;
-      --border:   #d0d7de;
-      --accent:   #0969da;
-      --success:  #1a7f37;
-      --warning:  #9a6700;
-      --danger:   #cf222e;
-      --muted:    #57606a;
-      --text:     #24292f;
-      --shadow:   0 1px 3px rgba(0,0,0,.12);
-    }
-
-    body {
-      background: var(--bg);
-      color: var(--text);
-      font-family: system-ui, sans-serif;
-      font-size: 14px;
-      min-height: 100vh;
-      transition: background .2s, color .2s;
-    }
-
-    /* ── Layout ────────────────────────────────────── */
-    header {
-      background: var(--surface);
-      border-bottom: 1px solid var(--border);
-      padding: 10px 24px;
-      display: flex;
-      align-items: center;
-      gap: 12px;
-      box-shadow: var(--shadow);
-    }
-    header h1 { font-size: 18px; font-weight: 700; color: var(--accent); }
-    header .pill {
-      background: var(--bg);
-      border: 1px solid var(--border);
-      border-radius: 99px;
-      padding: 2px 10px;
-      font-size: 12px;
-      color: var(--muted);
-    }
-    #live-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); display: inline-block; margin-right: 4px; }
-    #live-dot.online { background: var(--success); animation: pulse 2s infinite; }
-    @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:0.4; } }
-
-    /* Theme toggle button */
-    #theme-toggle {
-      background: var(--bg);
-      border: 1px solid var(--border);
-      border-radius: 6px;
-      padding: 4px 10px;
-      font-size: 14px;
-      cursor: pointer;
-      color: var(--text);
-      transition: background .2s, border-color .2s;
-    }
-    #theme-toggle:hover { opacity: .8; }
-
-    /* ── 3-column grid ──────────────────────────────── */
-    main {
-      display: grid;
-      grid-template-columns: 1fr 1fr 1fr;
-      gap: 16px;
-      padding: 20px 24px;
-      max-width: 1600px;
-      margin: auto;
-    }
-    @media (max-width: 1100px) { main { grid-template-columns: 1fr 1fr; } }
-    @media (max-width: 700px)  { main { grid-template-columns: 1fr; } }
-
-    /* ── Cards ─────────────────────────────────────── */
-    .card {
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: var(--radius);
-      overflow: hidden;
-      box-shadow: var(--shadow);
-      transition: background .2s, border-color .2s;
-    }
-    .card-header {
-      padding: 10px 16px;
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      border-bottom: 1px solid var(--border);
-    }
-    .card-header h2 { font-size: 13px; font-weight: 600; color: var(--text); }
-    .card-body { padding: 14px 16px; }
-    /* Span helpers */
-    .span-3 { grid-column: 1 / -1; }
-    .span-2 { grid-column: span 2; }
-    @media (max-width: 1100px) { .span-2 { grid-column: 1 / -1; } }
-
-    /* ── Compact stats bar ──────────────────────────── */
-    #stats-bar {
-      display: flex;
-      gap: 0;
-      flex-wrap: wrap;
-      /* dividers between items */
-    }
-    .cstat {
-      flex: 1;
-      min-width: 90px;
-      padding: 10px 14px;
-      text-align: center;
-      border-right: 1px solid var(--border);
-      position: relative;
-    }
-    .cstat:last-child { border-right: none; }
-    .cstat .val { font-size: 22px; font-weight: 700; line-height: 1.1; }
-    .cstat .lbl { font-size: 10px; color: var(--muted); margin-top: 2px; text-transform: uppercase; letter-spacing: .05em; white-space: nowrap; }
-    .cstat .src { font-size: 9px; color: var(--muted); opacity: .6; text-transform: uppercase; letter-spacing: .04em; }
-    .cstat.trusted    .val { color: var(--success); }
-    .cstat.quarantine .val { color: var(--warning); }
-    .cstat.blocked    .val { color: var(--danger);  }
-    .cstat.iot        .val { color: var(--accent);  }
-    .cstat.honeypot   .val { color: #c084fc; }
-    .cstat.alerts     .val { color: var(--warning); }
-    .cstat.ph-blocked .val { color: var(--danger);  }
-    .cstat.ph-pct     .val { color: var(--warning); }
-    .cstat.ph-gravity .val { color: var(--success); }
-    /* Section divider inside stats bar */
-    .cstat-sep {
-      width: 1px;
-      background: var(--border);
-      margin: 6px 0;
-      opacity: .5;
-    }
-    .stats-section-label {
-      font-size: 9px;
-      text-transform: uppercase;
-      letter-spacing: .08em;
-      color: var(--muted);
-      padding: 4px 10px 0;
-      opacity: .7;
-      white-space: nowrap;
-      align-self: flex-end;
-      writing-mode: horizontal-tb;
-    }
-
-    /* ── Tables ─────────────────────────────────────── */
-    table { width: 100%; border-collapse: collapse; }
-    th { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); padding: 6px 8px; text-align: left; border-bottom: 1px solid var(--border); }
-    th.sortable { cursor: pointer; user-select: none; white-space: nowrap; }
-    th.sortable:hover { color: var(--text); }
-    th.sortable::after { content: ' ⇅'; opacity: .4; font-size: 10px; }
-    th.sort-asc::after  { content: ' ↑'; opacity: 1; color: var(--accent); }
-    th.sort-desc::after { content: ' ↓'; opacity: 1; color: var(--accent); }
-    th.sort-asc, th.sort-desc { color: var(--accent); }
-    td { padding: 7px 8px; border-bottom: 1px solid var(--border); vertical-align: middle; }
-    tr:last-child td { border-bottom: none; }
-    tr:hover td { background: rgba(88,166,255,0.05); }
-    body.light tr:hover td { background: rgba(9,105,218,0.06); }
-
-    /* ── Status badges ──────────────────────────────── */
-    .badge { display: inline-block; padding: 2px 8px; border-radius: 99px; font-size: 11px; font-weight: 600; }
-    .badge-trusted    { background: rgba(63,185,80,.15);  color: var(--success); }
-    .badge-quarantine { background: rgba(210,153,34,.15); color: var(--warning); }
-    .badge-blocked    { background: rgba(248,81,73,.15);  color: var(--danger);  }
-    .badge-iot        { background: rgba(88,166,255,.15); color: var(--accent);  }
-    .badge-new        { background: rgba(139,148,158,.15);color: var(--muted);   }
-    .badge-low        { background: rgba(63,185,80,.15);  color: var(--success); }
-    .badge-high       { background: rgba(210,153,34,.15); color: var(--warning); }
-    .badge-critical   { background: rgba(248,81,73,.15);  color: var(--danger);  }
-    .badge-group      { background: rgba(139,148,158,.15);color: var(--text); margin: 1px; }
-
-    /* ── Buttons ────────────────────────────────────── */
-    .btn { border: none; border-radius: 6px; padding: 4px 8px; font-size: 12px; cursor: pointer; font-weight: 600; background: rgba(139,148,158,.15); color: var(--text); }
-    .btn-trust  { background: rgba(63,185,80,.15);  color: var(--success); }
-    .btn-block  { background: rgba(248,81,73,.15);  color: var(--danger);  }
-    .btn-iot    { background: rgba(88,166,255,.15); color: var(--accent);  }
-    .btn-ack    { background: rgba(139,148,158,.15);color: var(--muted);   }
-    .btn-user   { background: rgba(139,148,158,.15);color: var(--text);    }
-    .btn-danger { background: rgba(248,81,73,.15);  color: var(--danger);  }
-    .btn:hover  { opacity: .8; }
-    .btn-actions { white-space: nowrap; }
-    .ml-auto { margin-left: auto; }
-    .filter-select { margin-left: 12px; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 3px 8px; color: var(--text); font-size: 13px; }
-
-    /* ── Modal ──────────────────────────────────────── */
-    .modal-backdrop { display:none; position:fixed; inset:0; background:rgba(0,0,0,.6); z-index:100; align-items:center; justify-content:center; }
-    .modal-backdrop.open { display:flex; }
-    .modal { background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); padding:24px; min-width:320px; max-width:520px; width:100%; max-height:90vh; overflow-y:auto; }
-    .modal h3 { font-size:15px; font-weight:700; margin-bottom:16px; }
-    .modal label { display:block; font-size:12px; color:var(--muted); margin-bottom:4px; margin-top:12px; }
-    .modal input, .modal select, .modal textarea { width:100%; background:var(--bg); border:1px solid var(--border); border-radius:6px; padding:6px 10px; color:var(--text); font-size:13px; }
-    .modal input:focus, .modal select:focus, .modal textarea:focus { outline:none; border-color:var(--accent); }
-    .modal textarea { resize:vertical; min-height:100px; font-family:inherit; }
-    .modal-actions { display:flex; gap:8px; justify-content:flex-end; margin-top:20px; }
-    .btn-primary { background:var(--accent); color:#fff; padding:6px 16px; font-size:13px; }
-
-    /* ── Checklist (group membership editor) ────────── */
-    .checklist { max-height:160px; overflow-y:auto; border:1px solid var(--border); border-radius:6px; padding:8px; background:var(--bg); }
-    .checklist label { display:flex; align-items:center; gap:8px; padding:4px 0; font-size:13px; color:var(--text); cursor:pointer; margin-top:0; }
-    .checklist input[type=checkbox] { width:auto; }
-
-    /* ── Form row ───────────────────────────────────── */
-    .form-row { display:flex; gap:8px; align-items:flex-end; flex-wrap:wrap; }
-    .form-row input { flex:1; min-width:120px; background:var(--bg); border:1px solid var(--border); border-radius:6px; padding:5px 10px; color:var(--text); font-size:12px; }
-    .form-row input:focus { outline:none; border-color:var(--accent); }
-
-    /* ── Alert list ─────────────────────────────────── */
-    .alert-item { padding: 9px 12px; border-left: 3px solid var(--muted); margin-bottom: 7px; background: var(--bg); border-radius: 0 6px 6px 0; }
-    .alert-item.warning  { border-left-color: var(--warning); }
-    .alert-item.critical { border-left-color: var(--danger); }
-    .alert-item.info     { border-left-color: var(--accent); }
-    .alert-title { font-weight: 600; margin-bottom: 2px; font-size: 13px; }
-    .alert-meta  { font-size: 11px; color: var(--muted); }
-
-    /* ── Empty state ────────────────────────────────── */
-    .empty { text-align: center; padding: 32px; color: var(--muted); }
-
-    /* ── Scrollable panels ──────────────────────────── */
-    .scrollable      { max-height: 400px; overflow-y: auto; }
-    .scrollable-tall { max-height: 520px; overflow-y: auto; }
-    .scrollable-sm   { max-height: 280px; overflow-y: auto; }
-
-    /* ── Honeypot table ─────────────────────────────── */
-    #hp-table-wrap table { font-size: 12px; }
-    #hp-table-wrap tr.clickable { cursor: pointer; }
-    #hp-table-wrap tr.clickable:hover td { background: rgba(88,166,255,0.08); }
-    .badge-sweep     { background: rgba(168,85,247,.15); color: #c084fc; }
-    .badge-none      { background: rgba(139,148,158,.15); color: var(--muted); }
-    .badge-banner    { background: rgba(88,166,255,.15);  color: var(--accent); }
-    .badge-data      { background: rgba(210,153,34,.15);  color: var(--warning); }
-    .badge-credentials { background: rgba(248,81,73,.15); color: var(--danger); }
-    .badge-commands  { background: rgba(248,81,73,.15);   color: var(--danger); }
-    .badge-scan      { background: rgba(139,148,158,.15); color: var(--muted); }
-    .badge-recon     { background: rgba(88,166,255,.15);  color: var(--accent); }
-    .badge-probe     { background: rgba(210,153,34,.15);  color: var(--warning); }
-    .badge-exploit   { background: rgba(248,81,73,.15);   color: var(--danger); }
-    .badge-brute_force { background: rgba(248,81,73,.15); color: var(--danger); }
-
-    /* ── Event detail modal ─────────────────────────── */
-    .event-detail-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 16px; }
-    .event-detail-grid .full { grid-column: 1 / -1; }
-    .event-detail-label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; margin-bottom: 2px; }
-    .event-detail-val { font-size: 13px; color: var(--text); font-family: monospace; word-break: break-all; }
-    .payload-box { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; font-family: monospace; font-size: 12px; white-space: pre-wrap; word-break: break-all; max-height: 200px; overflow-y: auto; color: var(--text); }
-
-    /* ── Pi-hole status badge ───────────────────────── */
-    #pihole-status-badge { font-size: 11px; padding: 2px 8px; border-radius: 99px; font-weight: 600; }
-    #pihole-status-badge.enabled  { background: rgba(63,185,80,.15);  color: var(--success); }
-    #pihole-status-badge.disabled { background: rgba(248,81,73,.15);  color: var(--danger); }
-    #pihole-status-badge.unknown  { background: rgba(139,148,158,.15); color: var(--muted); }
-
-    /* ── Settings panel ────────────────────────────── */
-    .settings-category { margin-bottom: 24px; }
-    .settings-category-title {
-      font-size: 12px;
-      font-weight: 700;
-      text-transform: uppercase;
-      letter-spacing: .07em;
-      color: var(--accent);
-      margin-bottom: 10px;
-      padding-bottom: 6px;
-      border-bottom: 1px solid var(--border);
-    }
-    .setting-row {
-      display: grid;
-      grid-template-columns: 220px 1fr auto;
-      gap: 8px;
-      align-items: center;
-      padding: 6px 0;
-      border-bottom: 1px solid rgba(48,54,61,.5);
-    }
-    .setting-row:last-child { border-bottom: none; }
-    .setting-key {
-      font-family: monospace;
-      font-size: 12px;
-      color: var(--text);
-      font-weight: 600;
-    }
-    .setting-desc { font-size: 11px; color: var(--muted); margin-top: 2px; }
-    .setting-input {
-      background: var(--bg);
-      border: 1px solid var(--border);
-      border-radius: 6px;
-      padding: 5px 8px;
-      font-size: 12px;
-      color: var(--text);
-      width: 100%;
-      font-family: monospace;
-    }
-    .setting-input:focus { outline: none; border-color: var(--accent); }
-    .setting-save-btn {
-      background: rgba(88,166,255,.15);
-      color: var(--accent);
-      border: none;
-      border-radius: 6px;
-      padding: 4px 10px;
-      font-size: 12px;
-      font-weight: 600;
-      cursor: pointer;
-      white-space: nowrap;
-    }
-    .setting-save-btn:hover { background: rgba(88,166,255,.25); }
-    .setting-save-btn.saved { background: rgba(63,185,80,.15); color: var(--success); }
-    .setting-save-btn.error { background: rgba(248,81,73,.15);  color: var(--danger); }
-    .settings-notice {
-      font-size: 11px;
-      color: var(--muted);
-      background: rgba(88,166,255,.07);
-      border: 1px solid rgba(88,166,255,.2);
-      border-radius: 6px;
-      padding: 8px 12px;
-      margin-bottom: 16px;
-    }
-    /* ── Device detail modal ────────────────────────── */
-    .allowlist-entry { display:flex; align-items:center; gap:8px; padding:5px 0; border-bottom:1px solid var(--border); }
-    .allowlist-entry:last-child { border-bottom:none; }
-    .allowlist-fqdn { flex:1; font-family:monospace; font-size:13px; word-break:break-all; }
-    .allowlist-date { font-size:11px; color:var(--muted); white-space:nowrap; }
-    #allowlist-entries { max-height:220px; overflow-y:auto; }
-    .section-label { font-size:12px; font-weight:600; text-transform:uppercase; letter-spacing:.06em; color:var(--muted); margin:16px 0 8px; }
-  </style>
-</head>
-<body>
-
-<header>
-  <h1>🛡 TheBox</h1>
-  <span class="pill">Network Command Center</span>
-  <span style="margin-left:auto;display:flex;align-items:center;gap:12px;font-size:12px;color:var(--muted)">
-    <span style="display:flex;align-items:center"><span id="live-dot"></span><span id="live-label">Connecting…</span></span>
-    <button id="theme-toggle" onclick="toggleTheme()" title="Toggle dark/light mode">☀️</button>
-    <a href="/logout" style="color:var(--muted);text-decoration:none;padding:4px 8px;border:1px solid var(--border);border-radius:4px;" title="Sign out">Sign out</a>
-  </span>
-</header>
-
+{% block content %}
 <main>
 
   <!-- Combined stats bar (full width) -->
@@ -363,25 +12,45 @@
       <button class="btn btn-ack ml-auto" onclick="loadStats();loadPihole()">Refresh</button>
     </div>
     <div id="stats-bar">
-      <!-- Network device stats -->
-      <div class="cstat trusted">   <div class="val" id="s-trusted">–</div>   <div class="lbl">Trusted</div>    <div class="src">devices</div></div>
-      <div class="cstat quarantine"><div class="val" id="s-quarantine">–</div><div class="lbl">Quarantined</div><div class="src">devices</div></div>
-      <div class="cstat blocked">   <div class="val" id="s-blocked">–</div>   <div class="lbl">Blocked</div>    <div class="src">devices</div></div>
-      <div class="cstat iot">       <div class="val" id="s-iot">–</div>       <div class="lbl">IoT</div>         <div class="src">devices</div></div>
-      <div class="cstat">           <div class="val" id="s-total">–</div>     <div class="lbl">Total</div>       <div class="src">devices</div></div>
-      <div class="cstat honeypot">  <div class="val" id="s-honeypot">–</div>  <div class="lbl">HP Hits</div>    <div class="src">honeypot</div></div>
-      <div class="cstat alerts">    <div class="val" id="s-alerts">–</div>    <div class="lbl">Open Alerts</div><div class="src">alerts</div></div>
-      <!-- Pi-hole stats -->
-      <div class="cstat">           <div class="val" id="ph-total">–</div>    <div class="lbl">DNS Queries</div> <div class="src">pi-hole</div></div>
-      <div class="cstat ph-blocked"><div class="val" id="ph-blocked">–</div>  <div class="lbl">DNS Blocked</div> <div class="src">pi-hole</div></div>
-      <div class="cstat ph-pct">    <div class="val" id="ph-pct">–</div>      <div class="lbl">% Blocked</div>   <div class="src">pi-hole</div></div>
-      <div class="cstat ph-gravity"><div class="val" id="ph-gravity">–</div>  <div class="lbl">Block Lists</div> <div class="src">pi-hole</div></div>
-      <div class="cstat">           <div class="val" id="ph-clients">–</div>  <div class="lbl">DNS Clients</div> <div class="src">pi-hole</div></div>
+      <!-- Device stats group -->
+      <div class="stats-group">
+        <span class="stats-group-label">Devices</span>
+        <div class="stats-group-items">
+          <div class="cstat trusted clickable"      title="Show trusted devices"      onclick="setDeviceFilter('trusted')">     <div class="val" id="s-trusted">–</div>       <div class="lbl">Trusted</div></div>
+          <div class="cstat quarantine clickable"   title="Show quarantined devices"  onclick="setDeviceFilter('quarantined')"> <div class="val" id="s-quarantine">–</div>   <div class="lbl">Quarantined</div></div>
+          <div class="cstat blocked clickable"      title="Show blocked devices"      onclick="setDeviceFilter('blocked')">     <div class="val" id="s-blocked">–</div>       <div class="lbl">Blocked</div></div>
+          <div class="cstat iot clickable"          title="Show IoT devices"          onclick="setDeviceFilter('iot')">         <div class="val" id="s-iot">–</div>           <div class="lbl">IoT</div></div>
+          <div class="cstat iot-learning clickable" title="Show IoT learning devices" onclick="setDeviceFilter('iot_learning')"><div class="val" id="s-iot-learning">–</div>  <div class="lbl">IoT Learning</div></div>
+          <div class="cstat new-dev clickable"      title="Show new devices"          onclick="setDeviceFilter('new')">         <div class="val" id="s-new">–</div>           <div class="lbl">New</div></div>
+          <div class="cstat clickable"              title="Show all devices"          onclick="setDeviceFilter('')">            <div class="val" id="s-total">–</div>         <div class="lbl">Total</div></div>
+        </div>
+      </div>
+      <!-- Activity stats group -->
+      <div class="stats-group">
+        <span class="stats-group-label">Activity</span>
+        <div class="stats-group-items">
+          <div class="cstat honeypot clickable"    title="View all honeypot events"  onclick="window.location='/honeypot'"><div class="val" id="s-honeypot">–</div>    <div class="lbl">HP Hits</div></div>
+          <div class="cstat hp-critical clickable" title="View critical HP events"   onclick="window.location='/honeypot'"><div class="val" id="s-hp-critical">–</div><div class="lbl">HP Critical</div></div>
+          <div class="cstat alerts clickable"      title="Scroll to alerts"          onclick="scrollToAlerts()">           <div class="val" id="s-alerts">–</div>     <div class="lbl">Open Alerts</div></div>
+          <div class="cstat clickable"             title="View scan history"         onclick="window.location='/scans'">   <div class="val" id="s-scans">–</div>      <div class="lbl">Scan Runs</div></div>
+        </div>
+      </div>
+      <!-- Pi-hole stats group -->
+      <div class="stats-group">
+        <span class="stats-group-label">Pi-hole DNS</span>
+        <div class="stats-group-items">
+          <div class="cstat">            <div class="val" id="ph-total">–</div>   <div class="lbl">DNS Queries</div></div>
+          <div class="cstat ph-blocked"> <div class="val" id="ph-blocked">–</div> <div class="lbl">DNS Blocked</div></div>
+          <div class="cstat ph-pct">     <div class="val" id="ph-pct">–</div>     <div class="lbl">% Blocked</div></div>
+          <div class="cstat ph-gravity"> <div class="val" id="ph-gravity">–</div> <div class="lbl">Block Lists</div></div>
+          <div class="cstat">            <div class="val" id="ph-clients">–</div> <div class="lbl">DNS Clients</div></div>
+        </div>
+      </div>
     </div>
   </div>
 
   <!-- Devices table (full width) -->
-  <div class="card span-3">
+  <div class="card span-3" id="devices-card">
     <div class="card-header">
       <h2>Devices</h2>
       <select id="device-status-filter" class="filter-select" onchange="loadDevices()">
@@ -417,36 +86,14 @@
     </div>
   </div>
 
-  <!-- Honeypot feed (2/3 width) + Alerts (1/3 width) side by side -->
-  <div class="card span-2">
-    <div class="card-header">
-      <h2>Honeypot Activity</h2>
-      <span style="font-size:11px;color:var(--muted)">Click row for details</span>
-      <button class="btn btn-ack ml-auto" onclick="loadHoneypot()">Refresh</button>
-    </div>
-    <div class="card-body scrollable-tall" id="hp-table-wrap">
-      <table id="hp-table">
-        <thead><tr>
-          <th>Time</th>
-          <th>Source IP</th>
-          <th>Dst Port</th>
-          <th>Interaction</th>
-          <th>Intent</th>
-          <th>Severity</th>
-        </tr></thead>
-        <tbody id="hp-body"><tr><td colspan="6" class="empty">Loading…</td></tr></tbody>
-      </table>
-    </div>
-  </div>
-
-  <!-- Alerts panel (1/3 width, beside honeypot) -->
-  <div class="card">
+  <!-- Alerts (full width) -->
+  <div class="card span-3" id="alerts-card">
     <div class="card-header">
       <h2>Recent Alerts</h2>
       <button class="btn btn-ack ml-auto" onclick="ackAllAlerts()" title="Acknowledge all open warnings and critical alerts">Ack All</button>
       <button class="btn btn-ack" onclick="loadAlerts()">Refresh</button>
     </div>
-    <div class="card-body scrollable-tall" id="alerts-list"><div class="empty">Loading…</div></div>
+    <div class="card-body scrollable" id="alerts-list"><div class="empty">Loading…</div></div>
   </div>
 
   <!-- Users management -->
@@ -457,9 +104,9 @@
     </div>
     <div class="card-body">
       <div class="form-row" style="margin-bottom:16px">
-        <input id="new-username"     type="text" placeholder="Username *" />
-        <input id="new-displayname"  type="text" placeholder="Display name" />
-        <input id="new-email"        type="email" placeholder="Email" />
+        <input id="new-username"    type="text"  placeholder="Username *" />
+        <input id="new-displayname" type="text"  placeholder="Display name" />
+        <input id="new-email"       type="email" placeholder="Email" />
         <button class="btn btn-primary" onclick="createUser()">Add User</button>
       </div>
       <div class="scrollable">
@@ -482,9 +129,9 @@
     </div>
     <div class="card-body">
       <div class="form-row" style="margin-bottom:16px">
-        <input id="new-groupname"        type="text"  placeholder="Group name *" />
-        <input id="new-groupdesc"        type="text"  placeholder="Description" />
-        <input id="new-pihole-groupname" type="text"  placeholder="Pi-hole group name" />
+        <input id="new-groupname"        type="text" placeholder="Group name *" />
+        <input id="new-groupdesc"        type="text" placeholder="Description" />
+        <input id="new-pihole-groupname" type="text" placeholder="Pi-hole group name" />
         <button class="btn btn-primary" onclick="createGroup()">Add Group</button>
       </div>
       <div class="scrollable">
@@ -499,53 +146,10 @@
     </div>
   </div>
 
-  <!-- Configuration Settings -->
-  <div class="card span-3">
-    <div class="card-header">
-      <h2>⚙️ Configuration Settings</h2>
-      <button class="btn btn-ack ml-auto" onclick="loadSettings()">Refresh</button>
-    </div>
-    <div class="card-body">
-      <div class="settings-notice">
-        Settings are stored in the database. Changes take effect on next service restart
-        (Pi-hole URL/password apply immediately to the dashboard). Environment variables
-        are only used to seed initial values.
-      </div>
-      <div id="settings-container"><div class="empty">Loading…</div></div>
-  <!-- Scan run history -->
-  <div class="card span-3">
-    <div class="card-header">
-      <h2>Scan History</h2>
-      <button class="btn btn-ack ml-auto" onclick="loadScanRuns()">Refresh</button>
-    </div>
-    <div class="card-body scrollable">
-      <table id="scan-runs-table">
-        <thead><tr>
-          <th>Started</th>
-          <th>Finished</th>
-          <th>Network</th>
-          <th>Devices Found</th>
-          <th>New Devices</th>
-          <th>Status</th>
-        </tr></thead>
-        <tbody id="scan-runs-body"><tr><td colspan="6" class="empty">Loading…</td></tr></tbody>
-      </table>
-    </div>
-  </div>
-
 </main>
+{% endblock %}
 
-<!-- Honeypot Event Detail Modal -->
-<div class="modal-backdrop" id="hp-event-modal">
-  <div class="modal" style="max-width:640px">
-    <h3>Honeypot Event Detail</h3>
-    <div class="event-detail-grid" id="hp-event-grid"></div>
-    <div class="modal-actions" style="margin-top:16px">
-      <button class="btn btn-ack" onclick="closeHpEventModal()">Close</button>
-    </div>
-  </div>
-</div>
-
+{% block modals %}
 <!-- Assign User Modal -->
 <div class="modal-backdrop" id="assign-modal">
   <div class="modal">
@@ -638,65 +242,31 @@
     </div>
   </div>
 </div>
+{% endblock %}
 
+{% block scripts %}
 <script>
-// ── Theme toggle ─────────────────────────────────────────────────────────────
-function applyTheme(theme) {
-  const isLight = theme === 'light';
-  document.body.classList.toggle('light', isLight);
-  const btn = document.getElementById('theme-toggle');
-  if (btn) btn.textContent = isLight ? '🌙' : '☀️';
-}
-
-function toggleTheme() {
-  const isLight = document.body.classList.toggle('light');
-  document.getElementById('theme-toggle').textContent = isLight ? '🌙' : '☀️';
-  localStorage.setItem('thebox-theme', isLight ? 'light' : 'dark');
-}
-
-// Apply saved theme on load (before DOMContentLoaded)
-applyTheme(localStorage.getItem('thebox-theme') || 'dark');
-
-// ── API helpers ──────────────────────────────────────────────────────────────
-async function api(path, opts={}) {
-  const r = await fetch(path, opts);
-  if (r.status === 401) { window.location.href = '/login'; throw new Error('Unauthenticated'); }
-  if (!r.ok) throw new Error(await r.text());
-  return r.json();
-}
-
-function fmtDate(iso) {
-  if (!iso) return '–';
-  return new Date(iso).toLocaleString();
-}
-
-function escHtml(s) {
-  if (!s) return '';
-  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
-}
-
-function statusBadge(s) {
-  const map = { trusted:'trusted', quarantined:'quarantine', blocked:'blocked', iot:'iot', new:'new' };
-  return `<span class="badge badge-${map[s]||'new'}">${escHtml(s)}</span>`;
-}
-
-function severityBadge(s) {
-  return `<span class="badge badge-${escHtml(s)||'low'}">${escHtml(s)||'low'}</span>`;
-}
-
-// ── Stats ────────────────────────────────────────────────────────────────────
+// ── Stats ────────────────────────────────────────────
 async function loadStats() {
   const d = await api('/api/stats');
-  document.getElementById('s-trusted').textContent    = d.devices.trusted;
-  document.getElementById('s-quarantine').textContent = d.devices.quarantined;
-  document.getElementById('s-blocked').textContent    = d.devices.blocked;
-  document.getElementById('s-iot').textContent        = d.devices.iot;
-  document.getElementById('s-total').textContent      = d.devices.total;
-  document.getElementById('s-honeypot').textContent   = d.honeypot_hits;
-  document.getElementById('s-alerts').textContent     = d.unacked_alerts;
+  document.getElementById('s-trusted').textContent      = d.devices.trusted;
+  document.getElementById('s-quarantine').textContent   = d.devices.quarantined;
+  document.getElementById('s-blocked').textContent      = d.devices.blocked;
+  document.getElementById('s-iot').textContent          = d.devices.iot;
+  document.getElementById('s-iot-learning').textContent = d.devices.iot_learning;
+  document.getElementById('s-new').textContent          = d.devices.new_devices;
+  document.getElementById('s-total').textContent        = d.devices.total;
+  document.getElementById('s-honeypot').textContent     = d.honeypot_hits;
+  document.getElementById('s-hp-critical').textContent  = d.honeypot_critical;
+  document.getElementById('s-alerts').textContent       = d.unacked_alerts;
+  document.getElementById('s-scans').textContent        = d.scan_runs;
 }
 
-// ── Pi-hole ──────────────────────────────────────────────────────────────────
+function scrollToAlerts() {
+  document.getElementById('alerts-card').scrollIntoView({ behavior: 'smooth' });
+}
+
+// ── Pi-hole ────────────────────────────────────────────
 async function loadPihole() {
   const badge = document.getElementById('pihole-status-badge');
   try {
@@ -716,10 +286,17 @@ async function loadPihole() {
   }
 }
 
-// ── Devices ──────────────────────────────────────────────────────────────────
+// ── Devices ────────────────────────────────────────────
 let _devices = [];
 let _sortCol = 'last_seen';
-let _sortDir = -1; // -1 = desc (newest first default), 1 = asc
+let _sortDir = -1;
+
+function setDeviceFilter(status) {
+  const sel = document.getElementById('device-status-filter');
+  sel.value = status;
+  loadDevices();
+  document.getElementById('devices-card').scrollIntoView({ behavior: 'smooth' });
+}
 
 function sortDevices(col) {
   if (_sortCol === col) {
@@ -735,7 +312,6 @@ function renderDevices() {
   const tbody = document.getElementById('devices-body');
   if (!_devices.length) { tbody.innerHTML = '<tr><td colspan="11" class="empty">No devices yet</td></tr>'; return; }
 
-  // Update sort indicators on headers
   document.querySelectorAll('#devices-table thead th').forEach(th => {
     th.classList.remove('sort-asc', 'sort-desc');
   });
@@ -820,7 +396,7 @@ async function setStatus(id, status) {
   loadDevices(); loadStats();
 }
 
-// ── Assign user modal ─────────────────────────────────────────────────────────
+// ── Assign user modal ──────────────────────────────────────────
 let _assignDeviceId = null;
 
 function openAssignModalFromBtn(btn) {
@@ -858,7 +434,7 @@ async function confirmAssign() {
   loadDevices();
 }
 
-// ── Device notes modal ────────────────────────────────────────────────────────
+// ── Device notes modal ─────────────────────────────────────────
 function openNotesModalFromBtn(btn) {
   openNotesModal(parseInt(btn.dataset.deviceId), btn.dataset.notes || '');
 }
@@ -890,7 +466,7 @@ async function confirmNotes() {
   loadDevices();
 }
 
-// ── Device detail modal ───────────────────────────────────────────────────────
+// ── Device detail modal ─────────────────────────────────────────
 let _detailDeviceId = null;
 
 async function openDeviceDetailModal(deviceId) {
@@ -979,15 +555,15 @@ async function removeAllowlistEntry(deviceId, entryId) {
   await loadDeviceAllowlist(deviceId);
 }
 
-// ── Alerts ───────────────────────────────────────────────────────────────────
+// ── Alerts ───────────────────────────────────────────────
 async function loadAlerts() {
   const alerts = await api('/api/alerts');
   const el = document.getElementById('alerts-list');
   if (!alerts.length) { el.innerHTML = '<div class="empty">No alerts</div>'; return; }
   el.innerHTML = alerts.slice(0,50).map(a => `
-    <div class="alert-item ${a.level}">
-      <div class="alert-title">${a.title}</div>
-      <div class="alert-meta">${fmtDate(a.created_at)} · ${a.source}
+    <div class="alert-item ${escHtml(a.level)}">
+      <div class="alert-title">${escHtml(a.title)}</div>
+      <div class="alert-meta">${fmtDate(a.created_at)} · ${escHtml(a.source)}
         ${a.acknowledged ? '' : `<button class="btn btn-ack" style="margin-left:8px" onclick="ackAlert(${a.id})">Ack</button>`}
       </div>
     </div>`).join('');
@@ -1003,103 +579,7 @@ async function ackAllAlerts() {
   loadAlerts(); loadStats();
 }
 
-// ── Honeypot ─────────────────────────────────────────────────────────────────
-function intentBadge(s) {
-  const safe = escHtml(s || 'scan');
-  return `<span class="badge badge-${safe}">${safe}</span>`;
-}
-
-function interactionBadge(s) {
-  const safe = escHtml(s || 'none');
-  return `<span class="badge badge-${safe}">${safe}</span>`;
-}
-
-async function loadHoneypot() {
-  const rows = await api('/api/honeypot');
-  const tbody = document.getElementById('hp-body');
-  if (!rows.length) { tbody.innerHTML = '<tr><td colspan="6" class="empty">No honeypot activity</td></tr>'; return; }
-  tbody.innerHTML = rows.slice(0, 100).map(r => `
-    <tr class="clickable" onclick="openHpEventModal(${r.id})">
-      <td style="color:var(--muted);white-space:nowrap">${fmtDate(r.created_at)}</td>
-      <td style="color:var(--danger);font-family:monospace">${escHtml(r.src_ip)}${r.is_sweep ? ' <span class="badge badge-sweep">sweep</span>' : ''}</td>
-      <td style="color:var(--warning);font-family:monospace">${r.dst_port}</td>
-      <td>${interactionBadge(r.interaction_level)}</td>
-      <td>${intentBadge(r.intent)}</td>
-      <td>${severityBadge(r.severity)}</td>
-    </tr>`).join('');
-}
-
-async function openHpEventModal(eventId) {
-  let ev;
-  try { ev = await api(`/api/honeypot/${eventId}`); } catch(_) { return; }
-
-  let portsSel = null;
-  if (ev.ports_scanned) {
-    portsSel = typeof ev.ports_scanned === 'string'
-      ? JSON.parse(ev.ports_scanned)
-      : ev.ports_scanned;
-  }
-
-  document.getElementById('hp-event-grid').innerHTML = `
-    <div>
-      <div class="event-detail-label">Time</div>
-      <div class="event-detail-val">${fmtDate(ev.created_at)}</div>
-    </div>
-    <div>
-      <div class="event-detail-label">Event ID</div>
-      <div class="event-detail-val">#${ev.id}</div>
-    </div>
-    <div>
-      <div class="event-detail-label">Source IP</div>
-      <div class="event-detail-val">${escHtml(ev.src_ip)}</div>
-    </div>
-    <div>
-      <div class="event-detail-label">Source Port</div>
-      <div class="event-detail-val">${ev.src_port || '–'}</div>
-    </div>
-    <div>
-      <div class="event-detail-label">Destination Port</div>
-      <div class="event-detail-val">${ev.dst_port}</div>
-    </div>
-    <div>
-      <div class="event-detail-label">Protocol</div>
-      <div class="event-detail-val">${escHtml(ev.protocol)}</div>
-    </div>
-    <div>
-      <div class="event-detail-label">Severity</div>
-      <div class="event-detail-val">${severityBadge(ev.severity)}</div>
-    </div>
-    <div>
-      <div class="event-detail-label">Interaction Level</div>
-      <div class="event-detail-val">${interactionBadge(ev.interaction_level)}</div>
-    </div>
-    <div>
-      <div class="event-detail-label">Inferred Intent</div>
-      <div class="event-detail-val">${intentBadge(ev.intent)}</div>
-    </div>
-    <div>
-      <div class="event-detail-label">Port Sweep</div>
-      <div class="event-detail-val">${ev.is_sweep ? `<span class="badge badge-sweep">Yes</span>` : 'No'}</div>
-    </div>
-    ${portsSel ? `
-    <div class="full">
-      <div class="event-detail-label">Ports Scanned</div>
-      <div class="event-detail-val">${escHtml(portsSel.join(', '))}</div>
-    </div>` : ''}
-    ${ev.payload_preview ? `
-    <div class="full">
-      <div class="event-detail-label">Protocol Conversation</div>
-      <div class="payload-box">${escHtml(ev.payload_preview)}</div>
-    </div>` : ''}
-  `;
-  document.getElementById('hp-event-modal').classList.add('open');
-}
-
-function closeHpEventModal() {
-  document.getElementById('hp-event-modal').classList.remove('open');
-}
-
-// ── Users ────────────────────────────────────────────────────────────────────
+// ── Users ────────────────────────────────────────────────
 async function loadUsers() {
   const users = await api('/api/users');
   const tbody = document.getElementById('users-body');
@@ -1156,9 +636,9 @@ function openEditUserModalFromBtn(btn) {
 }
 
 function openEditUserModal(id, displayName, email) {
-  document.getElementById('edit-user-id').value      = id;
-  document.getElementById('edit-displayname').value  = displayName;
-  document.getElementById('edit-email').value        = email;
+  document.getElementById('edit-user-id').value     = id;
+  document.getElementById('edit-displayname').value = displayName;
+  document.getElementById('edit-email').value       = email;
   document.getElementById('edit-user-modal').classList.add('open');
 }
 
@@ -1202,7 +682,7 @@ async function deleteUser(id, username) {
   loadUsers(); loadDevices();
 }
 
-// ── Groups ───────────────────────────────────────────────────────────────────
+// ── Groups ───────────────────────────────────────────────
 async function loadGroups() {
   const groups = await api('/api/groups');
   const tbody = document.getElementById('groups-body');
@@ -1305,35 +785,13 @@ async function deleteGroup(id, name) {
   loadGroups(); loadUsers(); loadDevices();
 }
 
-// ── Scan history ──────────────────────────────────────────────────────────────
-async function loadScanRuns() {
-  const rows = await api('/api/scan-runs');
-  const tbody = document.getElementById('scan-runs-body');
-  if (!rows.length) {
-    tbody.innerHTML = '<tr><td colspan="6" class="empty">No scan runs recorded yet</td></tr>';
-    return;
-  }
-  tbody.innerHTML = rows.map(r => {
-    const statusClassMap = {completed: 'trusted', running: 'iot', failed: 'blocked'};
-    const statusClass = statusClassMap[r.status] || 'new';
-    return `<tr>
-      <td style="white-space:nowrap">${fmtDate(r.started_at)}</td>
-      <td style="white-space:nowrap">${r.finished_at ? fmtDate(r.finished_at) : '<span style="color:var(--muted)">—</span>'}</td>
-      <td>${escHtml(r.network_range)}</td>
-      <td>${r.devices_found}</td>
-      <td>${r.new_devices}</td>
-      <td><span class="badge badge-${statusClass}">${escHtml(r.status)}</span></td>
-    </tr>`;
-  }).join('');
-}
-
-// ── Manage group members modal ────────────────────────────────────────────────
+// ── Manage group members modal ──────────────────────────────────
 async function openManageGroupModalFromBtn(btn) {
   openManageGroupModal(parseInt(btn.dataset.groupId), btn.dataset.groupName);
 }
 
 async function openManageGroupModal(groupId, groupName) {
-  document.getElementById('manage-group-id').value      = groupId;
+  document.getElementById('manage-group-id').value          = groupId;
   document.getElementById('manage-group-title').textContent = `Manage Members — ${groupName}`;
 
   const [allUsers, allDevices, memberUsers, memberDevices] = await Promise.all([
@@ -1409,26 +867,8 @@ async function confirmManageGroup() {
   closeManageGroupModal();
   loadGroups(); loadUsers(); loadDevices();
 }
-function connectSSE() {
-  const es = new EventSource('/api/events');
-  const dot = document.getElementById('live-dot');
-  const lbl = document.getElementById('live-label');
 
-  es.onopen = () => { dot.classList.add('online'); lbl.textContent = 'Live'; };
-  es.onerror = () => { dot.classList.remove('online'); lbl.textContent = 'Reconnecting…'; };
-  es.onmessage = (e) => {
-    try {
-      const ev = JSON.parse(e.data);
-      if (ev.type === 'new_device') { loadDevices(); loadStats(); loadAlerts(); }
-      if (ev.type === 'device_status_changed') { loadDevices(); loadStats(); }
-    } catch (_) {}
-  };
-}
-
-// Close modals on backdrop click
-document.getElementById('hp-event-modal').addEventListener('click', function(e) {
-  if (e.target === this) closeHpEventModal();
-});
+// ── Close modals on backdrop click ───────────────────────────────
 document.getElementById('assign-modal').addEventListener('click', function(e) {
   if (e.target === this) closeAssignModal();
 });
@@ -1448,76 +888,14 @@ document.getElementById('device-detail-modal').addEventListener('click', functio
   if (e.target === this) closeDeviceDetailModal();
 });
 
-// ── Settings ─────────────────────────────────────────────────────────────────
-const CATEGORY_LABELS = {
-  general:    '🌐 General',
-  pihole:     '🕳️ Pi-hole',
-  discovery:  '🔍 Network Discovery',
-  guardian:   '🛡️ Device Guardian',
-  iot:        '📡 IoT Learning',
-  honeypot:   '🍯 Honeypot',
-  redirector: '↩️ Redirector',
-};
-
-async function loadSettings() {
-  const container = document.getElementById('settings-container');
-  try {
-    const grouped = await api('/api/settings');
-    if (!Object.keys(grouped).length) {
-      container.innerHTML = '<div class="empty">No settings found</div>';
-      return;
-    }
-    const order = ['general','pihole','discovery','guardian','iot','honeypot','redirector'];
-    const categories = [...new Set([...order, ...Object.keys(grouped)])].filter(c => grouped[c]);
-    container.innerHTML = categories.map(cat => `
-      <div class="settings-category">
-        <div class="settings-category-title">${escHtml(CATEGORY_LABELS[cat] || cat)}</div>
-        ${grouped[cat].map(s => `
-          <div class="setting-row">
-            <div>
-              <div class="setting-key">${escHtml(s.key)}</div>
-              ${s.description ? `<div class="setting-desc">${escHtml(s.description)}</div>` : ''}
-            </div>
-            <input class="setting-input" id="setting-${escHtml(s.key)}" type="${s.key.toLowerCase().includes('password') ? 'password' : 'text'}" value="${escHtml(s.value)}" aria-label="${escHtml(s.key)}" />
-            <button class="setting-save-btn" data-key="${escHtml(s.key)}" onclick="saveSetting(this)">Save</button>
-          </div>`).join('')}
-      </div>`).join('');
-  } catch(e) {
-    container.innerHTML = '<div class="empty" style="color:var(--danger)">Failed to load settings</div>';
-  }
-}
-
-async function saveSetting(btn) {
-  const key = btn.dataset.key;
-  const input = document.getElementById(`setting-${key}`);
-  const value = input.value;
-  btn.textContent = '…';
-  btn.className = 'setting-save-btn';
-  try {
-    await api(`/api/settings/${key}`, {
-      method: 'PUT',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({value}),
-    });
-    btn.textContent = 'Saved ✓';
-    btn.className = 'setting-save-btn saved';
-  } catch(e) {
-    btn.textContent = 'Error ✗';
-    btn.className = 'setting-save-btn error';
-    let msg = 'Failed to save setting.';
-    try { msg = JSON.parse(e.message).error || msg; } catch(_) {}
-    alert(msg);
-  }
-  setTimeout(() => { btn.textContent = 'Save'; btn.className = 'setting-save-btn'; }, 2500);
-}
-
-// ── Bootstrap ────────────────────────────────────────────────────────────────
+// ── Bootstrap ────────────────────────────────────────────────
 (async () => {
-  await Promise.all([loadStats(), loadPihole(), loadDevices(), loadAlerts(), loadHoneypot(), loadUsers(), loadGroups(), loadSettings(), loadScanRuns()]);
-  connectSSE();
-  // Periodic refresh
-  setInterval(() => { loadStats(); loadPihole(); loadAlerts(); loadHoneypot(); loadScanRuns(); }, 30000);
+  await Promise.all([loadStats(), loadPihole(), loadDevices(), loadAlerts(), loadUsers(), loadGroups()]);
+  connectSSE((ev) => {
+    if (ev.type === 'new_device') { loadDevices(); loadStats(); loadAlerts(); }
+    if (ev.type === 'device_status_changed') { loadDevices(); loadStats(); }
+  });
+  setInterval(() => { loadStats(); loadPihole(); loadAlerts(); }, 30000);
 })();
 </script>
-</body>
-</html>
+{% endblock %}
