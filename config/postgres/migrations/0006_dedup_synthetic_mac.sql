@@ -1,4 +1,4 @@
--- Migration 0005 — remove duplicate device rows caused by synthetic MACs
+-- Migration 0006 — remove duplicate device rows caused by synthetic MACs
 --
 -- When the discovery service cannot resolve a real MAC address via ARP it
 -- creates a temporary record with a deterministic "synthetic" MAC derived from
@@ -82,5 +82,5 @@ END;
 $$;
 
 -- Record this migration as applied.
-INSERT INTO schema_migrations (version) VALUES ('0005')
+INSERT INTO schema_migrations (version) VALUES ('0006')
     ON CONFLICT (version) DO NOTHING;
