@@ -1326,7 +1326,8 @@ def process_arp_sniff_queue(conn, rdb) -> int:
     return new_count
 
 
-# ─── SSDP / UPnP discovery ───────────────────────────────────────────────────_SSDP_MULTICAST_ADDR = "239.255.255.250"
+# ─── SSDP / UPnP discovery ───────────────────────────────────────────────────
+_SSDP_MULTICAST_ADDR = "239.255.255.250"
 _SSDP_PORT = 1900
 _SSDP_MX = 3
 
