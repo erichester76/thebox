@@ -1,9 +1,9 @@
 """RandomForest device-type classifier for TheBox discovery service.
 
-Provides fast, in-process device classification using a pre-trained
-sklearn RandomForestClassifier (~100 KB on disk).  The model is trained
-by ``train_classifier.py`` (run during Docker image build) and loaded once
-at service startup.
+Provides fast, in-process device classification using two pre-trained
+sklearn RandomForestClassifier models (~100 KB each on disk).  The models
+are trained by ``train_classifier.py`` (run during Docker image build) and
+loaded once at service startup.
 
 Feature vector (142 dimensions total):
   - DHCP option-55 individual option-code flags     (30 flags)
@@ -12,8 +12,21 @@ Feature vector (142 dimensions total):
   - mDNS service-type presence/absence flags        (18 flags)
   - HTTP Server header keyword flags                (22 flags)
 
-The classifier returns one of the canonical device-type labels:
+Both classifiers share the same 142-dimension feature vector.  The
+feature vector is intentionally designed to work well when DHCP data is
+absent: port signals, vendor keywords, and mDNS service types provide
+independent signal paths for devices discovered via ARP scan, nmap, or
+passive mDNS sniffing.
+
+The model file is a ``(clf_device_type, clf_os_family)`` tuple saved with
+joblib.  Both classifiers are required; a plain single-output pkl (legacy
+format) is accepted but will not provide os_family predictions.
+
+**clf_device_type** returns one of:
   ``iot``, ``desktop``, ``server``, ``mobile``, ``printer``, ``network_device``
+
+**clf_os_family** returns one of:
+  ``windows``, ``macos``, ``linux``, ``ios``, ``android``, ``embedded``
 
 When the model is not found or confidence is below *RF_MIN_CONFIDENCE*
 (default 0.50) the caller falls back to the existing rule-based
@@ -194,6 +207,17 @@ DEVICE_TYPES: list[str] = [
     "network_device",
 ]
 
+# Canonical OS-family labels (must match training labels in train_classifier.py).
+# "embedded" covers firmware devices: IoT, IP cameras, network equipment, printers.
+OS_FAMILIES: list[str] = [
+    "windows",
+    "macos",
+    "linux",
+    "ios",
+    "android",
+    "embedded",
+]
+
 
 # ── Feature extraction ────────────────────────────────────────────────────────
 
@@ -267,18 +291,26 @@ def extract_features(
 
 # ── Model I/O ─────────────────────────────────────────────────────────────────
 
-# Module-level loaded classifier instance (None = not yet loaded / unavailable).
-_clf = None
+# Module-level classifier instances.  Both are None until load_classifier() is
+# called.  The model file is expected to be a (clf_device_type, clf_os_family)
+# tuple; a plain single-output pkl (legacy) is also accepted.
+_clf_dt = None   # device_type classifier
+_clf_os = None   # os_family classifier
 
 
 def load_classifier() -> bool:
-    """Load the pre-trained RF model from *MODEL_PATH*.
+    """Load the pre-trained RF models from *MODEL_PATH*.
+
+    Expects the file to contain a ``(clf_device_type, clf_os_family)`` tuple
+    produced by ``train_classifier.py``.  A legacy single-output pkl is also
+    accepted for backward compatibility (os_family predictions will be
+    unavailable in that case).
 
     Returns ``True`` on success, ``False`` when the model file is missing or
     cannot be loaded (e.g. incompatible sklearn version).  A warning is logged
     in the failure case so the operator knows to rebuild the image.
     """
-    global _clf  # noqa: PLW0603
+    global _clf_dt, _clf_os  # noqa: PLW0603
 
     if not RF_CLASSIFIER_ENABLED:
         log.info("rf_classifier_disabled")
@@ -286,13 +318,23 @@ def load_classifier() -> bool:
 
     try:
         import joblib  # noqa: PLC0415 (import inside function for graceful missing-dep)
-        _clf = joblib.load(MODEL_PATH)
-        n_classes = len(_clf.classes_) if hasattr(_clf, "classes_") else None
-        n_trees = _clf.n_estimators if hasattr(_clf, "n_estimators") else None
+        loaded = joblib.load(MODEL_PATH)
+
+        if isinstance(loaded, tuple) and len(loaded) == 2:
+            _clf_dt, _clf_os = loaded
+        else:
+            # Legacy single-output model — device_type only.
+            _clf_dt = loaded
+            _clf_os = None
+
+        n_dt_classes = len(_clf_dt.classes_) if hasattr(_clf_dt, "classes_") else None
+        n_os_classes = len(_clf_os.classes_) if (_clf_os is not None and hasattr(_clf_os, "classes_")) else None
+        n_trees = _clf_dt.n_estimators if hasattr(_clf_dt, "n_estimators") else None
         log.info(
             "rf_classifier_loaded",
             path=MODEL_PATH,
-            classes=n_classes,
+            device_type_classes=n_dt_classes,
+            os_family_classes=n_os_classes,
             estimators=n_trees,
             feature_count=FEATURE_COUNT,
         )
@@ -310,8 +352,8 @@ def classify_device(
     extra_info: dict | None,
     dhcp_fingerprint: str | None = None,
     min_confidence: float | None = None,
-) -> tuple[str, float]:
-    """Classify a device using the loaded RF model.
+) -> tuple[str, str, float]:
+    """Classify a device using the loaded RF models.
 
     Parameters
     ----------
@@ -323,19 +365,25 @@ def classify_device(
 
     Returns
     -------
-    tuple[str, float]
-        ``(device_type, confidence)`` where *device_type* is one of the
-        canonical labels defined in :data:`DEVICE_TYPES` and *confidence* is
-        the highest predicted class probability in [0, 1].
+    tuple[str, str, float]
+        ``(device_type, os_family, confidence)`` where:
 
-        Returns ``("unknown", 0.0)`` when:
+        * *device_type* is one of the labels in :data:`DEVICE_TYPES`
+        * *os_family* is one of the labels in :data:`OS_FAMILIES`
+        * *confidence* is the predicted class probability for *device_type*
+
+        Returns ``("unknown", "unknown", 0.0)`` when:
 
         * the model is not loaded (file missing or disabled);
         * feature extraction raises an unexpected exception;
         * the highest class probability is below *min_confidence*.
+
+        *os_family* is ``"unknown"`` independently when the os_family
+        classifier is unavailable or its top-class probability is below
+        *min_confidence*.
     """
-    if _clf is None:
-        return "unknown", 0.0
+    if _clf_dt is None:
+        return "unknown", "unknown", 0.0
 
     threshold = RF_MIN_CONFIDENCE if min_confidence is None else min_confidence
 
@@ -344,22 +392,35 @@ def classify_device(
 
         features = extract_features(vendor, open_ports, extra_info, dhcp_fingerprint)
         X = np.array([features], dtype=np.float32)
-        proba = _clf.predict_proba(X)[0]
-        max_idx = int(np.argmax(proba))
-        confidence = float(proba[max_idx])
+
+        # ── device_type prediction ────────────────────────────────────────────
+        proba_dt = _clf_dt.predict_proba(X)[0]
+        max_idx_dt = int(np.argmax(proba_dt))
+        confidence = float(proba_dt[max_idx_dt])
 
         if confidence < threshold:
-            return "unknown", confidence
+            return "unknown", "unknown", confidence
 
-        label = str(_clf.classes_[max_idx])
+        device_type = str(_clf_dt.classes_[max_idx_dt])
+
+        # ── os_family prediction ──────────────────────────────────────────────
+        os_family = "unknown"
+        if _clf_os is not None:
+            proba_os = _clf_os.predict_proba(X)[0]
+            max_idx_os = int(np.argmax(proba_os))
+            conf_os = float(proba_os[max_idx_os])
+            if conf_os >= threshold:
+                os_family = str(_clf_os.classes_[max_idx_os])
+
         log.debug(
             "rf_classify",
-            label=label,
+            device_type=device_type,
+            os_family=os_family,
             confidence=round(confidence, 3),
             vendor=vendor,
         )
-        return label, confidence
+        return device_type, os_family, confidence
 
     except Exception as exc:
         log.debug("rf_classify_error", error=str(exc))
-        return "unknown", 0.0
+        return "unknown", "unknown", 0.0
