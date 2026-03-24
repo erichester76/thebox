@@ -359,6 +359,17 @@ def ensure_schema():
             status          VARCHAR(32) NOT NULL DEFAULT 'running'
         )""",
         "CREATE INDEX IF NOT EXISTS idx_scan_runs_started ON scan_runs(started_at)",
+        # Migration tracking — ensure the table exists and record all versions
+        # covered by this service's schema management so that schema_migrations
+        # stays accurate whether or not upgrade.sh has been run.
+        """CREATE TABLE IF NOT EXISTS schema_migrations (
+            version     VARCHAR(16) NOT NULL PRIMARY KEY,
+            applied_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""",
+        "INSERT INTO schema_migrations (version) VALUES ('0001') ON CONFLICT (version) DO NOTHING",
+        "INSERT INTO schema_migrations (version) VALUES ('0002') ON CONFLICT (version) DO NOTHING",
+        "INSERT INTO schema_migrations (version) VALUES ('0003') ON CONFLICT (version) DO NOTHING",
+        "INSERT INTO schema_migrations (version) VALUES ('0004') ON CONFLICT (version) DO NOTHING",
     ]
     conn = get_db()
     try:

@@ -219,6 +219,13 @@ def ensure_schema():
         "CREATE INDEX IF NOT EXISTS idx_redirect_created   ON redirect_events(created_at)",
         "CREATE INDEX IF NOT EXISTS idx_alerts_level       ON alerts(level)",
         "CREATE INDEX IF NOT EXISTS idx_alerts_created     ON alerts(created_at)",
+        # Migration tracking — ensure the table exists and record all versions
+        # covered by this service's schema management.
+        """CREATE TABLE IF NOT EXISTS schema_migrations (
+            version     VARCHAR(16) NOT NULL PRIMARY KEY,
+            applied_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""",
+        "INSERT INTO schema_migrations (version) VALUES ('0001') ON CONFLICT (version) DO NOTHING",
     ]
     conn = get_db()
     try:

@@ -417,6 +417,13 @@ def ensure_schema():
         "ALTER TABLE honeypot_events ADD COLUMN IF NOT EXISTS intent VARCHAR(32) NOT NULL DEFAULT 'scan'",
         "ALTER TABLE honeypot_events ADD COLUMN IF NOT EXISTS is_sweep BOOLEAN NOT NULL DEFAULT FALSE",
         "ALTER TABLE honeypot_events ADD COLUMN IF NOT EXISTS ports_scanned JSONB",
+        # Migration tracking — ensure the table exists and record all versions
+        # covered by this service's schema management.
+        """CREATE TABLE IF NOT EXISTS schema_migrations (
+            version     VARCHAR(16) NOT NULL PRIMARY KEY,
+            applied_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""",
+        "INSERT INTO schema_migrations (version) VALUES ('0001') ON CONFLICT (version) DO NOTHING",
     ]
     conn = get_db()
     try:

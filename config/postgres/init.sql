@@ -6,6 +6,7 @@ CREATE TABLE IF NOT EXISTS users (
     username        VARCHAR(64) NOT NULL UNIQUE,
     display_name    VARCHAR(255),
     email           VARCHAR(255),
+    password_hash   VARCHAR(255),
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -15,6 +16,7 @@ CREATE TABLE IF NOT EXISTS devices (
     id              SERIAL PRIMARY KEY,
     mac_address     VARCHAR(17) NOT NULL UNIQUE,
     ip_address      VARCHAR(45),
+    ipv6_address    VARCHAR(45),
     hostname        VARCHAR(255),
     vendor          VARCHAR(255),
     device_type     VARCHAR(64) DEFAULT 'unknown',   -- desktop, mobile, iot, printer, …
@@ -60,15 +62,19 @@ CREATE TABLE IF NOT EXISTS iot_learning_sessions (
 
 -- Honeypot events: connection attempts to the honeypot
 CREATE TABLE IF NOT EXISTS honeypot_events (
-    id              SERIAL PRIMARY KEY,
-    src_ip          VARCHAR(45) NOT NULL,
-    src_port        INTEGER,
-    dst_port        INTEGER NOT NULL,
-    protocol        VARCHAR(10) NOT NULL DEFAULT 'tcp',
-    payload_preview TEXT,
-    severity        VARCHAR(16) NOT NULL DEFAULT 'low',  -- low, medium, high, critical
-    device_id       INTEGER REFERENCES devices(id),
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    id                SERIAL PRIMARY KEY,
+    src_ip            VARCHAR(45) NOT NULL,
+    src_port          INTEGER,
+    dst_port          INTEGER NOT NULL,
+    protocol          VARCHAR(10) NOT NULL DEFAULT 'tcp',
+    payload_preview   TEXT,
+    severity          VARCHAR(16) NOT NULL DEFAULT 'low',  -- low, medium, high, critical
+    interaction_level VARCHAR(16) NOT NULL DEFAULT 'none',
+    intent            VARCHAR(32) NOT NULL DEFAULT 'scan',
+    is_sweep          BOOLEAN NOT NULL DEFAULT FALSE,
+    ports_scanned     JSONB,
+    device_id         INTEGER REFERENCES devices(id),
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 -- DNS events: notable DNS query log
@@ -108,6 +114,7 @@ CREATE TABLE IF NOT EXISTS alerts (
 -- Indices for common queries
 CREATE INDEX IF NOT EXISTS idx_devices_mac        ON devices(mac_address);
 CREATE INDEX IF NOT EXISTS idx_devices_ip         ON devices(ip_address);
+CREATE INDEX IF NOT EXISTS idx_devices_ipv6       ON devices(ipv6_address);
 CREATE INDEX IF NOT EXISTS idx_devices_status     ON devices(status);
 CREATE INDEX IF NOT EXISTS idx_devices_owner      ON devices(owner_id);
 CREATE INDEX IF NOT EXISTS idx_honeypot_src_ip    ON honeypot_events(src_ip);
@@ -157,6 +164,17 @@ CREATE TABLE IF NOT EXISTS redirect_events (
 CREATE INDEX IF NOT EXISTS idx_redirect_target_ip  ON redirect_events(target_ip);
 CREATE INDEX IF NOT EXISTS idx_redirect_created    ON redirect_events(created_at);
 
+-- Runtime configuration settings
+CREATE TABLE IF NOT EXISTS settings (
+    key         VARCHAR(64)  NOT NULL PRIMARY KEY,
+    value       TEXT         NOT NULL,
+    description TEXT,
+    category    VARCHAR(32)  NOT NULL DEFAULT 'general',
+    updated_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_settings_category ON settings(category);
+
 -- Migration tracking — records which versioned migrations have been applied.
 -- Populated here so that fresh installs (where Docker runs this file
 -- automatically) are already in sync when upgrade.sh runs later.
@@ -165,6 +183,9 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
     applied_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Mark the baseline migration as applied on a fresh install.
-INSERT INTO schema_migrations (version) VALUES ('0001')
-    ON CONFLICT (version) DO NOTHING;
+-- Mark all migrations as applied on a fresh install since this file
+-- includes the complete up-to-date schema.
+INSERT INTO schema_migrations (version) VALUES ('0001') ON CONFLICT (version) DO NOTHING;
+INSERT INTO schema_migrations (version) VALUES ('0002') ON CONFLICT (version) DO NOTHING;
+INSERT INTO schema_migrations (version) VALUES ('0003') ON CONFLICT (version) DO NOTHING;
+INSERT INTO schema_migrations (version) VALUES ('0004') ON CONFLICT (version) DO NOTHING;
