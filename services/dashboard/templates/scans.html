@@ -15,7 +15,7 @@
       <div class="sstat success"><div class="val" id="ss-completed">–</div><div class="lbl">Completed</div></div>
       <div class="sstat accent"> <div class="val" id="ss-running">–</div>  <div class="lbl">Running</div></div>
       <div class="sstat critical"><div class="val" id="ss-failed">–</div>  <div class="lbl">Failed</div></div>
-      <div class="sstat total">  <div class="val" id="ss-devices">–</div>  <div class="lbl">Devices Found</div></div>
+      <div class="sstat total">  <div class="val" id="ss-devices">–</div>  <div class="lbl">Devices (Latest)</div></div>
       <div class="sstat accent"> <div class="val" id="ss-new">–</div>      <div class="lbl">New Devices</div></div>
     </div>
     <div class="card-body">
@@ -49,7 +49,8 @@ async function loadScanRuns() {
   const completed = rows.filter(r => r.status === 'completed').length;
   const running   = rows.filter(r => r.status === 'running').length;
   const failed    = rows.filter(r => r.status === 'failed').length;
-  const devices   = rows.reduce((sum, r) => sum + (r.devices_found || 0), 0);
+  const latestRun = rows.find(r => r.status === 'completed') || rows[0];
+  const devices   = latestRun ? (latestRun.devices_found || 0) : 0;
   const newDevs   = rows.reduce((sum, r) => sum + (r.new_devices || 0), 0);
 
   document.getElementById('ss-total').textContent     = total.toLocaleString();

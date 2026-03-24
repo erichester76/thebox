@@ -142,9 +142,14 @@
     /* ── Compact stats bar ──────────────────────────── */
     #stats-bar {
       display: flex;
+      flex-direction: column;
       gap: 0;
-      flex-wrap: wrap;
     }
+    .stats-row {
+      display: flex;
+      gap: 0;
+    }
+    .stats-row:first-child { border-bottom: 1px solid var(--border); }
     /* Grouped stats with section headers */
     .stats-group {
       display: flex;
@@ -228,7 +233,7 @@
     .badge-group        { background: rgba(139,148,158,.15); color: var(--text); margin: 1px; }
 
     /* ── Buttons ────────────────────────────────────── */
-    .btn { border: none; border-radius: 6px; padding: 4px 10px; font-size: 12px; cursor: pointer; font-weight: 600; }
+    .btn { border: none; border-radius: 6px; padding: 4px 8px; font-size: 12px; cursor: pointer; font-weight: 600; background: rgba(139,148,158,.15); color: var(--text); }
     .btn-trust  { background: rgba(63,185,80,.15);  color: var(--success); }
     .btn-block  { background: rgba(248,81,73,.15);  color: var(--danger);  }
     .btn-iot    { background: rgba(88,166,255,.15); color: var(--accent);  }
@@ -236,6 +241,7 @@
     .btn-user   { background: rgba(139,148,158,.15);color: var(--text);    }
     .btn-danger { background: rgba(248,81,73,.15);  color: var(--danger);  }
     .btn:hover  { opacity: .8; }
+    .btn-actions { white-space: nowrap; }
     .ml-auto { margin-left: auto; }
     .filter-select { margin-left: 12px; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 3px 8px; color: var(--text); font-size: 13px; }
 
@@ -420,6 +426,7 @@
   <a href="/" {% if active_page == 'dashboard' %}class="active"{% endif %}>📊 Dashboard</a>
   <a href="/honeypot" {% if active_page == 'honeypot' %}class="active"{% endif %}>🍯 Honeypot</a>
   <a href="/scans" {% if active_page == 'scans' %}class="active"{% endif %}>🔍 Scans</a>
+  <a href="/users" {% if active_page == 'users' %}class="active"{% endif %}>👥 Users</a>
   <a href="/settings" {% if active_page == 'settings' %}class="active"{% endif %}>⚙️ Settings</a>
 </nav>
 

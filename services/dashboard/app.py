@@ -469,6 +469,12 @@ def settings_page():
     return render_template("settings.html", active_page="settings")
 
 
+@app.route("/users")
+@login_required
+def users_page():
+    return render_template("users.html", active_page="users")
+
+
 # --- API: Devices ---
 
 _VALID_DEVICE_STATUSES = frozenset(
