@@ -555,7 +555,11 @@ class _CaptivePortalHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         if not head_only:
-            self.wfile.write(body)
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                # Client disconnected before the response was fully sent; ignore.
+                pass
 
     def log_message(self, fmt, *args):  # silence default stderr logging
         log.debug("captive_portal_request", client=self.client_address[0], path=self.path)
