@@ -447,22 +447,23 @@ def _build_samples_from_fingerbank_api(
     api_key: str,
     base_url: str = "https://api.fingerbank.org/api/v2",
 ) -> tuple[list[list[float]], list[str]]:
-    """Pull labelled DHCP fingerprint data directly from the Fingerbank REST API.
+    """Use the Fingerbank /combinations/interrogate endpoint to label a curated
+    set of well-known real-world DHCP option-55 fingerprints as extra training
+    samples for the device_type classifier.
 
-    Makes two requests:
+    Fingerbank's combinations dataset (the full mapping of signal patterns to
+    device types) is not available for bulk download via the public API.  The
+    only classification endpoint is ``GET /api/v2/combinations/interrogate``,
+    which accepts a single DHCP fingerprint string and returns the best-matching
+    device with a confidence score.  This function submits a curated list of
+    publicly documented fingerprints one at a time and uses each high-confidence
+    response to derive a device-type label.
 
-    1. ``GET /api/v2/devices/base_info?fields=id,name,parent_id`` to fetch the
-       complete device hierarchy in a single response (~2 MB JSON).
-    2. ``GET /api/v2/dhcp_fingerprints?fields=value,device_id`` to fetch all
-       DHCP opt-55 fingerprint strings with their associated device IDs.
-
-    The ``details`` field returned by ``base_info`` is a plain-text description
-    string (e.g. ``"Auto created via the UPnP User-Agent import script"``), not
-    structured fingerprint data, so fingerprints must be fetched separately.
-
-    The API key can be obtained for free at https://fingerbank.org/users/register
-    (also exposed as the ``FINGERBANK_API_KEY`` env var used by the discovery
-    service at runtime).
+    Rate limit: 250 req/min for all accounts.  At one request every 0.25 s the
+    script runs at ~240 req/min, well within the limit.  A 429 response
+    triggers a 60 s back-off before the same fingerprint is retried (up to
+    three times).  404 responses (no match) and low-confidence results
+    (score < 30) are silently skipped.
 
     Parameters
     ----------
@@ -471,6 +472,7 @@ def _build_samples_from_fingerbank_api(
     base_url:
         Base URL for the Fingerbank API (default: ``https://api.fingerbank.org/api/v2``).
     """
+    import time
     import urllib.error
     import urllib.parse
     import urllib.request
@@ -479,142 +481,168 @@ def _build_samples_from_fingerbank_api(
     if not base_url.startswith("https://"):
         raise ValueError(f"base_url must start with https:// — got: {base_url!r}")
 
-    # Rough top-level Fingerbank category name → our label mapping.
-    _FB_CATEGORY_MAP = {
-        "mobile device": "mobile",
-        "smartphone": "mobile",
-        "tablet": "mobile",
-        "ios device": "mobile",
-        "android": "mobile",
-        "iot": "iot",
-        "smart tv": "iot",
-        "streaming": "iot",
-        "game console": "iot",
-        "printer": "printer",
-        "network device": "network_device",
-        "router": "network_device",
-        "switch": "network_device",
-        "access point": "network_device",
-        "nas": "server",
-        "workstation": "desktop",
-        "desktop": "desktop",
-        "laptop": "desktop",
-        "computer": "desktop",
-        "server": "server",
-        "virtual machine": "server",
-    }
+    # ── Curated DHCP fingerprints ─────────────────────────────────────────────
+    # Well-known DHCP option-55 Parameter Request List strings from major client
+    # implementations, sourced from the Wireshark wiki, PacketFence, and the
+    # Fingerbank public documentation.  Duplicates are removed below.
+    _CURATED_FINGERPRINTS: list[str] = [
+        # Windows 10 / 11
+        "1,3,6,15,31,33,43,44,46,47,119,121,249,252",
+        # Windows 7 / 8  (also used in Fingerbank's own docs)
+        "1,15,3,6,44,46,47,31,33,121,249,43",
+        # Windows Server / older Windows
+        "1,3,6,15,31,43,44,46,47,119,252",
+        # Windows XP / Server 2003
+        "1,3,6,15,44,46,47,31,33,121,43",
+        # macOS (all modern versions share this fingerprint)
+        "1,121,3,6,15,119,252",
+        # Linux dhclient — Debian / Ubuntu / RHEL default
+        "1,3,6,12,15,17,23,28,29,31,33,40,41,42",
+        # Linux NetworkManager variant
+        "1,3,6,12,15,17,28,29,31,33,40,41,42,119",
+        # Linux systemd-networkd
+        "1,3,6,15,119,252",
+        # Linux udhcpc / BusyBox (common on embedded + IoT)
+        "1,3,6,12,15,28,42",
+        # BusyBox with timezone options (Espressif, OpenWrt IoT)
+        "1,3,6,12,15,28,42,100,101",
+        # Android 4+
+        "1,3,6,15,26,28,51,58,59",
+        # iOS / iPadOS (same base fingerprint as macOS; Fingerbank disambiguates
+        # via MAC OUI + User-Agent when those signals are available)
+        "1,121,3,6,15,119,252,44,46",
+        # HP / Epson printer embedded DHCP stack
+        "1,3,6,15,51,58,59",
+        "1,3,6,15,28,51,58,59,43",
+        # Cisco IOS network device (with TFTP options)
+        "1,3,6,12,15,28,43,66,67",
+        # Generic embedded / IoT
+        "1,3,6,15,28,51,58,59",
+    ]
 
-    log.info("fingerbank_api_load_start base_url=%s", base_url)
+    # Deduplicate while preserving order.
+    seen_fp: set[str] = set()
+    unique_fingerprints: list[str] = []
+    for fp in _CURATED_FINGERPRINTS:
+        if fp not in seen_fp:
+            seen_fp.add(fp)
+            unique_fingerprints.append(fp)
 
-    # ── 1. Fetch device hierarchy ─────────────────────────────────────────────
-    # GET /api/v2/devices/base_info returns every device in one response
-    # (typically 2-3 MB JSON).  We only need id/name/parent_id to build the
-    # category hierarchy; ``details`` is a plain text description, not data.
-    params = urllib.parse.urlencode({"key": api_key, "fields": "id,name,parent_id"})
-    url = f"{base_url}/devices/base_info?{params}"
-    try:
-        with urllib.request.urlopen(url, timeout=120) as resp:  # noqa: S310
-            raw = resp.read().decode()
-    except urllib.error.HTTPError as exc:
-        log.error("fingerbank_api_http_error endpoint=devices/base_info status=%d", exc.code)
-        return [], []
-    except Exception as exc:
-        log.error("fingerbank_api_error endpoint=devices/base_info error=%s", exc)
-        return [], []
+    # ── device_name keyword → device_type label ───────────────────────────────
+    # The interrogate response includes ``device_name``: a full hierarchy path
+    # like ``"Operating System/Windows OS/Microsoft Windows Kernel 6.x/..."``.
+    # We scan that string for keywords in priority order (most-specific first).
+    _DEVICE_TYPE_RULES: list[tuple[str, str]] = [
+        ("android",        "mobile"),
+        ("apple ios",      "mobile"),
+        ("iphone",         "mobile"),
+        ("ipad",           "mobile"),
+        ("smartphone",     "mobile"),
+        ("mobile device",  "mobile"),
+        ("tablet",         "mobile"),
+        ("windows",        "desktop"),
+        ("macos",          "desktop"),
+        ("mac os",         "desktop"),
+        ("linux",          "desktop"),
+        ("printer",        "printer"),
+        ("multifunction",  "printer"),
+        ("network device", "network_device"),
+        ("router",         "network_device"),
+        ("switch",         "network_device"),
+        ("access point",   "network_device"),
+        ("firewall",       "network_device"),
+        ("nas",            "server"),
+        ("server",         "server"),
+        ("smart tv",       "iot"),
+        ("streaming",      "iot"),
+        ("game console",   "iot"),
+        ("iot",            "iot"),
+        ("camera",         "iot"),
+        ("thermostat",     "iot"),
+        ("smart home",     "iot"),
+    ]
 
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        log.error(
-            "fingerbank_api_json_error endpoint=devices/base_info error=%s body_prefix=%.200s",
-            exc, raw,
-        )
-        return [], []
-
-    if not isinstance(data, list):
-        log.error("fingerbank_api_unexpected_format endpoint=devices/base_info type=%s", type(data).__name__)
-        return [], []
-
-    devices: dict[int, dict] = {}
-    for dev in data:
-        did = dev.get("id")
-        if did is None:
-            continue
-        devices[int(did)] = {
-            "name": (dev.get("name") or "").lower(),
-            "parent": dev.get("parent_id"),
-        }
-    log.info("fingerbank_api_devices_loaded count=%d", len(devices))
-
-    def _root_category(did: int | None) -> str | None:
-        seen: set[int] = set()
-        while did is not None and did not in seen:
-            seen.add(did)
-            node = devices.get(did, {})
-            name = node.get("name", "")
-            if name in _FB_CATEGORY_MAP:
-                return _FB_CATEGORY_MAP[name]
-            parent = node.get("parent")
-            if not isinstance(parent, int):
-                break
-            did = parent
+    def _label_from_response(data: dict) -> str | None:
+        device_name = (data.get("device_name") or "").lower()
+        if not device_name:
+            return None
+        for keyword, label in _DEVICE_TYPE_RULES:
+            if keyword in device_name:
+                return label
         return None
 
-    # ── 2. Fetch DHCP fingerprints ────────────────────────────────────────────
-    # GET /api/v2/dhcp_fingerprints returns all fingerprints with their
-    # associated device_id.  Each entry has ``value`` (the comma-separated
-    # option-55 string) and ``device_id`` (links back to the device hierarchy).
-    fp_params = urllib.parse.urlencode({"key": api_key, "fields": "value,device_id"})
-    fp_url = f"{base_url}/dhcp_fingerprints?{fp_params}"
-    try:
-        with urllib.request.urlopen(fp_url, timeout=120) as resp:  # noqa: S310
-            fp_raw = resp.read().decode()
-    except urllib.error.HTTPError as exc:
-        log.error("fingerbank_api_http_error endpoint=dhcp_fingerprints status=%d", exc.code)
-        return [], []
-    except Exception as exc:
-        log.error("fingerbank_api_error endpoint=dhcp_fingerprints error=%s", exc)
-        return [], []
+    log.info(
+        "fingerbank_api_load_start base_url=%s fingerprints=%d",
+        base_url, len(unique_fingerprints),
+    )
 
-    try:
-        fp_data = json.loads(fp_raw)
-    except json.JSONDecodeError as exc:
-        log.error(
-            "fingerbank_api_json_error endpoint=dhcp_fingerprints error=%s body_prefix=%.200s",
-            exc, fp_raw,
-        )
-        return [], []
-
-    if not isinstance(fp_data, list):
-        log.error("fingerbank_api_unexpected_format endpoint=dhcp_fingerprints type=%s", type(fp_data).__name__)
-        return [], []
-
-    log.info("fingerbank_api_fingerprints_loaded count=%d", len(fp_data))
-
-    # ── 3. Build feature samples ──────────────────────────────────────────────
+    interrogate_url = f"{base_url}/combinations/interrogate"
     X: list[list[float]] = []
     y: list[str] = []
     skipped = 0
-    seen_samples: set[tuple] = set()
+    idx = 0
+    _MAX_RATE_LIMIT_RETRIES = 3
 
-    for fp_entry in fp_data:
-        device_id = fp_entry.get("device_id")
-        dhcp_fp = (fp_entry.get("value") or "").strip()
+    while idx < len(unique_fingerprints):
+        dhcp_fp = unique_fingerprints[idx]
+        params = urllib.parse.urlencode({"key": api_key, "dhcp_fingerprint": dhcp_fp})
+        url = f"{interrogate_url}?{params}"
+        rate_limit_retries = 0
+        raw = None
+        while True:
+            try:
+                with urllib.request.urlopen(url, timeout=30) as resp:  # noqa: S310
+                    raw = resp.read().decode()
+                break
+            except urllib.error.HTTPError as exc:
+                if exc.code == 429 and rate_limit_retries < _MAX_RATE_LIMIT_RETRIES:
+                    rate_limit_retries += 1
+                    log.warning(
+                        "fingerbank_api_rate_limited sleeping=60s retry=%d", rate_limit_retries,
+                    )
+                    time.sleep(60)
+                    continue
+                if exc.code != 404:
+                    log.warning(
+                        "fingerbank_api_http_error fp=%.60s status=%d", dhcp_fp, exc.code,
+                    )
+                raw = None
+                break
+            except Exception as exc:
+                log.warning("fingerbank_api_error fp=%.60s error=%s", dhcp_fp, exc)
+                raw = None
+                break
 
-        if not device_id or not dhcp_fp:
+        if raw is None:
             skipped += 1
+            idx += 1
             continue
 
-        label = _root_category(int(device_id))
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            log.warning(
+                "fingerbank_api_json_error fp=%.60s error=%s body_prefix=%.100s",
+                dhcp_fp, exc, raw,
+            )
+            skipped += 1
+            idx += 1
+            continue
+
+        score = data.get("score", 0)
+        if score < 30:
+            # Very low confidence — skip rather than pollute training data.
+            skipped += 1
+            idx += 1
+            time.sleep(0.25)
+            continue
+
+        label = _label_from_response(data)
         if label is None:
             skipped += 1
+            idx += 1
+            time.sleep(0.25)
             continue
-
-        key = (dhcp_fp, device_id)
-        if key in seen_samples:
-            skipped += 1
-            continue
-        seen_samples.add(key)
 
         feats = extract_features(
             vendor=None,
@@ -624,6 +652,8 @@ def _build_samples_from_fingerbank_api(
         )
         X.append(feats)
         y.append(label)
+        idx += 1
+        time.sleep(0.25)  # ≤ 4 req/s → well within the 250 req/min rate limit
 
     log.info("fingerbank_api_load_done loaded=%d skipped=%d", len(y), skipped)
     return X, y
