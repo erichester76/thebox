@@ -6,16 +6,25 @@ This script can be run:
    file and calls ``python train_classifier.py`` so the model is available
    the moment the container starts.
 
-2. **Manually with the fingerbank dataset** for higher accuracy::
+2. **Manually with the fingerbank JSON dataset** for higher accuracy::
 
-       python train_classifier.py --fingerbank-csv /path/to/fingerbank.csv
+       python train_classifier.py --fingerbank-json /path/to/fingerprints_and_devices.json
 
    The fingerbank Open Source Database (CC-licensed) is available at:
    https://github.com/fingerbank/open-source-database
-   Download ``fingerprints_and_devices.json`` and pass it with
-   ``--fingerbank-json /path/to/fingerprints_and_devices.json``.
 
-3. **Interactively** to inspect feature importances or cross-validation scores::
+3. **Manually with the fingerbank SQLite database** for higher accuracy::
+
+       python train_classifier.py --fingerbank-db /path/to/fingerbank.db
+
+   The ``fingerbank.db`` SQLite file can be downloaded from the Fingerbank API::
+
+       curl -k -o fingerbank.db "https://api.fingerbank.org/api/v2/download/db?key=<YOUR_API_KEY>"
+
+   It contains a ``devices`` table (with ``id``, ``name``, ``parent_id``) and a
+   ``dhcp_fingerprints`` table (with ``id``, ``value``, ``device_id``).
+
+4. **Interactively** to inspect feature importances or cross-validation scores::
 
        python train_classifier.py --cv --verbose
 
@@ -29,6 +38,7 @@ import argparse
 import json
 import logging
 import os
+import sqlite3
 import sys
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
@@ -347,6 +357,111 @@ def _build_samples_from_fingerbank_json(path: str) -> tuple[list[list[float]], l
     return X, y
 
 
+def _build_samples_from_fingerbank_db(path: str) -> tuple[list[list[float]], list[str]]:
+    """Parse a ``fingerbank.db`` SQLite database exported from the Fingerbank API.
+
+    The database can be downloaded from::
+
+        curl -k -o fingerbank.db "https://api.fingerbank.org/api/v2/download/db?key=<YOUR_API_KEY>"
+
+    Expected schema:
+
+    * ``devices``         – columns: ``id``, ``name``, ``parent_id``
+    * ``dhcp_fingerprints`` – columns: ``id``, ``value``, ``device_id``
+
+    This function walks the ``devices`` hierarchy to resolve a root-category
+    label for each fingerprint row and emits (features, label) pairs that use
+    the same :func:`extract_features` contract as the synthetic dataset.
+    Only rows whose root parent maps to a known :data:`DEVICE_TYPES` label
+    are included.
+    """
+    # Rough top-level Fingerbank category name → our label mapping.
+    _FB_CATEGORY_MAP = {
+        "mobile device": "mobile",
+        "smartphone": "mobile",
+        "tablet": "mobile",
+        "ios device": "mobile",
+        "android": "mobile",
+        "iot": "iot",
+        "smart tv": "iot",
+        "streaming": "iot",
+        "game console": "iot",
+        "printer": "printer",
+        "network device": "network_device",
+        "router": "network_device",
+        "switch": "network_device",
+        "access point": "network_device",
+        "nas": "server",
+        "workstation": "desktop",
+        "desktop": "desktop",
+        "laptop": "desktop",
+        "computer": "desktop",
+        "server": "server",
+        "virtual machine": "server",
+    }
+
+    log.info("fingerbank_db_load_start path=%s", path)
+    con = sqlite3.connect(path)
+    con.row_factory = sqlite3.Row
+
+    # Build device-id → {name, parent_id} index.
+    devices: dict[int, dict] = {}
+    try:
+        for row in con.execute("SELECT id, name, parent_id FROM devices"):
+            devices[row["id"]] = {
+                "name": (row["name"] or "").lower(),
+                "parent": row["parent_id"],
+            }
+    except sqlite3.OperationalError as exc:
+        log.error("fingerbank_db_devices_error error=%s", exc)
+        con.close()
+        return [], []
+
+    def _root_category(did: int | None) -> str | None:
+        seen: set[int] = set()
+        while did is not None and did not in seen:
+            seen.add(did)
+            node = devices.get(did, {})
+            name = node.get("name", "")
+            if name in _FB_CATEGORY_MAP:
+                return _FB_CATEGORY_MAP[name]
+            parent = node.get("parent")
+            if not isinstance(parent, int):
+                break
+            did = parent
+        return None
+
+    X: list[list[float]] = []
+    y: list[str] = []
+    skipped = 0
+    try:
+        for row in con.execute("SELECT value, device_id FROM dhcp_fingerprints"):
+            dhcp_fp: str = row["value"] or ""
+            if not dhcp_fp:
+                skipped += 1
+                continue
+            device_id = row["device_id"]
+            label = _root_category(device_id) if device_id is not None else None
+            if label is None:
+                skipped += 1
+                continue
+            feats = extract_features(
+                vendor=None,
+                open_ports=[],
+                extra_info=None,
+                dhcp_fingerprint=dhcp_fp,
+            )
+            X.append(feats)
+            y.append(label)
+    except sqlite3.OperationalError as exc:
+        log.error("fingerbank_db_fingerprints_error error=%s", exc)
+    finally:
+        con.close()
+
+    log.info("fingerbank_db_load_done loaded=%d skipped=%d", len(y), skipped)
+    return X, y
+
+
 def train(
     extra_X: list[list[float]] | None = None,
     extra_y: list[str] | None = None,
@@ -447,7 +562,19 @@ def main() -> None:
     parser.add_argument(
         "--fingerbank-json",
         metavar="PATH",
-        help="Path to fingerbank open-source fingerprints_and_devices.json for augmentation.",
+        help=(
+            "Path to fingerbank open-source fingerprints_and_devices.json for augmentation. "
+            "Available at https://github.com/fingerbank/open-source-database"
+        ),
+    )
+    parser.add_argument(
+        "--fingerbank-db",
+        metavar="PATH",
+        help=(
+            "Path to fingerbank.db SQLite database for augmentation. "
+            "Download with: curl -k -o fingerbank.db "
+            "\"https://api.fingerbank.org/api/v2/download/db?key=<YOUR_API_KEY>\""
+        ),
     )
     parser.add_argument(
         "--output",
@@ -473,7 +600,9 @@ def main() -> None:
 
     extra_X: list[list[float]] | None = None
     extra_y: list[str] | None = None
-    if args.fingerbank_json:
+    if args.fingerbank_db:
+        extra_X, extra_y = _build_samples_from_fingerbank_db(args.fingerbank_db)
+    elif args.fingerbank_json:
         extra_X, extra_y = _build_samples_from_fingerbank_json(args.fingerbank_json)
 
     clf = train(
