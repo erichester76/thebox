@@ -26,6 +26,7 @@ Additional discovery methods:
 
 import csv
 import io
+import ipaddress
 import json
 import hashlib
 import logging
@@ -34,6 +35,7 @@ import queue
 import re
 import socket
 import ssl
+import subprocess
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -256,6 +258,9 @@ def ensure_schema():
         # The UNIQUE(device_id, fqdn) constraint above allows multiple NULLs.
         """CREATE UNIQUE INDEX IF NOT EXISTS idx_iot_allowlist_global_fqdn
             ON iot_allowlist(fqdn) WHERE device_id IS NULL""",
+        # Migration: add ipv6_address column if the table already exists without it.
+        "ALTER TABLE devices ADD COLUMN IF NOT EXISTS ipv6_address VARCHAR(45)",
+        "CREATE INDEX IF NOT EXISTS idx_devices_ipv6       ON devices(ipv6_address)",
     ]
     conn = get_db()
     try:
@@ -280,6 +285,40 @@ def arp_sweep(network: str) -> list[dict]:
         hosts.append({"ip": rcv.psrc, "mac": rcv.hwsrc.upper()})
     log.info("arp_sweep_done", network=network, found=len(hosts))
     return hosts
+
+
+def ndp_table() -> dict[str, str]:
+    """Return a mapping of MAC address → globally-routable IPv6 address from the kernel NDP cache.
+
+    Reads ``ip -6 neigh`` output.  Link-local addresses (``fe80::/10``) are
+    excluded using the ``ipaddress`` module because they are not globally
+    routable and are therefore not useful for guardian policy enforcement.
+
+    Returns an empty dict when the command is unavailable or produces no output
+    (e.g. inside a container without IPv6 or without the ``iproute2`` package).
+    """
+    result: dict[str, str] = {}
+    try:
+        out = subprocess.run(
+            ["ip", "-6", "neigh"], capture_output=True, text=True, check=False
+        )
+        for line in out.stdout.splitlines():
+            # Line format: <ipv6-addr> dev <iface> lladdr <mac> [router] <state>
+            parts = line.split()
+            if len(parts) >= 5 and parts[3] == "lladdr":
+                ipv6_str = parts[0]
+                mac = parts[4].upper()
+                try:
+                    addr = ipaddress.ip_address(ipv6_str)
+                except ValueError:
+                    continue
+                # Exclude link-local (fe80::/10) — not globally routable
+                if addr.is_link_local:
+                    continue
+                result[mac] = ipv6_str
+    except Exception as exc:
+        log.debug("ndp_table_error", error=str(exc))
+    return result
 
 
 def nmap_ping_sweep(network: str) -> list[dict]:
@@ -2064,14 +2103,15 @@ def upsert_device(conn, rdb, device: dict) -> bool:
             cur.execute(
                 """
                 INSERT INTO devices
-                    (mac_address, ip_address, hostname, vendor, device_type, os_guess,
+                    (mac_address, ip_address, ipv6_address, hostname, vendor, device_type, os_guess,
                      open_ports, extra_info, status, first_seen, last_seen)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'new',NOW(),NOW())
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,'new',NOW(),NOW())
                 RETURNING id
                 """,
                 (
                     device["mac"],
                     device["ip"],
+                    device.get("ipv6") or None,
                     device.get("hostname"),
                     device.get("vendor"),
                     device.get("device_type", "unknown"),
@@ -2100,6 +2140,7 @@ def upsert_device(conn, rdb, device: dict) -> bool:
                             "device_id": device_id,
                             "mac": device["mac"],
                             "ip": device["ip"],
+                            "ipv6": device.get("ipv6") or "",
                             "vendor": device.get("vendor"),
                             "device_type": device_type,
                             "ts": datetime.now(timezone.utc).isoformat(),
@@ -2111,12 +2152,14 @@ def upsert_device(conn, rdb, device: dict) -> bool:
             cur.execute(
                 """
                 UPDATE devices
-                SET ip_address=%s, hostname=%s, vendor=%s, device_type=%s,
+                SET ip_address=%s, ipv6_address=COALESCE(%s, ipv6_address),
+                    hostname=%s, vendor=%s, device_type=%s,
                     os_guess=%s, open_ports=%s, extra_info=%s, last_seen=NOW()
                 WHERE mac_address=%s
                 """,
                 (
                     device["ip"],
+                    device.get("ipv6") or None,
                     device.get("hostname"),
                     device.get("vendor"),
                     device.get("device_type", "unknown"),
@@ -2211,6 +2254,13 @@ def run_scan():
         # ── Step 5: NetBIOS/NBNS subnet scan ─────────────────────────────────
         netbios_data: dict[str, dict] = netbios_scan(network) if NETBIOS_ENABLED else {}
 
+        # ── Step 6: NDP table — back-fill IPv6 addresses ─────────────────────
+        # Read the kernel Neighbour Discovery Protocol (NDP) cache to obtain
+        # the globally-routable IPv6 address for each device we have already
+        # resolved to a MAC address.  This is a best-effort step; devices
+        # without IPv6 connectivity (or behind NAT64) will simply have no entry.
+        ndp_cache: dict[str, str] = ndp_table()  # MAC (upper) → IPv6 address
+
         new_count = 0
 
         for host in hosts:
@@ -2230,6 +2280,10 @@ def run_scan():
                         mac=host["mac"],
                         reason="arp_unavailable",
                     )
+
+            # Back-fill IPv6 address from NDP cache (keyed by upper-cased MAC).
+            if not host.get("ipv6"):
+                host["ipv6"] = ndp_cache.get(host["mac"].upper(), "")
 
             # ── Per-host enrichment ───────────────────────────────────────────
             # Build the extra_info dict from all enrichment sources.

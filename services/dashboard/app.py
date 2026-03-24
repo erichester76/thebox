@@ -201,6 +201,9 @@ def ensure_schema():
         "ALTER TABLE honeypot_events ADD COLUMN IF NOT EXISTS ports_scanned JSONB",
         # Migration: add password_hash for dashboard login
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash VARCHAR(255)",
+        # Migration: add ipv6_address column for IPv6 policy enforcement
+        "ALTER TABLE devices ADD COLUMN IF NOT EXISTS ipv6_address VARCHAR(45)",
+        "CREATE INDEX IF NOT EXISTS idx_devices_ipv6        ON devices(ipv6_address)",
         # scan_runs — populated by discovery after each nmap scan cycle
         """CREATE TABLE IF NOT EXISTS scan_runs (
             id              SERIAL PRIMARY KEY,

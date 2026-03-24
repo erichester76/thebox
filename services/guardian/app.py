@@ -106,6 +106,9 @@ def ensure_schema():
         "CREATE INDEX IF NOT EXISTS idx_devices_status ON devices(status)",
         "CREATE INDEX IF NOT EXISTS idx_alerts_level   ON alerts(level)",
         "CREATE INDEX IF NOT EXISTS idx_alerts_created ON alerts(created_at)",
+        # Migration: add ipv6_address column if the table already exists without it.
+        "ALTER TABLE devices ADD COLUMN IF NOT EXISTS ipv6_address VARCHAR(45)",
+        "CREATE INDEX IF NOT EXISTS idx_devices_ipv6   ON devices(ipv6_address)",
     ]
     conn = get_db()
     try:
@@ -126,6 +129,15 @@ _ipsets_available: bool = True
 
 # Name of the dedicated iptables chain used for IP-based fallback rules.
 _THEBOX_CHAIN = "THEBOX_POLICY"
+
+
+def _ipt_cmd(ip: str) -> str:
+    """Return ``'ip6tables'`` when *ip* is an IPv6 address, ``'iptables'`` otherwise."""
+    try:
+        return "ip6tables" if ipaddress.ip_address(ip).version == 6 else "iptables"
+    except ValueError:
+        log.debug("ipt_cmd_invalid_ip", ip=ip, msg="unrecognised address format — defaulting to iptables")
+        return "iptables"
 
 
 def run_cmd(args: list[str], check: bool = True) -> subprocess.CompletedProcess:
@@ -179,28 +191,33 @@ def _bootstrap_iptables_ip_fallback():
 
     Used when the kernel does not support the ``hash:mac`` ipset type (e.g.
     macOS Docker Desktop).  Policy is enforced via per-IP iptables rules in
-    the dedicated chain rather than MAC-based ipsets.
+    the dedicated chain rather than MAC-based ipsets.  Equivalent ip6tables
+    chains are created alongside so that IPv6 traffic is covered too.
     """
-    # Create the chain (idempotent — -N fails if it already exists)
-    run_cmd(["iptables", "-N", _THEBOX_CHAIN], check=False)
-    # Insert the jump rule into FORWARD if not already there
-    if run_cmd(["iptables", "-C", "FORWARD", "-j", _THEBOX_CHAIN], check=False).returncode != 0:
-        run_cmd(["iptables", "-I", "FORWARD", "-j", _THEBOX_CHAIN])
+    for ipt in ("iptables", "ip6tables"):
+        # Create the chain (idempotent — -N fails if it already exists)
+        run_cmd([ipt, "-N", _THEBOX_CHAIN], check=False)
+        # Insert the jump rule into FORWARD if not already there
+        if run_cmd([ipt, "-C", "FORWARD", "-j", _THEBOX_CHAIN], check=False).returncode != 0:
+            run_cmd([ipt, "-I", "FORWARD", "-j", _THEBOX_CHAIN])
     log.info("iptables_ip_fallback_ready", chain=_THEBOX_CHAIN)
 
 
 def _flush_iptables_ip_chain():
-    """Remove all per-IP rules from the THEBOX_POLICY chain."""
-    run_cmd(["iptables", "-F", _THEBOX_CHAIN], check=False)
+    """Remove all per-IP rules from the THEBOX_POLICY chain (both IPv4 and IPv6)."""
+    run_cmd(["iptables",  "-F", _THEBOX_CHAIN], check=False)
+    run_cmd(["ip6tables", "-F", _THEBOX_CHAIN], check=False)
 
 
 def _remove_iptables_ip_rules(ip: str):
     """Delete all THEBOX_POLICY rules that reference source IP *ip*.
 
+    Selects ``iptables`` or ``ip6tables`` based on the address family of *ip*.
     Tries every rule variant we might have inserted and repeats each deletion
     until iptables reports no matching rule (handles duplicate entries).
     A maximum of 10 iterations per variant guards against unexpected loops.
     """
+    ipt = _ipt_cmd(ip)
     _MAX_ITER = 10
     for extra in [
         ["-p", "udp", "--dport", "53", "-j", "ACCEPT"],
@@ -210,7 +227,7 @@ def _remove_iptables_ip_rules(ip: str):
     ]:
         for _ in range(_MAX_ITER):
             if run_cmd(
-                ["iptables", "-D", _THEBOX_CHAIN, "-s", ip] + extra, check=False
+                [ipt, "-D", _THEBOX_CHAIN, "-s", ip] + extra, check=False
             ).returncode != 0:
                 break
 
@@ -218,12 +235,15 @@ def _remove_iptables_ip_rules(ip: str):
 def _apply_iptables_ip_policy(ip: str, status: str):
     """Insert per-IP THEBOX_POLICY rules for a single device.
 
+    Selects ``iptables`` or ``ip6tables`` based on the address family of *ip*.
     The caller is responsible for removing any stale rules for *ip* first
     (either via :func:`_remove_iptables_ip_rules` or
     :func:`_flush_iptables_ip_chain`).
     """
     if not ip:
         return
+
+    ipt = _ipt_cmd(ip)
 
     if status in ("quarantined", "iot"):
         rules = [
@@ -240,16 +260,16 @@ def _apply_iptables_ip_policy(ip: str, status: str):
         return  # trusted / iot_learning / new — no rules; unrestricted access
 
     for rule in rules:
-        run_cmd(["iptables"] + rule)
+        run_cmd([ipt] + rule)
 
 
 def bootstrap_iptables():
     """
-    Create the ipsets and iptables chains used by the guardian.
+    Create the ipsets and iptables/ip6tables chains used by the guardian.
     Idempotent — safe to call on every start.
 
-    Falls back to per-IP iptables rules in the ``THEBOX_POLICY`` chain when
-    the kernel does not support the ``hash:mac`` ipset type.
+    Falls back to per-IP iptables/ip6tables rules in the ``THEBOX_POLICY``
+    chain when the kernel does not support the ``hash:mac`` ipset type.
     """
     global _ipsets_available
 
@@ -272,7 +292,10 @@ def bootstrap_iptables():
             _bootstrap_iptables_ip_fallback()
             return
 
-    # Insert jump rules into FORWARD chain (idempotent via -C check)
+    # Insert jump rules into FORWARD chain for both IPv4 and IPv6.
+    # hash:mac ipsets operate at layer 2 and are shared between iptables and
+    # ip6tables, so the same set names cover both address families.
+    # The rules are identical for both protocols; we iterate over both commands.
     rules = [
         # Blocked devices — drop everything
         ["-I", "FORWARD", "-m", "set", "--match-set", "thebox_blocked", "src", "-j", "DROP"],
@@ -287,21 +310,27 @@ def bootstrap_iptables():
          "-j", "DROP"],
     ]
 
-    for rule in rules:
-        # Check if rule already exists
-        check_args = ["-C"] + rule[1:]
-        chk = run_cmd(["iptables"] + check_args, check=False)
-        if chk.returncode != 0:
-            run_cmd(["iptables"] + rule)
+    for ipt in ("iptables", "ip6tables"):
+        for rule in rules:
+            # Check if rule already exists
+            check_args = ["-C"] + rule[1:]
+            chk = run_cmd([ipt] + check_args, check=False)
+            if chk.returncode != 0:
+                run_cmd([ipt] + rule)
 
     log.info("iptables_bootstrap_done")
 
 
-def apply_device_policy(mac: str, ip: str, status: str):
-    """Apply iptables policy for a single device based on its status.
+def apply_device_policy(mac: str, ip: str, status: str, ipv6: str = ""):
+    """Apply iptables/ip6tables policy for a single device based on its status.
 
-    Uses MAC-based ipsets when available; falls back to per-IP iptables rules
-    in the THEBOX_POLICY chain when the kernel does not support hash:mac.
+    Uses MAC-based ipsets when available; falls back to per-IP iptables/ip6tables
+    rules in the THEBOX_POLICY chain when the kernel does not support hash:mac.
+
+    *ipv6* is the device's globally-routable IPv6 address, if known.  In the
+    ipsets path MAC membership already covers IPv6 traffic (ipsets operate at
+    layer 2).  In the IP-fallback path, separate ``ip6tables`` rules are
+    inserted for *ipv6* when it is provided.
 
     ``iot_learning`` devices are granted unrestricted access so that all their
     DNS queries (and the corresponding connections) are visible to Pi-hole
@@ -309,7 +338,9 @@ def apply_device_policy(mac: str, ip: str, status: str):
     device transitions to ``iot`` status which applies the restricted policy.
     """
     if _ipsets_available:
-        # Preferred path: O(1) MAC-based ipset membership
+        # Preferred path: O(1) MAC-based ipset membership.
+        # hash:mac ipsets cover both IPv4 and IPv6 traffic because they match
+        # at layer 2; no separate ip6tables action is needed here.
         remove_from_ipset("thebox_quarantine", mac)
         remove_from_ipset("thebox_iot",        mac)
         remove_from_ipset("thebox_blocked",    mac)
@@ -328,24 +359,26 @@ def apply_device_policy(mac: str, ip: str, status: str):
             log.info("device_iot_learning_unrestricted", mac=mac, ip=ip)
         # new / trusted — no ipset entry; unrestricted access
     else:
-        # Fallback: per-IP rules in THEBOX_POLICY chain
-        if not ip:
+        # Fallback: per-IP rules in THEBOX_POLICY chain.
+        # Apply rules for IPv4 address, then IPv6 address (if available).
+        if not ip and not ipv6:
             log.warning(
                 "apply_device_policy_no_ip",
                 mac=mac, status=status,
                 msg="Cannot apply IP-based fallback rules -- device has no IP address",
             )
             return
-        _remove_iptables_ip_rules(ip)
-        _apply_iptables_ip_policy(ip, status)
+        for addr in filter(None, [ip, ipv6]):
+            _remove_iptables_ip_rules(addr)
+            _apply_iptables_ip_policy(addr, status)
         if status == "quarantined":
-            log.info("device_quarantined_ip_rules", mac=mac, ip=ip)
+            log.info("device_quarantined_ip_rules", mac=mac, ip=ip, ipv6=ipv6)
         elif status == "blocked":
-            log.info("device_blocked_ip_rules", mac=mac, ip=ip)
+            log.info("device_blocked_ip_rules", mac=mac, ip=ip, ipv6=ipv6)
         elif status == "iot":
-            log.info("device_iot_restricted_ip_rules", mac=mac, ip=ip)
+            log.info("device_iot_restricted_ip_rules", mac=mac, ip=ip, ipv6=ipv6)
         elif status == "iot_learning":
-            log.info("device_iot_learning_unrestricted_ip_rules", mac=mac, ip=ip)
+            log.info("device_iot_learning_unrestricted_ip_rules", mac=mac, ip=ip, ipv6=ipv6)
 
 
 def sync_all_policies():
@@ -361,7 +394,7 @@ def sync_all_policies():
         _flush_iptables_ip_chain()
 
     with conn.cursor() as cur:
-        cur.execute("SELECT mac_address, ip_address, status FROM devices")
+        cur.execute("SELECT mac_address, ip_address, ipv6_address, status FROM devices")
         for row in cur:
             effective_status = row["status"]
             # When AUTO_QUARANTINE is enabled, treat any device still in "new"
@@ -371,7 +404,12 @@ def sync_all_policies():
             # unrestricted so Pi-hole can observe their full DNS traffic.
             if AUTO_QUARANTINE and effective_status == "new":
                 effective_status = "quarantined"
-            apply_device_policy(row["mac_address"], row["ip_address"] or "", effective_status)
+            apply_device_policy(
+                row["mac_address"],
+                row["ip_address"] or "",
+                effective_status,
+                ipv6=row["ipv6_address"] or "",
+            )
 
     conn.close()
     log.info("sync_all_policies_done")
@@ -428,21 +466,22 @@ def handle_block_ip_event(event: dict):
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT id, mac_address FROM devices WHERE ip_address=%s",
-                (ip,),
+                "SELECT id, mac_address, ipv6_address FROM devices WHERE ip_address=%s OR ipv6_address=%s",
+                (ip, ip),
             )
             row = cur.fetchone()
 
         if row:
             device_id = row["id"]
             mac = row["mac_address"]
+            ipv6 = row["ipv6_address"] or ""
             with conn.cursor() as cur:
                 cur.execute(
                     "UPDATE devices SET status='blocked' WHERE id=%s",
                     (device_id,),
                 )
             conn.commit()
-            apply_device_policy(mac, ip, "blocked")
+            apply_device_policy(mac, ip, "blocked", ipv6=ipv6)
             log.info("block_ip_device_blocked", ip=ip, mac=mac, device_id=device_id)
             create_alert(
                 conn,
@@ -476,10 +515,11 @@ def handle_new_device_event(event: dict):
     """React to a new device appearing on the network."""
     mac = event.get("mac")
     ip = event.get("ip")
+    ipv6 = event.get("ipv6", "")
     vendor = event.get("vendor", "Unknown")
     device_id = event.get("device_id")
 
-    log.info("new_device_event", mac=mac, ip=ip, vendor=vendor)
+    log.info("new_device_event", mac=mac, ip=ip, ipv6=ipv6, vendor=vendor)
 
     conn = get_db()
 
@@ -491,7 +531,7 @@ def handle_new_device_event(event: dict):
                 (device_id,),
             )
         conn.commit()
-        apply_device_policy(mac, ip, "quarantined")
+        apply_device_policy(mac, ip, "quarantined", ipv6=ipv6)
         publish_event("quarantine_device", ip=ip, mac=mac)
         create_alert(
             conn,
@@ -502,7 +542,7 @@ def handle_new_device_event(event: dict):
             device_id=device_id,
         )
     else:
-        apply_device_policy(mac, ip, "new")
+        apply_device_policy(mac, ip, "new", ipv6=ipv6)
         create_alert(
             conn,
             source="guardian",
@@ -518,7 +558,7 @@ def handle_new_device_event(event: dict):
 # ─── Redis subscriber thread ─────────────────────────────────────────────────
 
 def _apply_policy_from_db(device_id: int, status_override: str | None = None) -> tuple[str, str, bool] | None:
-    """Look up a device by ID and apply the correct iptables policy.
+    """Look up a device by ID and apply the correct iptables/ip6tables policy.
 
     When *status_override* is provided it is used instead of the DB value
     (useful when the DB hasn't been updated yet, e.g. during event handlers).
@@ -530,7 +570,10 @@ def _apply_policy_from_db(device_id: int, status_override: str | None = None) ->
     """
     conn = get_db()
     with conn.cursor() as cur:
-        cur.execute("SELECT mac_address, ip_address, status FROM devices WHERE id=%s", (device_id,))
+        cur.execute(
+            "SELECT mac_address, ip_address, ipv6_address, status FROM devices WHERE id=%s",
+            (device_id,),
+        )
         row = cur.fetchone()
     conn.close()
 
@@ -540,6 +583,7 @@ def _apply_policy_from_db(device_id: int, status_override: str | None = None) ->
 
     mac = row["mac_address"]
     ip = row["ip_address"] or ""
+    ipv6 = row["ipv6_address"] or ""
     effective_status = status_override if status_override is not None else row["status"]
 
     # Check quarantine membership *before* apply_device_policy clears it.
@@ -551,7 +595,7 @@ def _apply_policy_from_db(device_id: int, status_override: str | None = None) ->
             ["iptables", "-C", _THEBOX_CHAIN, "-s", ip, "-j", "DROP"], check=False
         ).returncode == 0
 
-    apply_device_policy(mac, ip, effective_status)
+    apply_device_policy(mac, ip, effective_status, ipv6=ipv6)
     return mac, ip, was_quarantined
 
 
