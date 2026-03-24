@@ -3063,14 +3063,16 @@ def _enrich_and_classify(host: dict, extra_seed: dict | None = None) -> dict:
     host["extra_info"] = extra_info
 
     # ── RF classifier (primary) ───────────────────────────────────────────────
-    # Try the RandomForest model first.  If it returns a confident prediction
-    # (above RF_MIN_CONFIDENCE), use it directly.  Otherwise fall back to the
-    # rule-based heuristic so that the two classifiers are complementary.
+    # Try the RandomForest models first.  classify_device() returns a
+    # (device_type, os_family, confidence) triple.  Both predictions share the
+    # same feature vector and are only accepted above RF_MIN_CONFIDENCE.
+    # The heuristic is used as a fallback when RF confidence is too low.
     dhcp_fp: str | None = extra_info.get("dhcp_fingerprint") or None
     rf_type: str = "unknown"
+    rf_os: str = "unknown"
     rf_conf: float = 0.0
     if _dc is not None:
-        rf_type, rf_conf = _dc.classify_device(
+        rf_type, rf_os, rf_conf = _dc.classify_device(
             host.get("vendor"),
             host.get("open_ports", []),
             extra_info,
@@ -3081,7 +3083,7 @@ def _enrich_and_classify(host: dict, extra_seed: dict | None = None) -> dict:
         host["device_type"] = rf_type
         log.debug(
             "rf_classify_used",
-            ip=ip, device_type=rf_type, confidence=round(rf_conf, 3),
+            ip=ip, device_type=rf_type, os_family=rf_os, confidence=round(rf_conf, 3),
         )
     else:
         # Heuristic fallback — retains all the high-specificity rules
@@ -3091,6 +3093,12 @@ def _enrich_and_classify(host: dict, extra_seed: dict | None = None) -> dict:
             host.get("os_guess"), extra_info, host.get("hostname"),
             mac=mac,
         )
+
+    # Fill in os_guess from the RF os_family prediction when nmap did not
+    # detect the OS (which is most of the time without a privileged scan).
+    if rf_os not in ("unknown", "") and not host.get("os_guess"):
+        host["os_guess"] = rf_os
+
     return host
 
 
