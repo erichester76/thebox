@@ -441,237 +441,6 @@ def _build_samples_from_synthetic() -> tuple[list[list[float]], list[str], list[
     return X, y_dt, y_os
 
 
-def _build_samples_from_fingerbank_json(path: str) -> tuple[list[list[float]], list[str]]:
-    """Parse a fingerbank ``fingerprints_and_devices.json`` export.
-
-    The Open Source Fingerbank database (CC-BY-4.0) is available at:
-    https://github.com/fingerbank/open-source-database
-
-    This function extracts DHCP option-55 fingerprint strings and the
-    ``device.name`` / ``device.parent_id`` hierarchy to map to our labels.
-    Only samples whose root parent maps to a known :data:`DEVICE_TYPES` label
-    are included.
-    """
-    # Rough top-level Fingerbank category name → our label mapping.
-    _FB_CATEGORY_MAP = {
-        "mobile device": "mobile",
-        "smartphone": "mobile",
-        "tablet": "mobile",
-        "ios device": "mobile",
-        "android": "mobile",
-        "iot": "iot",
-        "smart tv": "iot",
-        "streaming": "iot",
-        "game console": "iot",
-        "printer": "printer",
-        "network device": "network_device",
-        "router": "network_device",
-        "switch": "network_device",
-        "access point": "network_device",
-        "nas": "server",
-        "workstation": "desktop",
-        "desktop": "desktop",
-        "laptop": "desktop",
-        "computer": "desktop",
-        "server": "server",
-        "virtual machine": "server",
-    }
-
-    log.info("fingerbank_load_start path=%s", path)
-    with open(path, encoding="utf-8") as fh:
-        data = json.load(fh)
-
-    # Build a device-id → root category name index.
-    devices: dict = {}
-    for device in data.get("devices", []):
-        did = device.get("id")
-        name = (device.get("name") or "").lower()
-        parent = device.get("parent_id")
-        devices[did] = {"name": name, "parent": parent}
-
-    def _root_category(did: int | None) -> str | None:
-        seen: set = set()
-        while did is not None and did not in seen:
-            seen.add(did)
-            node = devices.get(did, {})
-            name = node.get("name", "")
-            if name in _FB_CATEGORY_MAP:
-                return _FB_CATEGORY_MAP[name]
-            parent = node.get("parent")
-            # Guard against non-integer parent IDs in malformed data.
-            if not isinstance(parent, int):
-                break
-            did = parent
-        return None
-
-    X: list[list[float]] = []
-    y: list[str] = []
-    skipped = 0
-    for fp in data.get("fingerprints", []):
-        dhcp_fp: str = fp.get("value") or fp.get("fingerprint") or ""
-        if not dhcp_fp:
-            skipped += 1
-            continue
-        device_id = fp.get("device_id")
-        label = _root_category(device_id) if device_id else None
-        if label is None:
-            skipped += 1
-            continue
-        feats = extract_features(
-            vendor=None,
-            open_ports=[],
-            extra_info=None,
-            dhcp_fingerprint=dhcp_fp,
-        )
-        X.append(feats)
-        y.append(label)
-
-    log.info("fingerbank_load_done loaded=%d skipped=%d", len(y), skipped)
-    return X, y
-
-
-def _build_samples_from_fingerbank_db(path: str) -> tuple[list[list[float]], list[str]]:
-    """Parse a ``fingerbank.db`` SQLite database exported from the Fingerbank API.
-
-    The database can be downloaded from::
-
-        curl -k -o fingerbank.db "https://api.fingerbank.org/api/v2/download/db?key=<YOUR_API_KEY>"
-
-    Actual schema used:
-
-    * ``device``           – ``id``, ``name``, ``parent_id`` (device-type hierarchy)
-    * ``dhcp_fingerprint`` – ``id``, ``value``, ``ignored``  (DHCP opt-55 strings)
-    * ``combination``      – ``dhcp_fingerprint_id``, ``mac_vendor_id``, ``device_id``
-                             (links fingerprints + vendor to a classified device)
-
-    .. note::
-        In many DB snapshots downloaded from the Fingerbank API the
-        ``combination`` table is **empty** and ``mac_vendor.device_id`` is
-        always ``0``.  If that is your situation, use the
-        ``--fingerbank-api-key`` option instead to pull labelled data
-        directly from the Fingerbank REST API.
-    """
-    # Rough top-level Fingerbank category name → our label mapping.
-    _FB_CATEGORY_MAP = {
-        "mobile device": "mobile",
-        "smartphone": "mobile",
-        "tablet": "mobile",
-        "ios device": "mobile",
-        "android": "mobile",
-        "iot": "iot",
-        "smart tv": "iot",
-        "streaming": "iot",
-        "game console": "iot",
-        "printer": "printer",
-        "network device": "network_device",
-        "router": "network_device",
-        "switch": "network_device",
-        "access point": "network_device",
-        "nas": "server",
-        "workstation": "desktop",
-        "desktop": "desktop",
-        "laptop": "desktop",
-        "computer": "desktop",
-        "server": "server",
-        "virtual machine": "server",
-    }
-
-    log.info("fingerbank_db_load_start path=%s", path)
-    con = sqlite3.connect(path)
-    con.row_factory = sqlite3.Row
-
-    # Build device-id → {name, parent_id} index.
-    devices: dict[int, dict] = {}
-    try:
-        for row in con.execute("SELECT id, name, parent_id FROM device"):
-            devices[row["id"]] = {
-                "name": (row["name"] or "").lower(),
-                "parent": row["parent_id"],
-            }
-    except sqlite3.OperationalError as exc:
-        log.error("fingerbank_db_device_error error=%s", exc)
-        con.close()
-        return [], []
-
-    def _root_category(did: int | None) -> str | None:
-        seen: set[int] = set()
-        while did is not None and did not in seen:
-            seen.add(did)
-            node = devices.get(did, {})
-            name = node.get("name", "")
-            if name in _FB_CATEGORY_MAP:
-                return _FB_CATEGORY_MAP[name]
-            parent = node.get("parent")
-            if not isinstance(parent, int):
-                break
-            did = parent
-        return None
-
-    # Join combination → dhcp_fingerprint (for the opt-55 string) and
-    # mac_vendor (for the OUI vendor name).  Rows with ignored fingerprints
-    # or no device_id are excluded by the WHERE clause.
-    _COMBO_QUERY = """
-        SELECT
-            df.value  AS dhcp_fp,
-            mv.name   AS vendor_name,
-            c.device_id
-        FROM combination c
-        LEFT JOIN dhcp_fingerprint df ON df.id = c.dhcp_fingerprint_id
-        LEFT JOIN mac_vendor        mv ON mv.id = c.mac_vendor_id
-        WHERE c.device_id IS NOT NULL
-          AND (df.ignored IS NULL OR df.ignored = 0)
-    """
-
-    X: list[list[float]] = []
-    y: list[str] = []
-    skipped = 0
-    seen_samples: set[tuple] = set()
-    try:
-        for row in con.execute(_COMBO_QUERY):
-            dhcp_fp: str = row["dhcp_fp"] or ""
-            vendor: str | None = row["vendor_name"] or None
-            device_id: int = row["device_id"]
-
-            # Skip combinations that carry no useful signal at all.
-            if not dhcp_fp and vendor is None:
-                skipped += 1
-                continue
-
-            label = _root_category(device_id)
-            if label is None:
-                skipped += 1
-                continue
-
-            # Deduplicate identical (dhcp_fp, vendor, device_id) tuples.
-            key = (dhcp_fp, vendor, device_id)
-            if key in seen_samples:
-                skipped += 1
-                continue
-            seen_samples.add(key)
-
-            feats = extract_features(
-                vendor=vendor,
-                open_ports=[],
-                extra_info=None,
-                dhcp_fingerprint=dhcp_fp if dhcp_fp else None,
-            )
-            X.append(feats)
-            y.append(label)
-    except sqlite3.OperationalError as exc:
-        log.error("fingerbank_db_combination_error error=%s", exc)
-    finally:
-        con.close()
-
-    if not y:
-        log.warning(
-            "fingerbank_db_no_samples: combination table appears empty or "
-            "mac_vendor.device_id is 0; consider using --fingerbank-api-key instead"
-        )
-    log.info("fingerbank_db_load_done loaded=%d skipped=%d", len(y), skipped)
-    return X, y
-
-
-
 def _build_samples_from_fingerbank_api(
     api_key: str,
     base_url: str = "https://api.fingerbank.org/api/v2",
@@ -842,61 +611,106 @@ def _build_samples_from_fingerbank_api(
 
 def train(
     extra_X: list[list[float]] | None = None,
-    extra_y: list[str] | None = None,
+    extra_y_dt: list[str] | None = None,
     n_estimators: int = 100,
     max_depth: int = 8,
     run_cv: bool = False,
     verbose: bool = False,
-) -> object:
-    """Train and return a RandomForestClassifier.
+) -> tuple[object, object]:
+    """Train device_type and os_family classifiers and return them as a tuple.
 
     Parameters
     ----------
-    extra_X, extra_y:
-        Optional additional training samples (e.g. from the fingerbank dataset)
-        to augment the embedded synthetic set.
+    extra_X, extra_y_dt:
+        Optional additional training samples for the *device_type* classifier
+        only (e.g. DHCP fingerprints from the Fingerbank API that carry a
+        device_type label but no os_family).  These are NOT used to train the
+        os_family classifier.
     n_estimators:
         Number of trees in the forest.  100 gives a good size/accuracy tradeoff.
     max_depth:
         Maximum depth of each tree.  8 keeps the model compact (~100 KB).
     run_cv:
-        When ``True``, print 5-fold cross-validation accuracy to stdout.
+        When ``True``, print 5-fold cross-validation accuracy to stdout for
+        both classifiers.
     verbose:
-        When ``True``, print feature importances.
+        When ``True``, print the top-20 feature importances for the device_type
+        classifier.
+
+    Returns
+    -------
+    tuple[clf_device_type, clf_os_family]
+        Both classifiers sharing the same 142-dimension feature vector.
     """
     import numpy as np
     from sklearn.ensemble import RandomForestClassifier
     from sklearn.model_selection import cross_val_score
 
-    X_syn, y_syn = _build_samples_from_synthetic()
-    X_all = X_syn.copy()
-    y_all = y_syn.copy()
+    X_syn, y_dt_syn, y_os_syn = _build_samples_from_synthetic()
 
-    if extra_X and extra_y:
-        X_all.extend(extra_X)
-        y_all.extend(extra_y)
+    # ── device_type classifier (synthetic + optional Fingerbank augmentation) ─
+    X_dt = X_syn.copy()
+    y_dt = y_dt_syn.copy()
+    if extra_X and extra_y_dt:
+        X_dt.extend(extra_X)
+        y_dt.extend(extra_y_dt)
 
-    X_np = np.array(X_all, dtype=np.float32)
-    y_np = np.array(y_all)
+    X_dt_np = np.array(X_dt, dtype=np.float32)
+    y_dt_np = np.array(y_dt)
 
-    log.info("training_start samples=%d features=%d", len(y_all), X_np.shape[1])
-
-    clf = RandomForestClassifier(
+    log.info(
+        "training_device_type_start samples=%d features=%d",
+        len(y_dt), X_dt_np.shape[1],
+    )
+    clf_dt = RandomForestClassifier(
         n_estimators=n_estimators,
         max_depth=max_depth,
         class_weight="balanced",
         n_jobs=-1,
         random_state=42,
     )
-    clf.fit(X_np, y_np)
-    log.info("training_done classes=%s", list(clf.classes_))
+    clf_dt.fit(X_dt_np, y_dt_np)
+    log.info("training_device_type_done classes=%s", list(clf_dt.classes_))
+
+    # ── os_family classifier (synthetic only — Fingerbank has no OS labels) ───
+    X_os_np = np.array(X_syn, dtype=np.float32)
+    y_os_np = np.array(y_os_syn)
+
+    log.info(
+        "training_os_family_start samples=%d features=%d",
+        len(y_os_syn), X_os_np.shape[1],
+    )
+    clf_os = RandomForestClassifier(
+        n_estimators=n_estimators,
+        max_depth=max_depth,
+        class_weight="balanced",
+        n_jobs=-1,
+        random_state=42,
+    )
+    clf_os.fit(X_os_np, y_os_np)
+    log.info("training_os_family_done classes=%s", list(clf_os.classes_))
 
     if run_cv:
-        scores = cross_val_score(clf, X_np, y_np, cv=5, scoring="accuracy", n_jobs=-1)
-        print(
-            f"5-fold CV accuracy: {scores.mean():.3f} ± {scores.std():.3f}  "
-            f"[{', '.join(f'{s:.3f}' for s in scores)}]"
-        )
+        for label, clf, X_np, y_np in [
+            ("device_type", clf_dt, X_dt_np, y_dt_np),
+            ("os_family",   clf_os, X_os_np, y_os_np),
+        ]:
+            # Need at least 2 samples per class for CV; skip if not enough data.
+            from collections import Counter  # noqa: PLC0415
+            min_count = min(Counter(y_np).values())
+            if min_count < 2:
+                print(f"[{label}] Skipping CV — too few samples in some classes.")
+                continue
+            scores = cross_val_score(
+                clf, X_np, y_np,
+                cv=min(5, min_count),
+                scoring="accuracy",
+                n_jobs=-1,
+            )
+            print(
+                f"[{label}] 5-fold CV accuracy: {scores.mean():.3f} ± {scores.std():.3f}  "
+                f"[{', '.join(f'{s:.3f}' for s in scores)}]"
+            )
 
     if verbose:
         from device_classifier import (  # noqa: PLC0415
@@ -914,46 +728,31 @@ def train(
             + [f"mdns_{s}" for s in MDNS_SERVICE_TYPES]
             + [f"http_{k}" for k in HTTP_SERVER_KEYWORDS]
         )
-        importances = clf.feature_importances_
-        top_n = sorted(enumerate(importances), key=lambda x: -x[1])[:20]
-        print("\nTop-20 feature importances:")
-        for idx, imp in top_n:
-            print(f"  {feature_names[idx]:<35s}  {imp:.4f}")
+        for label, clf in [("device_type", clf_dt), ("os_family", clf_os)]:
+            importances = clf.feature_importances_
+            top_n = sorted(enumerate(importances), key=lambda x: -x[1])[:20]
+            print(f"\nTop-20 feature importances [{label}]:")
+            for idx, imp in top_n:
+                print(f"  {feature_names[idx]:<35s}  {imp:.4f}")
 
-    return clf
+    return clf_dt, clf_os
 
 
-def save(clf: object, path: str = MODEL_PATH) -> None:
-    """Serialise *clf* to *path* using joblib."""
+def save(models: tuple[object, object], path: str = MODEL_PATH) -> None:
+    """Serialise the ``(clf_device_type, clf_os_family)`` tuple to *path* using joblib."""
     import joblib  # noqa: PLC0415
 
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    joblib.dump(clf, path, compress=3)
+    joblib.dump(models, path, compress=3)
     size_kb = os.path.getsize(path) / 1024
     log.info("model_saved path=%s size_kb=%.1f", path, size_kb)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Train the TheBox RF device-type classifier.",
-    )
-    parser.add_argument(
-        "--fingerbank-json",
-        metavar="PATH",
-        help=(
-            "Path to fingerbank open-source fingerprints_and_devices.json for augmentation. "
-            "Available at https://github.com/fingerbank/open-source-database"
-        ),
-    )
-    parser.add_argument(
-        "--fingerbank-db",
-        metavar="PATH",
-        help=(
-            "Path to fingerbank.db SQLite database for augmentation. "
-            "Download with: curl -k -o fingerbank.db "
-            "\"https://api.fingerbank.org/api/v2/download/db?key=<YOUR_API_KEY>\". "
-            "NOTE: the standard downloaded DB often has an empty combination table "
-            "and device_id=0 in mac_vendor; use --fingerbank-api-key instead."
+        description=(
+            "Train the TheBox RF device-type and OS-family classifiers. "
+            "The output file contains a (clf_device_type, clf_os_family) tuple."
         ),
     )
     parser.add_argument(
@@ -961,8 +760,8 @@ def main() -> None:
         metavar="KEY",
         default=os.environ.get("FINGERBANK_API_KEY", ""),
         help=(
-            "Fingerbank API key for pulling labelled data directly from the "
-            "Fingerbank REST API (recommended over --fingerbank-db). "
+            "Fingerbank API key for pulling additional labelled DHCP fingerprints "
+            "to augment the device_type classifier. "
             "Defaults to the FINGERBANK_API_KEY environment variable. "
             "Register for a free key at https://fingerbank.org/users/register"
         ),
@@ -990,23 +789,19 @@ def main() -> None:
     args = parser.parse_args()
 
     extra_X: list[list[float]] | None = None
-    extra_y: list[str] | None = None
+    extra_y_dt: list[str] | None = None
     if args.fingerbank_api_key:
-        extra_X, extra_y = _build_samples_from_fingerbank_api(args.fingerbank_api_key)
-    elif args.fingerbank_db:
-        extra_X, extra_y = _build_samples_from_fingerbank_db(args.fingerbank_db)
-    elif args.fingerbank_json:
-        extra_X, extra_y = _build_samples_from_fingerbank_json(args.fingerbank_json)
+        extra_X, extra_y_dt = _build_samples_from_fingerbank_api(args.fingerbank_api_key)
 
-    clf = train(
+    models = train(
         extra_X=extra_X,
-        extra_y=extra_y,
+        extra_y_dt=extra_y_dt,
         n_estimators=args.n_estimators,
         max_depth=args.max_depth,
         run_cv=args.cv,
         verbose=args.verbose,
     )
-    save(clf, path=args.output)
+    save(models, path=args.output)
 
 
 if __name__ == "__main__":
