@@ -124,7 +124,13 @@ def _load_oui_table() -> dict[str, str]:
     raw: str | None = None
     try:
         log.info("oui_download_start", url=_OUI_CSV_URL)
-        resp = requests.get(_OUI_CSV_URL, timeout=30)
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (X11; Linux x86_64; rv:124.0) "
+                "Gecko/20100101 Firefox/124.0"
+            )
+        }
+        resp = requests.get(_OUI_CSV_URL, timeout=30, headers=headers)
         resp.raise_for_status()
         raw = resp.text
         try:
