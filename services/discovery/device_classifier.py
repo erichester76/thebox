@@ -5,14 +5,14 @@ sklearn RandomForestClassifier models (~100 KB each on disk).  The models
 are trained by ``train_classifier.py`` (run during Docker image build) and
 loaded once at service startup.
 
-Feature vector (142 dimensions total):
+Feature vector (150 dimensions total):
   - DHCP option-55 individual option-code flags     (30 flags)
   - Open port multi-hot vector                      (30 flags)
-  - OUI vendor name keyword bag-of-words            (42 flags)
-  - mDNS service-type presence/absence flags        (18 flags)
+  - OUI vendor name keyword bag-of-words            (49 flags)
+  - mDNS service-type presence/absence flags        (19 flags)
   - HTTP Server header keyword flags                (22 flags)
 
-Both classifiers share the same 142-dimension feature vector.  The
+Both classifiers share the same 150-dimension feature vector.  The
 feature vector is intentionally designed to work well when DHCP data is
 absent: port signals, vendor keywords, and mDNS service types provide
 independent signal paths for devices discovered via ARP scan, nmap, or
@@ -157,6 +157,9 @@ VENDOR_KEYWORDS: list[str] = [
     "intel", "realtek", "broadcom", "dell", "lenovo",
     # NAS / storage
     "supermicro", "synology", "qnap",
+    # IoT module / chip OEMs whose OUI appears on commodity IoT hardware
+    "gaoshengda",      # Hui Zhou Gaoshengda — IoT/media module OEM (used in Roku, etc.)
+    "smart innovation", # Smart Innovation LLC — IoT WiFi modules
 ]
 
 # mDNS / DNS-SD service types — presence is used as a binary feature.
