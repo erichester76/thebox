@@ -5,14 +5,14 @@ sklearn RandomForestClassifier models (~100 KB each on disk).  The models
 are trained by ``train_classifier.py`` (run during Docker image build) and
 loaded once at service startup.
 
-Feature vector (150 dimensions total):
+Feature vector (180 dimensions total):
   - DHCP option-55 individual option-code flags     (30 flags)
-  - Open port multi-hot vector                      (30 flags)
-  - OUI vendor name keyword bag-of-words            (49 flags)
+  - Open port multi-hot vector                      (34 flags)
+  - OUI vendor name keyword bag-of-words            (70 flags)
   - mDNS service-type presence/absence flags        (19 flags)
-  - HTTP Server header keyword flags                (22 flags)
+  - HTTP Server header keyword flags                (27 flags)
 
-Both classifiers share the same 150-dimension feature vector.  The
+Both classifiers share the same 180-dimension feature vector.  The
 feature vector is intentionally designed to work well when DHCP data is
 absent: port signals, vendor keywords, and mDNS service types provide
 independent signal paths for devices discovered via ARP scan, nmap, or
@@ -29,8 +29,8 @@ format) is accepted but will not provide os_family predictions.
   ``windows``, ``macos``, ``linux``, ``ios``, ``android``, ``embedded``
 
 When the model is not found or confidence is below *RF_MIN_CONFIDENCE*
-(default 0.50) the caller falls back to the existing rule-based
-``guess_device_type()`` heuristic in ``app.py``.
+(default 0.35) the caller returns ``("unknown", "unknown", 0.0)`` and the
+discovery service records the device type as ``unknown``.
 """
 
 from __future__ import annotations
@@ -117,6 +117,7 @@ FEATURE_PORTS: list[int] = [
     161,   # SNMP
     443,   # HTTPS
     445,   # SMB/CIFS
+    502,   # Modbus TCP (industrial IoT / building automation)
     515,   # LPR / LPD
     554,   # RTSP (IP cameras)
     631,   # IPP (printing)
@@ -127,8 +128,11 @@ FEATURE_PORTS: list[int] = [
     3389,  # RDP
     5353,  # mDNS
     5432,  # PostgreSQL
+    5683,  # CoAP (IoT constrained protocols)
     5900,  # VNC
     7547,  # TR-069 (CPE/ISP device management)
+    8008,  # Google Cast control channel (Chromecast / Android TV)
+    8009,  # Google Cast media channel
     8080,  # HTTP alt
     8443,  # HTTPS alt
     8883,  # MQTT TLS (IoT)
@@ -141,22 +145,29 @@ FEATURE_PORTS: list[int] = [
 VENDOR_KEYWORDS: list[str] = [
     # Mobile / phones / tablets
     "apple", "samsung", "qualcomm", "mediatek", "xiaomi", "huawei",
-    # IoT manufacturers
+    "motorola", "oneplus", "oppo",
+    # IoT manufacturers — smart home / automation
     "espressif", "shenzhen", "tuya", "amazon", "google", "philips",
     "belkin", "ring", "nest", "blink", "wemo", "lifx",
+    "shelly", "ecobee", "iqara", "aqara", "govee",
+    "meross", "broadlink", "switchbot", "ikea",
+    # IP cameras / doorbells / security
+    "hikvision", "dahua", "axis", "arlo", "reolink", "wyze", "eufy", "amcrest",
+    # Robot vacuums / smart appliances
+    "irobot", "roborock", "ecovacs",
     # Streaming / smart TV
     "roku", "tcl", "sonos",
-    # IP cameras
-    "hikvision", "dahua",
     # Network equipment
     "cisco", "ubiquiti", "netgear", "tp-link", "aruba",
     "juniper", "mikrotik", "zyxel", "fortinet", "meraki",
+    "sophos", "sonicwall", "ruckus", "palo",
     # Printers
     "hewlett", "epson", "canon", "brother", "lexmark", "xerox",
+    "konica", "kyocera", "ricoh",
     # Workstations / PCs
-    "intel", "realtek", "broadcom", "dell", "lenovo",
+    "intel", "realtek", "broadcom", "dell", "lenovo", "asus",
     # NAS / storage
-    "supermicro", "synology", "qnap",
+    "supermicro", "synology", "qnap", "seagate", "buffalo",
     # IoT module / chip OEMs whose OUI appears on commodity IoT hardware
     "gaoshengda",      # Hui Zhou Gaoshengda — IoT/media module OEM (used in Roku, etc.)
     "smart innovation", # Smart Innovation LLC — IoT WiFi modules
@@ -188,9 +199,10 @@ MDNS_SERVICE_TYPES: list[str] = [
 # HTTP Server header keyword flags — case-insensitive substring match.
 HTTP_SERVER_KEYWORDS: list[str] = [
     # Traditional web servers
-    "apache", "nginx", "iis", "lighttpd", "jetty", "tomcat",
+    "apache", "nginx", "iis", "lighttpd", "jetty", "tomcat", "caddy",
     # Embedded / IoT HTTP stacks
     "mini_httpd", "boa", "thttpd", "uhttpd", "busybox", "micro_httpd",
+    "goahead", "lwip", "mongoose", "openwrt",
     # Printers
     "jetdirect", "printer",
     # Network equipment
