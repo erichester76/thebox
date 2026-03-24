@@ -363,13 +363,13 @@ function renderDevices() {
       <td>${groupBadges||'<span style="color:var(--muted)">–</span>'}</td>
       <td>${statusBadge(d.status)}</td>
       <td>${fmtDate(d.last_seen)}</td>
-      <td>
+      <td class="btn-actions">
         <button class="btn btn-ack"   onclick="openDeviceDetailModal(${d.id})">Details</button>
         ${trustBtn}
         <button class="btn btn-block" onclick="setStatus(${d.id},'blocked')">Block</button>
         <button class="btn btn-iot"   onclick="setStatus(${d.id},'iot')">IoT</button>
         <button class="btn btn-user"  data-device-id="${d.id}" data-owner-id="${d.owner_id||''}" onclick="openAssignModalFromBtn(this)">👤</button>
-        <button class="btn" title="${escHtml(d.notes||'')}" data-device-id="${d.id}" data-notes="${escHtml(d.notes||'')}" onclick="openNotesModalFromBtn(this)">📝</button>
+        <button class="btn"           title="${escHtml(d.notes||'')}" data-device-id="${d.id}" data-notes="${escHtml(d.notes||'')}" onclick="openNotesModalFromBtn(this)">📝</button>
       </td>
     </tr>`;
   }).join('');

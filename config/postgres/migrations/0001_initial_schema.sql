@@ -138,3 +138,7 @@ CREATE INDEX IF NOT EXISTS idx_user_groups_group  ON user_groups(group_id);
 CREATE INDEX IF NOT EXISTS idx_device_groups_group ON device_groups(group_id);
 CREATE INDEX IF NOT EXISTS idx_redirect_target_ip ON redirect_events(target_ip);
 CREATE INDEX IF NOT EXISTS idx_redirect_created   ON redirect_events(created_at);
+
+-- Record this migration as applied.
+INSERT INTO schema_migrations (version) VALUES ('0001')
+    ON CONFLICT (version) DO NOTHING;

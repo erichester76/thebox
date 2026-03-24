@@ -57,68 +57,57 @@ def get_redis():
 
 # ─── Schema bootstrap ────────────────────────────────────────────────────────
 
-def ensure_schema():
-    """Create tables this service reads from or writes to.
+_MIGRATIONS_DIR = "/app/migrations"
+REQUIRED_MIGRATIONS = ["0001", "0003"]
 
-    Scoped to: ``users`` (FK dependency for devices), ``devices``, ``alerts``.
-    All DDL uses ``IF NOT EXISTS`` so this is safe to call on every startup.
+
+def apply_migrations(required_versions):
+    """Apply all required migrations that have not yet been recorded.
+
+    Reads SQL from ``_MIGRATIONS_DIR``/NNNN_*.sql files and applies each
+    version in ascending order, skipping any already recorded in
+    schema_migrations.
     """
-    statements = [
-        # users — FK dependency for devices.owner_id
-        """CREATE TABLE IF NOT EXISTS users (
-            id              SERIAL PRIMARY KEY,
-            username        VARCHAR(64) NOT NULL UNIQUE,
-            display_name    VARCHAR(255),
-            email           VARCHAR(255),
-            created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )""",
-        # devices — guardian reads status and writes quarantine state
-        """CREATE TABLE IF NOT EXISTS devices (
-            id              SERIAL PRIMARY KEY,
-            mac_address     VARCHAR(17) NOT NULL UNIQUE,
-            ip_address      VARCHAR(45),
-            hostname        VARCHAR(255),
-            vendor          VARCHAR(255),
-            device_type     VARCHAR(64) DEFAULT 'unknown',
-            os_guess        VARCHAR(255),
-            first_seen      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            last_seen       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            status          VARCHAR(32) NOT NULL DEFAULT 'new',
-            notes           TEXT,
-            open_ports      JSONB DEFAULT '[]',
-            extra_info      JSONB DEFAULT '{}',
-            owner_id        INTEGER REFERENCES users(id) ON DELETE SET NULL
-        )""",
-        # alerts — guardian writes quarantine / new-device alerts
-        """CREATE TABLE IF NOT EXISTS alerts (
-            id           SERIAL PRIMARY KEY,
-            source       VARCHAR(64) NOT NULL,
-            level        VARCHAR(16) NOT NULL DEFAULT 'info',
-            title        VARCHAR(255) NOT NULL,
-            detail       TEXT,
-            device_id    INTEGER REFERENCES devices(id),
-            acknowledged BOOLEAN NOT NULL DEFAULT FALSE,
-            created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )""",
-        "CREATE INDEX IF NOT EXISTS idx_devices_mac    ON devices(mac_address)",
-        "CREATE INDEX IF NOT EXISTS idx_devices_ip     ON devices(ip_address)",
-        "CREATE INDEX IF NOT EXISTS idx_devices_status ON devices(status)",
-        "CREATE INDEX IF NOT EXISTS idx_alerts_level   ON alerts(level)",
-        "CREATE INDEX IF NOT EXISTS idx_alerts_created ON alerts(created_at)",
-        # Migration: add ipv6_address column if the table already exists without it.
-        "ALTER TABLE devices ADD COLUMN IF NOT EXISTS ipv6_address VARCHAR(45)",
-        "CREATE INDEX IF NOT EXISTS idx_devices_ipv6   ON devices(ipv6_address)",
-    ]
     conn = get_db()
     try:
         with conn.cursor() as cur:
-            for stmt in statements:
-                cur.execute(stmt)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS schema_migrations (
+                    version     VARCHAR(16) NOT NULL PRIMARY KEY,
+                    applied_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
         conn.commit()
+        for version in sorted(required_versions):
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT 1 FROM schema_migrations WHERE version = %s",
+                    (version,)
+                )
+                if cur.fetchone():
+                    continue
+                sql_file = None
+                for name in sorted(os.listdir(_MIGRATIONS_DIR)):
+                    if name.startswith(f"{version}_") and name.endswith(".sql"):
+                        sql_file = os.path.join(_MIGRATIONS_DIR, name)
+                        break
+                if sql_file is None:
+                    raise RuntimeError(
+                        f"Migration {version} not found in {_MIGRATIONS_DIR}"
+                    )
+                with open(sql_file) as fh:
+                    sql = fh.read()
+                cur.execute(sql)
+                cur.execute(
+                    "INSERT INTO schema_migrations (version) VALUES (%s)"
+                    " ON CONFLICT (version) DO NOTHING",
+                    (version,)
+                )
+                conn.commit()
+                log.info("migration_applied", version=version, file=os.path.basename(sql_file))
     finally:
         conn.close()
-    log.info("schema_ensured")
+    log.info("migrations_complete")
 
 
 # ─── Settings helpers ────────────────────────────────────────────────────────
@@ -671,7 +660,7 @@ def subscribe_loop():
 def main():
     log.info("guardian_service_start")
 
-    ensure_schema()
+    apply_migrations(REQUIRED_MIGRATIONS)
     _load_settings()
 
     # Wait for iptables to be available (may not be in all environments)
