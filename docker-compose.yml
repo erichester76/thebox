@@ -58,6 +58,8 @@ services:
       - ./config/pihole/etc-dnsmasq.d:/etc/dnsmasq.d
     cap_add:
       - NET_ADMIN
+      - SYS_TIME
+      - SYS_NICE
     networks:
       - thebox_internal
       - thebox_external
