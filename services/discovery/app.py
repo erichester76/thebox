@@ -1942,14 +1942,64 @@ def tls_cert_info(ip: str, port: int = 443, timeout: float = 3.0) -> dict:
     return {}
 
 
+def _parse_nmap_ssl_cert(output: str) -> dict:
+    """Parse nmap ``ssl-cert`` script text output into structured cert fields.
+
+    nmap's ``ssl-cert`` NSE script produces human-readable text such as::
+
+        Subject: commonName=device.local/organizationName=Acme Corp
+        Subject Alternative Name: DNS:device.local, DNS:*.device.local
+        Issuer: commonName=Acme Root CA/organizationName=Acme Corp
+
+    Returns a dict that may contain ``tls_cn``, ``tls_org``,
+    ``tls_issuer_cn``, and ``tls_sans`` — the same keys produced by
+    :func:`tls_cert_info` — so both code paths can be consumed identically.
+    """
+    result: dict = {}
+    subject_match = re.search(r"Subject: (.+?)(?:\n|$)", output)
+    if subject_match:
+        subject_str = subject_match.group(1)
+        cn = re.search(r"commonName=([^/\n]+)", subject_str)
+        org = re.search(r"organizationName=([^/\n]+)", subject_str)
+        if cn:
+            result["tls_cn"] = cn.group(1).strip()
+        if org:
+            result["tls_org"] = org.group(1).strip()
+    issuer_match = re.search(r"Issuer: (.+?)(?:\n|$)", output)
+    if issuer_match:
+        cn = re.search(r"commonName=([^/\n]+)", issuer_match.group(1))
+        if cn:
+            result["tls_issuer_cn"] = cn.group(1).strip()
+    san_match = re.search(r"Subject Alternative Name: (.+?)(?:\n|$)", output)
+    if san_match:
+        sans = [
+            p.strip()[4:]
+            for p in san_match.group(1).split(",")
+            if p.strip().startswith("DNS:")
+        ]
+        if sans:
+            result["tls_sans"] = sans
+    return result
+
+
 def enrich_from_banners(ip: str, open_ports: list[dict]) -> dict:
     """Grab HTTP server banners and TLS certificate info for *ip*.
 
+    First checks for nmap ``http-server-header`` and ``ssl-cert`` NSE script
+    results embedded in *open_ports* by :func:`nmap_scan`.  Using nmap's
+    built-in scripts avoids opening additional TCP connections for data that
+    nmap has already collected during the port/service scan pass.
+
+    Falls back to direct socket probes (``HEAD /`` and TLS handshake) only
+    when nmap script output is not present — for example, when a host was
+    discovered via ARP or Pi-hole without a prior nmap scan, or when the
+    scripts produced no output for a particular port.
+
     Iterates over *open_ports* and:
-    - Calls :func:`http_banner` for any port with service ``http`` or common
-      HTTP port numbers (80, 8080, 8443).
-    - Calls :func:`tls_cert_info` for any port with service ``https`` or
-      common HTTPS port numbers (443, 8443).
+    - Reads ``http-server-header`` script output (or calls :func:`http_banner`)
+      for ports with service ``http`` or common HTTP port numbers (80, 8080).
+    - Reads ``ssl-cert`` script output (or calls :func:`tls_cert_info`) for
+      ports with service ``https`` or common HTTPS port numbers (443, 8443).
 
     Returns a (possibly empty) dict of banner/cert enrichment fields.
     """
@@ -1957,24 +2007,48 @@ def enrich_from_banners(ip: str, open_ports: list[dict]) -> dict:
         return {}
 
     result: dict = {}
-    http_ports = {p["port"] for p in open_ports if p.get("service") in ("http",) or p["port"] in (80, 8080)}
-    https_ports = {p["port"] for p in open_ports if p.get("service") in ("https", "ssl") or p["port"] in (443, 8443)}
+    http_ports = [p for p in open_ports if p.get("service") in ("http",) or p["port"] in (80, 8080)]
+    https_ports = [p for p in open_ports if p.get("service") in ("https", "ssl") or p["port"] in (443, 8443)]
 
-    for port in http_ports:
-        banner = http_banner(ip, port, timeout=BANNER_GRAB_TIMEOUT)
-        if banner:
-            result["http_server"] = banner
-            break  # first successful banner is sufficient
-
-    for port in https_ports:
-        cert = tls_cert_info(ip, port, timeout=BANNER_GRAB_TIMEOUT)
-        if cert:
-            result.update(cert)
-            if not result.get("http_server"):
-                banner = http_banner(ip, port, timeout=BANNER_GRAB_TIMEOUT)
-                if banner:
-                    result["http_server"] = banner
+    # ── HTTP: prefer nmap http-server-header script, fall back to socket ──────
+    for p in http_ports:
+        scripts = p.get("scripts", {})
+        header_val = scripts.get("http-server-header", "").strip()
+        if header_val:
+            result["http_server"] = header_val
             break
+    if not result.get("http_server"):
+        for p in http_ports:
+            banner = http_banner(ip, p["port"], timeout=BANNER_GRAB_TIMEOUT)
+            if banner:
+                result["http_server"] = banner
+                break
+
+    # ── HTTPS: prefer nmap ssl-cert script, fall back to TLS socket ──────────
+    for p in https_ports:
+        scripts = p.get("scripts", {})
+        cert_output = scripts.get("ssl-cert", "")
+        if cert_output:
+            cert = _parse_nmap_ssl_cert(cert_output)
+            if cert:
+                result.update(cert)
+                # Also grab the HTTP server header for this HTTPS port if
+                # the nmap script reported it.
+                if not result.get("http_server"):
+                    header_val = scripts.get("http-server-header", "").strip()
+                    if header_val:
+                        result["http_server"] = header_val
+                break
+    if not result.get("tls_cn"):
+        for p in https_ports:
+            cert = tls_cert_info(ip, p["port"], timeout=BANNER_GRAB_TIMEOUT)
+            if cert:
+                result.update(cert)
+                if not result.get("http_server"):
+                    banner = http_banner(ip, p["port"], timeout=BANNER_GRAB_TIMEOUT)
+                    if banner:
+                        result["http_server"] = banner
+                break
 
     return result
 
@@ -1982,10 +2056,23 @@ def enrich_from_banners(ip: str, open_ports: list[dict]) -> dict:
 # ─── nmap port/OS scan ───────────────────────────────────────────────────────
 
 def nmap_scan(ip: str) -> dict:
-    """Run a quick nmap scan on *ip* and return port list + OS guess."""
+    """Run a quick nmap scan on *ip* and return port list + OS guess.
+
+    Uses nmap's built-in ``http-server-header`` and ``ssl-cert`` NSE scripts
+    so that HTTP banner and TLS certificate data are collected in the same
+    scan pass rather than requiring separate socket connections.  The script
+    output is attached to each port entry under the ``"scripts"`` key and
+    consumed by :func:`enrich_from_banners`.
+    """
     nm = nmap.PortScanner()
     try:
-        nm.scan(ip, arguments="-O -sV --osscan-guess -T4 --host-timeout 10s --open")
+        nm.scan(
+            ip,
+            arguments=(
+                "-O -sV --osscan-guess -T4 --host-timeout 10s --open"
+                " --script=http-server-header,ssl-cert"
+            ),
+        )
     except Exception as exc:
         log.warning("nmap_scan_error", ip=ip, error=str(exc))
         return {"open_ports": [], "os_guess": None}
@@ -1998,14 +2085,19 @@ def nmap_scan(ip: str) -> dict:
     for proto in host.all_protocols():
         for port, info in host[proto].items():
             if info.get("state") == "open":
-                open_ports.append(
-                    {
-                        "port": port,
-                        "protocol": proto,
-                        "service": info.get("name", ""),
-                        "version": info.get("version", ""),
-                    }
-                )
+                port_data: dict = {
+                    "port": port,
+                    "protocol": proto,
+                    "service": info.get("name", ""),
+                    "version": info.get("version", ""),
+                }
+                # Include NSE script output so enrich_from_banners() can
+                # consume http-server-header and ssl-cert results without
+                # opening additional TCP connections.
+                scripts = info.get("script", {})
+                if scripts:
+                    port_data["scripts"] = scripts
+                open_ports.append(port_data)
 
     os_guess = None
     if "osmatch" in host and host["osmatch"]:
