@@ -119,8 +119,8 @@ _SYNTHETIC_DATA: list[dict] = [
     {"label": "iot", "os_family": "embedded", "vendor": "Google LLC",          "open_ports": _p(8009),         "extra_info": _m("_cast._tcp"),         "dhcp_fingerprint": "1,121,3,6,15,119,252"},
     {"label": "iot", "os_family": "embedded", "vendor": "Google LLC",          "open_ports": _p(80, 8008),     "extra_info": _m("_googlecast._tcp", "_spotify-connect._tcp"), "dhcp_fingerprint": "1,3,6,15,119"},
     # Amazon Echo / Ring
-    {"label": "iot", "os_family": "embedded", "vendor": "Amazon Technologies", "open_ports": _p(443, 55443),   "extra_info": {},                       "dhcp_fingerprint": "1,3,6,15,119,252"},
-    {"label": "iot", "os_family": "embedded", "vendor": "Amazon Technologies", "open_ports": _p(80, 443),      "extra_info": {},                       "dhcp_fingerprint": "1,3,6,15,28,51,58,59"},
+    {"label": "iot", "os_family": "embedded", "vendor": "Amazon Technologies Inc.", "open_ports": _p(443, 55443),   "extra_info": {},                       "dhcp_fingerprint": "1,3,6,15,119,252"},
+    {"label": "iot", "os_family": "embedded", "vendor": "Amazon Technologies Inc", "open_ports": _p(80, 443),      "extra_info": {},                       "dhcp_fingerprint": "1,3,6,15,28,51,58,59"},
     {"label": "iot", "os_family": "embedded", "vendor": "Ring LLC",            "open_ports": _p(80, 443),      "extra_info": {},                       "dhcp_fingerprint": "1,3,6,15,28,51"},
     # Philips Hue bridge
     {"label": "iot", "os_family": "embedded", "vendor": "Philips Lighting BV", "open_ports": _p(80, 443),      "extra_info": _h("nginx"),              "dhcp_fingerprint": "1,3,6,15,28,42,100,101"},
@@ -241,8 +241,8 @@ _SYNTHETIC_DATA: list[dict] = [
     {"label": "network_device", "os_family": "embedded", "vendor": "Cisco Systems",  "open_ports": _p(22, 80, 443, 161),     "extra_info": {},              "dhcp_fingerprint": "1,3,6,15,9"},
     {"label": "network_device", "os_family": "embedded", "vendor": "Cisco-Meraki",   "open_ports": _p(22, 80, 443),          "extra_info": _h("nginx"),     "dhcp_fingerprint": "1,3,6,15,9"},
     # Ubiquiti UniFi — port 8443 (UniFi controller) is a strong Ubiquiti signal
-    {"label": "network_device", "os_family": "embedded", "vendor": "Ubiquiti Inc.",  "open_ports": _p(22, 80, 443, 8080, 8443), "extra_info": _h("ubiquiti"), "dhcp_fingerprint": "1,3,6,15,28,51"},
-    {"label": "network_device", "os_family": "embedded", "vendor": "Ubiquiti Inc.",  "open_ports": _p(22, 443, 8443),           "extra_info": {},            "dhcp_fingerprint": "1,3,6,15,28,51"},
+    {"label": "network_device", "os_family": "embedded", "vendor": "Ubiquiti Inc",  "open_ports": _p(22, 80, 443, 8080, 8443), "extra_info": _h("ubiquiti"), "dhcp_fingerprint": "1,3,6,15,28,51"},
+    {"label": "network_device", "os_family": "embedded", "vendor": "Ubiquiti Inc",  "open_ports": _p(22, 443, 8443),           "extra_info": {},            "dhcp_fingerprint": "1,3,6,15,28,51"},
     # Netgear
     {"label": "network_device", "os_family": "embedded", "vendor": "Netgear Inc.",   "open_ports": _p(80, 443, 23),          "extra_info": _h("netgear"),   "dhcp_fingerprint": "1,3,6,15,28,51,58,59"},
     {"label": "network_device", "os_family": "embedded", "vendor": "Netgear Inc.",   "open_ports": _p(80, 443),              "extra_info": {},              "dhcp_fingerprint": "1,3,6,15,28,51,58,59"},
@@ -333,12 +333,13 @@ _SYNTHETIC_DATA: list[dict] = [
     {"label": "iot",            "os_family": "embedded", "vendor": "Hikvision Digital",   "open_ports": [], "extra_info": {}, "dhcp_fingerprint": None},
     {"label": "iot",            "os_family": "embedded", "vendor": "Dahua Technology",    "open_ports": [], "extra_info": {}, "dhcp_fingerprint": None},
     {"label": "iot",            "os_family": "embedded", "vendor": "Axis Communications", "open_ports": [], "extra_info": {}, "dhcp_fingerprint": None},
-    {"label": "iot",            "os_family": "embedded", "vendor": "Amazon Technologies", "open_ports": [], "extra_info": {}, "dhcp_fingerprint": None},
+    {"label": "iot",            "os_family": "embedded", "vendor": "Amazon Technologies Inc", "open_ports": [], "extra_info": {}, "dhcp_fingerprint": None},
+    {"label": "iot",            "os_family": "embedded", "vendor": "Amazon.Com, LLC", "open_ports": [], "extra_info": {}, "dhcp_fingerprint": None},
     {"label": "iot",            "os_family": "embedded", "vendor": "Nest Labs Inc.",      "open_ports": [], "extra_info": {}, "dhcp_fingerprint": None},
     {"label": "iot",            "os_family": "embedded", "vendor": "Ring LLC",            "open_ports": [], "extra_info": {}, "dhcp_fingerprint": None},
     # Unambiguous network device vendors
     {"label": "network_device", "os_family": "embedded", "vendor": "Cisco Systems",       "open_ports": [], "extra_info": {}, "dhcp_fingerprint": None},
-    {"label": "network_device", "os_family": "embedded", "vendor": "Ubiquiti Inc.",        "open_ports": [], "extra_info": {}, "dhcp_fingerprint": None},
+    {"label": "network_device", "os_family": "embedded", "vendor": "Ubiquiti Inc",        "open_ports": [], "extra_info": {}, "dhcp_fingerprint": None},
     {"label": "network_device", "os_family": "embedded", "vendor": "Aruba Networks",       "open_ports": [], "extra_info": {}, "dhcp_fingerprint": None},
     {"label": "network_device", "os_family": "embedded", "vendor": "Fortinet Inc.",        "open_ports": [], "extra_info": {}, "dhcp_fingerprint": None},
     {"label": "network_device", "os_family": "embedded", "vendor": "Juniper Networks",     "open_ports": [], "extra_info": {}, "dhcp_fingerprint": None},
@@ -350,7 +351,7 @@ _SYNTHETIC_DATA: list[dict] = [
     {"label": "printer",        "os_family": "embedded", "vendor": "Brother Industries",   "open_ports": [], "extra_info": {}, "dhcp_fingerprint": None},
     # NAS vendors
     {"label": "server",         "os_family": "linux",    "vendor": "Synology Inc.",        "open_ports": [], "extra_info": {}, "dhcp_fingerprint": None},
-    {"label": "server",         "os_family": "linux",    "vendor": "QNAP Systems",         "open_ports": [], "extra_info": {}, "dhcp_fingerprint": None},
+    {"label": "server",         "os_family": "linux",    "vendor": "QNAP Systems, Inc.",         "open_ports": [], "extra_info": {}, "dhcp_fingerprint": None},
 
     # ── mDNS-only (no DHCP, no open ports, vendor optional) ──────────────────
     # Devices discovered via passive mDNS / DNS-SD browsing.  These service
@@ -389,8 +390,8 @@ _SYNTHETIC_DATA: list[dict] = [
     # common real-world non-DHCP cases: static-IP servers and appliances.
 
     # Ubiquiti + port 8443 = UniFi AP/switch with static management IP
-    {"label": "network_device", "os_family": "embedded", "vendor": "Ubiquiti Inc.", "open_ports": _p(22, 8443),        "extra_info": {},              "dhcp_fingerprint": None},
-    {"label": "network_device", "os_family": "embedded", "vendor": "Ubiquiti Inc.", "open_ports": _p(22, 80, 8443),    "extra_info": _h("ubiquiti"),  "dhcp_fingerprint": None},
+    {"label": "network_device", "os_family": "embedded", "vendor": "Ubiquiti Inc", "open_ports": _p(22, 8443),        "extra_info": {},              "dhcp_fingerprint": None},
+    {"label": "network_device", "os_family": "embedded", "vendor": "Ubiquiti Inc", "open_ports": _p(22, 80, 8443),    "extra_info": _h("ubiquiti"),  "dhcp_fingerprint": None},
     # Cisco + SNMP on static IP
     {"label": "network_device", "os_family": "embedded", "vendor": "Cisco Systems", "open_ports": _p(22, 80, 161),     "extra_info": {},              "dhcp_fingerprint": None},
     {"label": "network_device", "os_family": "embedded", "vendor": "Cisco Systems", "open_ports": _p(22, 443, 161),    "extra_info": {},              "dhcp_fingerprint": None},
@@ -399,7 +400,7 @@ _SYNTHETIC_DATA: list[dict] = [
     {"label": "server",         "os_family": "linux",    "vendor": "Intel Corporate","open_ports": _p(22, 80, 443),    "extra_info": _h("apache"),   "dhcp_fingerprint": None},
     # NAS on static IP
     {"label": "server",         "os_family": "linux",    "vendor": "Synology Inc.", "open_ports": _p(22, 80, 443, 445),"extra_info": _mh("_smb._tcp"), "dhcp_fingerprint": None},
-    {"label": "server",         "os_family": "linux",    "vendor": "QNAP Systems",  "open_ports": _p(22, 80, 443, 445),"extra_info": {},              "dhcp_fingerprint": None},
+    {"label": "server",         "os_family": "linux",    "vendor": "QNAP Systems, Inc.",  "open_ports": _p(22, 80, 443, 445),"extra_info": {},              "dhcp_fingerprint": None},
     # Windows desktop on static IP (e.g. admin workstation)
     {"label": "desktop",        "os_family": "windows",  "vendor": "Intel Corporate","open_ports": _p(445, 3389),      "extra_info": {},              "dhcp_fingerprint": None},
     {"label": "desktop",        "os_family": "windows",  "vendor": "Dell Inc.",      "open_ports": _p(445, 3389),      "extra_info": {},              "dhcp_fingerprint": None},
