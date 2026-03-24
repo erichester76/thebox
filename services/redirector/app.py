@@ -34,8 +34,18 @@ Quarantine enforcement:
   BLACKHOLE_QUARANTINED=true, additional iptables rules drop the spoofed
   traffic (except DHCP and DNS so the device can still request an address
   and receive a block-page response).
+
+Captive portal:
+  When CAPTIVE_PORTAL_ENABLED=true (the default), a lightweight HTTP server
+  starts on CAPTIVE_PORTAL_PORT (default 8082).  For each quarantined device
+  an iptables PREROUTING REDIRECT rule is inserted that steers incoming
+  TCP port-80 traffic from that IP to the captive portal port, so the device
+  receives a simple HTML page explaining the quarantine instead of a silent
+  connection failure.  The page text is configurable via
+  CAPTIVE_PORTAL_MESSAGE and CAPTIVE_PORTAL_CONTACT.
 """
 
+import html
 import json
 import logging
 import os
@@ -43,6 +53,7 @@ import random
 import subprocess
 import threading
 import time
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import psycopg2
 import psycopg2.extras
@@ -62,6 +73,8 @@ from scapy.all import (
     sniff,
     srp,
 )
+
+from notifier import send_alert_notification
 
 # ─── Configuration ───────────────────────────────────────────────────────────
 DATABASE_URL = os.environ["DATABASE_URL"]
@@ -85,6 +98,20 @@ BOX_IP = os.environ.get("BOX_IP", "")
 BLACKHOLE_QUARANTINED = os.environ.get("BLACKHOLE_QUARANTINED", "false").lower() == "true"
 # Seconds between ARP refresh packets
 ARP_REFRESH_INTERVAL = int(os.environ.get("ARP_REFRESH_INTERVAL", "10"))
+
+# ─── Captive portal configuration ────────────────────────────────────────────
+# When True, a lightweight HTTP server intercepts port-80 traffic from
+# quarantined IPs and serves a quarantine-explanation page.
+CAPTIVE_PORTAL_ENABLED = os.environ.get("CAPTIVE_PORTAL_ENABLED", "true").lower() == "true"
+# Local port the captive portal server listens on (iptables REDIRECT target).
+CAPTIVE_PORTAL_PORT = int(os.environ.get("CAPTIVE_PORTAL_PORT", "8082"))
+# Message displayed on the captive portal page.
+CAPTIVE_PORTAL_MESSAGE = os.environ.get(
+    "CAPTIVE_PORTAL_MESSAGE",
+    "Your device has been quarantined because it was not recognized on this network.",
+)
+# Contact address or URL shown on the portal page; leave empty to omit.
+CAPTIVE_PORTAL_CONTACT = os.environ.get("CAPTIVE_PORTAL_CONTACT", "")
 
 # ─── Logging ─────────────────────────────────────────────────────────────────
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
@@ -246,6 +273,7 @@ def create_alert(
             (source, level, title, detail, device_id),
         )
     conn.commit()
+    send_alert_notification(source, level, title, detail)
 
 
 # ─── ARP helpers ─────────────────────────────────────────────────────────────
@@ -333,6 +361,9 @@ def start_quarantine(ip: str, mac: str | None, gateway_ip: str, gateway_mac: str
         if BLACKHOLE_QUARANTINED:
             _setup_blackhole_iptables(ip)
 
+        if CAPTIVE_PORTAL_ENABLED:
+            _setup_captive_portal_iptables(ip, CAPTIVE_PORTAL_PORT)
+
         entry: dict = {
             "mac": resolved_mac,
             "gateway_ip": gateway_ip,
@@ -375,6 +406,9 @@ def stop_quarantine(ip: str):
     if BLACKHOLE_QUARANTINED:
         _teardown_blackhole_iptables(ip)
 
+    if CAPTIVE_PORTAL_ENABLED:
+        _teardown_captive_portal_iptables(ip, CAPTIVE_PORTAL_PORT)
+
     log.info("quarantine_released", ip=ip)
     try:
         conn = get_db()
@@ -411,6 +445,114 @@ def _teardown_blackhole_iptables(ip: str):
     for rule in rules:
         run_cmd(rule, check=False)
     log.info("blackhole_iptables_removed", ip=ip)
+
+
+# ─── Captive portal HTTP server ───────────────────────────────────────────────
+
+_CAPTIVE_PORTAL_HTML = """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Network Access Restricted</title>
+  <style>
+    body {{
+      font-family: sans-serif;
+      max-width: 600px;
+      margin: 80px auto;
+      padding: 20px;
+      text-align: center;
+      color: #333;
+    }}
+    h1 {{ color: #c0392b; margin-bottom: 0.5em; }}
+    .message {{ font-size: 1.1em; margin: 1em 0; }}
+    .contact {{ margin-top: 1.5em; font-size: 0.95em; }}
+    a {{ color: #2980b9; }}
+  </style>
+</head>
+<body>
+  <h1>&#x26A0;&#xFE0F; Network Access Restricted</h1>
+  <p class="message">{message}</p>
+  {contact_block}
+</body>
+</html>
+"""
+
+_CAPTIVE_PORTAL_CONTACT_BLOCK = (
+    '<p class="contact">For assistance, please contact: '
+    '<a href="mailto:{contact}">{contact}</a></p>'
+)
+
+
+class _CaptivePortalHandler(BaseHTTPRequestHandler):
+    """Serve a quarantine explanation page for every HTTP request."""
+
+    def do_GET(self):
+        self._serve()
+
+    def do_POST(self):
+        self._serve()
+
+    def do_HEAD(self):
+        self._serve(head_only=True)
+
+    def _serve(self, head_only: bool = False):
+        contact_block = (
+            _CAPTIVE_PORTAL_CONTACT_BLOCK.format(contact=html.escape(CAPTIVE_PORTAL_CONTACT))
+            if CAPTIVE_PORTAL_CONTACT
+            else ""
+        )
+        body = _CAPTIVE_PORTAL_HTML.format(
+            message=html.escape(CAPTIVE_PORTAL_MESSAGE),
+            contact_block=contact_block,
+        ).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if not head_only:
+            self.wfile.write(body)
+
+    def log_message(self, fmt, *args):  # silence default stderr logging
+        log.debug("captive_portal_request", client=self.client_address[0], path=self.path)
+
+
+def start_captive_portal(port: int):
+    """Start the captive portal HTTP server on *port* in a background thread."""
+    # Bind to 0.0.0.0 because iptables REDIRECT rewrites the destination to
+    # the incoming interface's IP (not loopback), so the server must accept on
+    # all interfaces to receive those redirected connections.
+    server = HTTPServer(("0.0.0.0", port), _CaptivePortalHandler)
+    t = threading.Thread(target=server.serve_forever, daemon=True, name="captive-portal")
+    t.start()
+    log.info("captive_portal_started", port=port)
+    return t
+
+
+def _setup_captive_portal_iptables(ip: str, portal_port: int):
+    """Redirect TCP port-80 traffic from *ip* to the local captive portal."""
+    rule = [
+        "iptables", "-t", "nat", "-I", "PREROUTING",
+        "-s", ip, "-p", "tcp", "--dport", "80",
+        "-j", "REDIRECT", "--to-ports", str(portal_port),
+    ]
+    check_args = list(rule)
+    check_args[3] = "-C"
+    if run_cmd(check_args, check=False).returncode != 0:
+        run_cmd(rule)
+    log.info("captive_portal_iptables_set", ip=ip, port=portal_port)
+
+
+def _teardown_captive_portal_iptables(ip: str, portal_port: int):
+    """Remove the captive portal PREROUTING REDIRECT rule for *ip*."""
+    rule = [
+        "iptables", "-t", "nat", "-D", "PREROUTING",
+        "-s", ip, "-p", "tcp", "--dport", "80",
+        "-j", "REDIRECT", "--to-ports", str(portal_port),
+    ]
+    run_cmd(rule, check=False)
+    log.info("captive_portal_iptables_removed", ip=ip)
 
 
 # ─── redirect_dns mode ───────────────────────────────────────────────────────
@@ -767,6 +909,10 @@ def main():
 
     if "passive" in REDIRECT_MODES or not REDIRECT_MODES:
         log.info("passive_mode_active", msg="Monitoring only — no active redirection")
+
+    # ── Start captive portal server ───────────────────────────────────────────
+    if CAPTIVE_PORTAL_ENABLED:
+        start_captive_portal(CAPTIVE_PORTAL_PORT)
 
     # ── Subscribe for quarantine/unquarantine events ──────────────────────────
     t = threading.Thread(

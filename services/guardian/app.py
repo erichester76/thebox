@@ -29,6 +29,8 @@ import redis
 import schedule
 import structlog
 
+from notifier import send_alert_notification
+
 # ─── Configuration ───────────────────────────────────────────────────────────
 DATABASE_URL = os.environ["DATABASE_URL"]
 REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379/0")
@@ -149,6 +151,13 @@ def add_to_ipset(name: str, value: str):
     if not _ipsets_available:
         return
     run_cmd(["ipset", "add", "-exist", name, value])
+
+
+def is_in_ipset(name: str, value: str) -> bool:
+    """Return True if *value* is a member of ipset *name*, False otherwise."""
+    if not _ipsets_available:
+        return False
+    return run_cmd(["ipset", "test", name, value], check=False).returncode == 0
 
 
 def remove_from_ipset(name: str, value: str):
@@ -368,6 +377,18 @@ def sync_all_policies():
     log.info("sync_all_policies_done")
 
 
+# ─── Redis event publisher ───────────────────────────────────────────────────
+
+def publish_event(event_type: str, **fields):
+    """Publish a structured event to the shared Redis channel."""
+    try:
+        rdb = get_redis()
+        rdb.publish("thebox:events", json.dumps({"type": event_type, **fields}))
+        log.info("event_published", event_type=event_type, **fields)
+    except Exception as exc:
+        log.error("event_publish_failed", event_type=event_type, error=str(exc))
+
+
 # ─── Alert helper ────────────────────────────────────────────────────────────
 
 def create_alert(conn, source: str, level: str, title: str, detail: str, device_id: int | None = None):
@@ -377,9 +398,79 @@ def create_alert(conn, source: str, level: str, title: str, detail: str, device_
             (source, level, title, detail, device_id),
         )
     conn.commit()
+    send_alert_notification(source, level, title, detail)
 
 
 # ─── Event handler ───────────────────────────────────────────────────────────
+
+def handle_block_ip_event(event: dict):
+    """React to a block_ip event published by the honeypot service.
+
+    Looks up the offending IP in the devices table.  If a matching device is
+    found, its status is updated to ``blocked`` and :func:`apply_device_policy`
+    enforces the new policy via the MAC-based ``thebox_blocked`` ipset.  When
+    the IP belongs to an unknown/external host that has no DB entry the IP is
+    blocked via a direct DROP rule in the ``THEBOX_POLICY`` iptables chain
+    (which is created on demand if it does not yet exist).
+
+    In both cases a ``critical`` alert is written to the ``alerts`` table.
+    """
+    ip = event.get("ip", "")
+    reason = event.get("reason", "honeypot")
+
+    if not ip:
+        log.warning("block_ip_event_missing_ip", event=event)
+        return
+
+    log.info("block_ip_event_received", ip=ip, reason=reason)
+
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, mac_address FROM devices WHERE ip_address=%s",
+                (ip,),
+            )
+            row = cur.fetchone()
+
+        if row:
+            device_id = row["id"]
+            mac = row["mac_address"]
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE devices SET status='blocked' WHERE id=%s",
+                    (device_id,),
+                )
+            conn.commit()
+            apply_device_policy(mac, ip, "blocked")
+            log.info("block_ip_device_blocked", ip=ip, mac=mac, device_id=device_id)
+            create_alert(
+                conn,
+                source="guardian",
+                level="critical",
+                title=f"Honeypot attack blocked: {ip}",
+                detail=f"IP: {ip}  Reason: {reason}\nDevice found in DB (MAC: {mac}) — status set to blocked.",
+                device_id=device_id,
+            )
+        else:
+            # Unknown/external IP — no DB entry.  Ensure the THEBOX_POLICY
+            # chain exists (idempotent) and insert a direct DROP rule.
+            # Remove any stale rules first so repeat events don't accumulate
+            # duplicate entries.
+            _bootstrap_iptables_ip_fallback()
+            _remove_iptables_ip_rules(ip)
+            _apply_iptables_ip_policy(ip, "blocked")
+            log.info("block_ip_external_blocked", ip=ip)
+            create_alert(
+                conn,
+                source="guardian",
+                level="critical",
+                title=f"Honeypot attack blocked (external IP): {ip}",
+                detail=f"IP: {ip}  Reason: {reason}\nNo matching device in DB — iptables DROP rule applied.",
+            )
+    finally:
+        conn.close()
+
 
 def handle_new_device_event(event: dict):
     """React to a new device appearing on the network."""
@@ -401,6 +492,7 @@ def handle_new_device_event(event: dict):
             )
         conn.commit()
         apply_device_policy(mac, ip, "quarantined")
+        publish_event("quarantine_device", ip=ip, mac=mac)
         create_alert(
             conn,
             source="guardian",
@@ -425,11 +517,16 @@ def handle_new_device_event(event: dict):
 
 # ─── Redis subscriber thread ─────────────────────────────────────────────────
 
-def _apply_policy_from_db(device_id: int, status_override: str | None = None) -> None:
+def _apply_policy_from_db(device_id: int, status_override: str | None = None) -> tuple[str, str, bool] | None:
     """Look up a device by ID and apply the correct iptables policy.
 
     When *status_override* is provided it is used instead of the DB value
     (useful when the DB hasn't been updated yet, e.g. during event handlers).
+
+    Returns a ``(mac_address, ip_address, was_quarantined)`` tuple on success,
+    where *was_quarantined* is ``True`` when the device was in the quarantine
+    ipset (or had quarantine IP rules) before the policy was applied.
+    Returns ``None`` if the device is not found.
     """
     conn = get_db()
     with conn.cursor() as cur:
@@ -439,12 +536,23 @@ def _apply_policy_from_db(device_id: int, status_override: str | None = None) ->
 
     if not row:
         log.warning("policy_apply_device_not_found", device_id=device_id)
-        return
+        return None
 
     mac = row["mac_address"]
     ip = row["ip_address"] or ""
     effective_status = status_override if status_override is not None else row["status"]
+
+    # Check quarantine membership *before* apply_device_policy clears it.
+    if _ipsets_available:
+        was_quarantined = is_in_ipset("thebox_quarantine", mac)
+    else:
+        # IP-fallback: probe for the DROP rule that marks quarantine
+        was_quarantined = ip != "" and run_cmd(
+            ["iptables", "-C", _THEBOX_CHAIN, "-s", ip, "-j", "DROP"], check=False
+        ).returncode == 0
+
     apply_device_policy(mac, ip, effective_status)
+    return mac, ip, was_quarantined
 
 
 def subscribe_loop():
@@ -462,6 +570,8 @@ def subscribe_loop():
             etype = event.get("type")
             if etype == "new_device":
                 handle_new_device_event(event)
+            elif etype == "block_ip":
+                handle_block_ip_event(event)
             elif etype == "iot_learning_started":
                 # Discovery has set the device status to 'iot_learning' in the
                 # DB; apply unrestricted policy immediately so Pi-hole can see
@@ -477,9 +587,15 @@ def subscribe_loop():
                 device_id = event.get("device_id")
                 new_status = event.get("status")
                 if device_id and new_status:
-                    _apply_policy_from_db(device_id, status_override=new_status)
+                    result = _apply_policy_from_db(device_id, status_override=new_status)
                     log.info("device_policy_updated_from_event",
                              device_id=device_id, status=new_status)
+                    if result:
+                        mac, ip, was_quarantined = result
+                        if new_status == "quarantined":
+                            publish_event("quarantine_device", ip=ip, mac=mac)
+                        elif was_quarantined:
+                            publish_event("unquarantine_device", ip=ip, mac=mac)
         except Exception as exc:
             log.error("event_handling_error", error=str(exc))
 
