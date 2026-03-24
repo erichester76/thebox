@@ -2628,6 +2628,15 @@ def vendor_lookup(mac: str) -> str | None:
 # All entries are matched as case-insensitive substrings of the vendor field,
 # so a short prefix like "espressif" covers "Espressif Systems, Inc." and any
 # future variant reported by MAC-vendor databases.
+#
+# Note: a subset of these keywords also appears in ``device_classifier.py``'s
+# ``VENDOR_KEYWORDS`` list, which is the RF classifier's binary feature set.
+# The two lists serve different roles: ``VENDOR_KEYWORDS`` drives the trained
+# model (must be kept short for tractable feature counts), while
+# ``_IOT_VENDOR_KEYWORDS`` drives the heuristic rule engine (can be as broad
+# as needed, no size constraint).  Both sets must be updated when adding new
+# IoT module / chip OEM keywords so that both the RF classifier and the
+# heuristic fallback benefit from the new signal.
 _IOT_VENDOR_KEYWORDS: frozenset[str] = frozenset({
     # Microcontroller / embedded-SoC manufacturers
     "espressif", "espressif systems", "raspberry pi", "raspberrypi",
