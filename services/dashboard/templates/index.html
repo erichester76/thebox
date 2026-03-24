@@ -266,6 +266,14 @@
     #pihole-status-badge.enabled  { background: rgba(63,185,80,.15);  color: var(--success); }
     #pihole-status-badge.disabled { background: rgba(248,81,73,.15);  color: var(--danger); }
     #pihole-status-badge.unknown  { background: rgba(139,148,158,.15); color: var(--muted); }
+
+    /* ── Device detail modal ────────────────────────── */
+    .allowlist-entry { display:flex; align-items:center; gap:8px; padding:5px 0; border-bottom:1px solid var(--border); }
+    .allowlist-entry:last-child { border-bottom:none; }
+    .allowlist-fqdn { flex:1; font-family:monospace; font-size:13px; word-break:break-all; }
+    .allowlist-date { font-size:11px; color:var(--muted); white-space:nowrap; }
+    #allowlist-entries { max-height:220px; overflow-y:auto; }
+    .section-label { font-size:12px; font-weight:600; text-transform:uppercase; letter-spacing:.06em; color:var(--muted); margin:16px 0 8px; }
   </style>
 </head>
 <body>
@@ -484,6 +492,23 @@
   </div>
 </div>
 
+<!-- Device Detail Modal -->
+<div class="modal-backdrop" id="device-detail-modal">
+  <div class="modal" style="max-width:640px">
+    <h3 id="device-detail-title">Device Details</h3>
+    <div class="event-detail-grid" id="device-detail-info"></div>
+    <div class="section-label">IoT DNS Allowlist</div>
+    <div class="form-row" style="margin-bottom:8px">
+      <input id="new-allowlist-fqdn" type="text" placeholder="e.g. example.com" />
+      <button class="btn btn-primary" onclick="addAllowlistEntry()">Add</button>
+    </div>
+    <div id="allowlist-entries"></div>
+    <div class="modal-actions" style="margin-top:16px">
+      <button class="btn btn-ack" onclick="closeDeviceDetailModal()">Close</button>
+    </div>
+  </div>
+</div>
+
 <script>
 // ── Theme toggle ─────────────────────────────────────────────────────────────
 function applyTheme(theme) {
@@ -632,6 +657,7 @@ function renderDevices() {
       <td>${statusBadge(d.status)}</td>
       <td>${fmtDate(d.last_seen)}</td>
       <td>
+        <button class="btn btn-ack"   onclick="openDeviceDetailModal(${d.id})">Details</button>
         ${trustBtn}
         <button class="btn btn-block" onclick="setStatus(${d.id},'blocked')">Block</button>
         <button class="btn btn-iot"   onclick="setStatus(${d.id},'iot')">IoT</button>
@@ -696,6 +722,93 @@ async function confirmAssign() {
   }
   closeAssignModal();
   loadDevices();
+}
+
+// ── Device detail modal ───────────────────────────────────────────────────────
+let _detailDeviceId = null;
+
+async function openDeviceDetailModal(deviceId) {
+  _detailDeviceId = deviceId;
+  const d = _devices.find(x => x.id === deviceId);
+  if (!d) return;
+
+  const ownerLabel = d.owner_display_name || d.owner_username || '–';
+  const groupNames = (d.groups || []).map(g => g.name).join(', ') || '–';
+
+  document.getElementById('device-detail-title').textContent =
+    `${d.ip_address || d.mac_address} — ${d.hostname || 'Unknown'}`;
+
+  document.getElementById('device-detail-info').innerHTML = `
+    <div><div class="event-detail-label">IP Address</div><div class="event-detail-val">${escHtml(d.ip_address||'–')}</div></div>
+    <div><div class="event-detail-label">MAC Address</div><div class="event-detail-val">${escHtml(d.mac_address)}</div></div>
+    <div><div class="event-detail-label">Hostname</div><div class="event-detail-val">${escHtml(d.hostname||'–')}</div></div>
+    <div><div class="event-detail-label">Vendor</div><div class="event-detail-val">${escHtml(d.vendor||'–')}</div></div>
+    <div><div class="event-detail-label">Device Type</div><div class="event-detail-val">${escHtml(d.device_type||'–')}</div></div>
+    <div><div class="event-detail-label">OS</div><div class="event-detail-val">${escHtml(d.os_guess||'–')}</div></div>
+    <div><div class="event-detail-label">Owner</div><div class="event-detail-val">${escHtml(ownerLabel)}</div></div>
+    <div><div class="event-detail-label">Groups</div><div class="event-detail-val">${escHtml(groupNames)}</div></div>
+    <div><div class="event-detail-label">Status</div><div class="event-detail-val">${statusBadge(d.status)}</div></div>
+    <div><div class="event-detail-label">Last Seen</div><div class="event-detail-val">${fmtDate(d.last_seen)}</div></div>
+  `;
+
+  document.getElementById('new-allowlist-fqdn').value = '';
+  document.getElementById('allowlist-entries').innerHTML = '<div style="color:var(--muted);font-size:12px;padding:6px 0">Loading…</div>';
+  document.getElementById('device-detail-modal').classList.add('open');
+  await loadDeviceAllowlist(deviceId);
+}
+
+function closeDeviceDetailModal() {
+  document.getElementById('device-detail-modal').classList.remove('open');
+  _detailDeviceId = null;
+}
+
+async function loadDeviceAllowlist(deviceId) {
+  let entries;
+  try { entries = await api(`/api/devices/${deviceId}/iot-allowlist`); } catch(_) { entries = []; }
+  const el = document.getElementById('allowlist-entries');
+  if (!entries.length) {
+    el.innerHTML = '<div style="color:var(--muted);font-size:12px;padding:6px 0">No allowlist entries for this device.</div>';
+    return;
+  }
+  el.innerHTML = entries.map(e => `
+    <div class="allowlist-entry">
+      <span class="allowlist-fqdn">${escHtml(e.fqdn)}</span>
+      <span class="allowlist-date">${fmtDate(e.created_at)}</span>
+      <button class="btn btn-danger" onclick="removeAllowlistEntry(${deviceId},${e.id})">✕</button>
+    </div>`).join('');
+}
+
+async function addAllowlistEntry() {
+  const fqdn = document.getElementById('new-allowlist-fqdn').value.trim();
+  if (!fqdn) { alert('Enter a domain name.'); return; }
+  if (!/^[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?)+$/.test(fqdn)) {
+    alert('Enter a valid domain name (e.g. example.com).');
+    return;
+  }
+  try {
+    await api(`/api/devices/${_detailDeviceId}/iot-allowlist`, {
+      method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({fqdn})
+    });
+  } catch(e) {
+    let msg = 'Failed to add entry.';
+    try { msg = JSON.parse(e.message).error || msg; } catch(_) {}
+    alert(msg);
+    return;
+  }
+  document.getElementById('new-allowlist-fqdn').value = '';
+  await loadDeviceAllowlist(_detailDeviceId);
+}
+
+async function removeAllowlistEntry(deviceId, entryId) {
+  try {
+    await api(`/api/devices/${deviceId}/iot-allowlist/${entryId}`, {method:'DELETE'});
+  } catch(e) {
+    let msg = 'Failed to remove entry.';
+    try { msg = JSON.parse(e.message).error || msg; } catch(_) {}
+    alert(msg);
+    return;
+  }
+  await loadDeviceAllowlist(deviceId);
 }
 
 // ── Alerts ───────────────────────────────────────────────────────────────────
@@ -1132,6 +1245,9 @@ document.getElementById('edit-group-modal').addEventListener('click', function(e
 });
 document.getElementById('manage-group-modal').addEventListener('click', function(e) {
   if (e.target === this) closeManageGroupModal();
+});
+document.getElementById('device-detail-modal').addEventListener('click', function(e) {
+  if (e.target === this) closeDeviceDetailModal();
 });
 
 // ── Bootstrap ────────────────────────────────────────────────────────────────
