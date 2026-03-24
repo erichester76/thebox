@@ -67,11 +67,7 @@ from mac_vendor_lookup import MacLookup, VendorNotFoundError
 from scapy.all import ARP, BOOTP, DNSRR, DHCP, DNS, DNSQR, Ether, IP, TCP, UDP, srp, sniff  # noqa: F401
 from zeroconf import ServiceBrowser, Zeroconf
 
-# RF device-type classifier — optional, gracefully absent before first build.
-try:
-    import device_classifier as _dc
-except ImportError:
-    _dc = None  # type: ignore[assignment]
+
 
 # ─── Configuration ───────────────────────────────────────────────────────────
 DATABASE_URL = os.environ["DATABASE_URL"]
@@ -253,13 +249,12 @@ def _is_locally_administered_mac(mac: str) -> bool:
         return False
 
 
-# ─── Fingerbank DHCP-fingerprint classification ───────────────────────────────
+# ─── Fingerbank device classification ────────────────────────────────────────
 
 _FINGERBANK_API_URL = "https://api.fingerbank.org/api/v2/combinations/interrogate"
 
-# In-process cache: key = "fp|vci" → result dict (or empty dict for 404).
-# Persists for the lifetime of the process; typical home-lab networks have
-# only a handful of unique DHCP fingerprints so memory cost is negligible.
+# In-process cache: key = SHA-256 of the sorted JSON payload → result dict
+# (or empty dict for 404).  Persists for the lifetime of the process.
 _fingerbank_cache: dict[str, dict] = {}
 # Monotonic timestamp of the last API call — used to enforce a minimum
 # interval between calls to avoid exceeding the unauthenticated rate limit.
@@ -293,30 +288,85 @@ _FINGERBANK_CATEGORY_MAP: dict[str, str] = {
     "virtual machine":"server",
 }
 
+# OS family keywords derived from the Fingerbank device_name hierarchy string.
+_FINGERBANK_OS_KEYWORDS: list[tuple[str, str]] = [
+    ("windows",  "windows"),
+    ("mac os",   "macos"),
+    ("macos",    "macos"),
+    ("os x",     "macos"),
+    (" ios",     "ios"),
+    ("iphone",   "ios"),
+    ("ipad",     "ios"),
+    ("android",  "android"),
+    ("linux",    "linux"),
+]
+
+
+def _fingerbank_os_family(device_name: str) -> str:
+    """Infer OS family from the Fingerbank full device_name hierarchy string."""
+    name_l = device_name.lower()
+    for keyword, family in _FINGERBANK_OS_KEYWORDS:
+        if keyword in name_l:
+            return family
+    return "embedded"
+
 
 def fingerbank_lookup(
-    dhcp_fingerprint: str,
-    vendor_class: str = "",
+    dhcp_fingerprint: str = "",
+    mac: str = "",
     hostname: str = "",
+    dhcp_vendor: str = "",
+    mdns_services: list[str] | None = None,
+    upnp_server_strings: list[str] | None = None,
 ) -> dict | None:
-    """Query fingerbank.org to classify a device by its DHCP option-55 fingerprint.
+    """Query the Fingerbank /combinations/interrogate endpoint.
 
-    The DHCP Parameter Request List (option 55) is a comma-separated list of
-    DHCP option codes that a client requests from the server.  The exact
-    sequence is unique to the TCP/IP stack compiled into the device's firmware
-    and is one of the most reliable passive classification signals.
+    Sends all available network signals (DHCP option-55 fingerprint, MAC
+    address, hostname, DHCP vendor class, mDNS service types, UPnP server
+    strings) as a POST JSON payload so that Fingerbank can use the richest
+    possible set of attributes to identify the device.
 
-    Results are cached in-process by (fingerprint, vci) key so that repeated
-    DHCP renewals from the same device type do not trigger additional API calls.
+    Providing more attributes produces more accurate results and a higher
+    confidence score (0–100).  At least one attribute must be non-empty for
+    the call to proceed.
 
-    Returns a dict with keys ``device_name``, ``device_type`` (one of our
-    canonical types), and ``score`` (0–100) on success, or ``None`` on API
-    failure or when fingerprinting is disabled.
+    Results are cached in-process by a SHA-256 hash of the payload so that
+    repeated calls with the same attributes do not trigger extra API requests.
+
+    Returns a dict with keys ``device_name`` (full hierarchy path),
+    ``device_type`` (one of our canonical types), ``os_family``, ``version``,
+    and ``score`` (0–100) on success, or ``None`` on API failure, when
+    fingerprinting is disabled, or when no usable attributes are provided.
     """
-    if not FINGERBANK_ENABLED or not dhcp_fingerprint:
+    if not FINGERBANK_ENABLED:
         return None
 
-    cache_key = f"{dhcp_fingerprint}|{vendor_class}"
+    # Build the JSON payload with all non-empty attributes.
+    payload: dict = {}
+    if dhcp_fingerprint:
+        payload["dhcp_fingerprint"] = dhcp_fingerprint
+    if mac:
+        # Normalise to the no-separator lowercase format expected by Fingerbank.
+        payload["mac"] = mac.replace(":", "").replace("-", "").lower()
+    if hostname:
+        payload["hostname"] = hostname
+    if dhcp_vendor:
+        payload["dhcp_vendor"] = dhcp_vendor
+    if mdns_services:
+        # Fingerbank accepts at most 5 mDNS service types per request.
+        payload["mdns_services"] = mdns_services[:5]
+    if upnp_server_strings:
+        # Fingerbank accepts at most 5 UPnP server strings per request.
+        payload["upnp_server_strings"] = upnp_server_strings[:5]
+
+    if not payload:
+        return None
+
+    # Build a stable cache key from the sorted payload so identical sets of
+    # attributes always hit the same entry regardless of dict insertion order.
+    cache_key = hashlib.sha256(
+        json.dumps(payload, sort_keys=True).encode()
+    ).hexdigest()
 
     with _fingerbank_lock:
         if cache_key in _fingerbank_cache:
@@ -334,44 +384,55 @@ def fingerbank_lookup(
 
     # Make the network call outside the lock so other threads can proceed
     # with cache lookups while this request is in flight.
-    params: dict[str, str] = {"dhcp_fingerprint": dhcp_fingerprint}
-    if vendor_class:
-        params["vendor_class_identifier"] = vendor_class
-    if hostname:
-        params["hostname"] = hostname
+    url_params: dict[str, str] = {}
     if FINGERBANK_API_KEY:
-        params["key"] = FINGERBANK_API_KEY
+        url_params["key"] = FINGERBANK_API_KEY
 
     try:
-        resp = requests.get(_FINGERBANK_API_URL, params=params, timeout=5)
+        resp = requests.post(
+            _FINGERBANK_API_URL,
+            params=url_params,
+            json=payload,
+            timeout=5,
+        )
         if resp.status_code == 200:
             data = resp.json()
             device = data.get("device") or {}
             parents = device.get("parents") or []
-            # Walk parents bottom-up to find a recognised category name.
+            # The full hierarchy path (e.g. "Operating System/Windows OS/...").
+            full_name: str = data.get("device_name", "") or device.get("name", "")
+            # Walk parents top-down (outermost first) to find a category match.
             device_type = "unknown"
             for parent in reversed(parents):
                 pname = (parent.get("name") or "").lower()
                 if pname in _FINGERBANK_CATEGORY_MAP:
                     device_type = _FINGERBANK_CATEGORY_MAP[pname]
                     break
+            # Also check the device name itself if no parent matched.
+            if device_type == "unknown":
+                dname_l = (device.get("name") or "").lower()
+                if dname_l in _FINGERBANK_CATEGORY_MAP:
+                    device_type = _FINGERBANK_CATEGORY_MAP[dname_l]
+
             result: dict = {
-                "device_name": device.get("name", ""),
+                "device_name": full_name,
                 "device_type": device_type,
+                "os_family": _fingerbank_os_family(full_name),
+                "version": data.get("version", ""),
                 "score": data.get("score", 0),
             }
             with _fingerbank_lock:
                 _fingerbank_cache[cache_key] = result
             log.debug(
                 "fingerbank_hit",
-                fingerprint=dhcp_fingerprint,
                 device=result["device_name"],
                 device_type=result["device_type"],
+                os_family=result["os_family"],
                 score=result["score"],
             )
             return result
         if resp.status_code == 404:
-            # Unknown fingerprint — cache empty result to avoid retrying.
+            # Unknown combination — cache empty result to avoid retrying.
             with _fingerbank_lock:
                 _fingerbank_cache[cache_key] = {}
             return None
@@ -1550,10 +1611,13 @@ def process_dhcp_sniff_queue(conn) -> int:
 
         vci_is_iot = bool(dhcp_vci and any(kw in dhcp_vci for kw in _IOT_DHCP_VCI_KEYWORDS))
 
-        # Query fingerbank if we have an option-55 fingerprint.
-        fb_result: dict | None = None
-        if dhcp_fp:
-            fb_result = fingerbank_lookup(dhcp_fp, vendor_class=dhcp_vci, hostname=hostname)
+        # Query fingerbank with all available DHCP signals plus MAC/hostname.
+        fb_result: dict | None = fingerbank_lookup(
+            dhcp_fingerprint=dhcp_fp,
+            mac=mac,
+            hostname=hostname,
+            dhcp_vendor=dhcp_vci,
+        )
 
         # Derive the best device_type hint from all signals.
         # Priority: fingerbank > VCI IoT keyword.  Never set "unknown".
@@ -1852,11 +1916,16 @@ def ssdp_discover(timeout: int = 5) -> dict[str, dict]:
                     continue
                 response_text = data.decode("utf-8", errors="replace")
                 location: str | None = None
+                server_string: str | None = None
                 for line in response_text.split("\r\n"):
-                    if line.upper().startswith("LOCATION:"):
+                    line_upper = line.upper()
+                    if line_upper.startswith("LOCATION:"):
                         location = line.split(":", 1)[1].strip()
-                        break
+                    elif line_upper.startswith("SERVER:"):
+                        server_string = line.split(":", 1)[1].strip()
                 entry: dict = {}
+                if server_string:
+                    entry["upnp_server_string"] = server_string
                 if location and _validate_ssdp_location(location, ip):
                     entry["upnp_location"] = location
                     try:
@@ -3062,42 +3131,73 @@ def _enrich_and_classify(host: dict, extra_seed: dict | None = None) -> dict:
 
     host["extra_info"] = extra_info
 
-    # ── RF classifier (primary) ───────────────────────────────────────────────
-    # Try the RandomForest models first.  classify_device() returns a
-    # (device_type, os_family, confidence) triple.  Both predictions share the
-    # same feature vector and are only accepted above RF_MIN_CONFIDENCE.
-    # The heuristic is used as a fallback when RF confidence is too low.
-    dhcp_fp: str | None = extra_info.get("dhcp_fingerprint") or None
-    rf_type: str = "unknown"
-    rf_os: str = "unknown"
-    rf_conf: float = 0.0
-    if _dc is not None:
-        rf_type, rf_os, rf_conf = _dc.classify_device(
-            host.get("vendor"),
-            host.get("open_ports", []),
-            extra_info,
-            dhcp_fingerprint=dhcp_fp,
-        )
+    # ── Fingerbank interrogate (primary classifier) ───────────────────────────
+    # Build all available signals and submit to the Fingerbank /combinations/
+    # interrogate endpoint, which returns the best-matching device and a
+    # confidence score.  Providing more attributes raises accuracy.
+    dhcp_fp: str = extra_info.get("dhcp_fingerprint") or ""
+    dhcp_vendor: str = (extra_info.get("dhcp_vendor_class") or "").lower()
 
-    if rf_type != "unknown":
-        host["device_type"] = rf_type
-        log.debug(
-            "rf_classify_used",
-            ip=ip, device_type=rf_type, os_family=rf_os, confidence=round(rf_conf, 3),
-        )
+    # Extract mDNS service types (e.g. "_airplay._tcp.local") from the stored
+    # list of service dicts.  Fingerbank expects plain service type strings.
+    raw_mdns = extra_info.get("mdns_services") or []
+    mdns_svc_types: list[str] = []
+    for svc in raw_mdns:
+        stype = (svc.get("service_type") or "").strip()
+        if stype:
+            mdns_svc_types.append(stype)
+
+    # UPnP/SSDP SERVER header captured from M-SEARCH responses.
+    upnp_server = extra_info.get("upnp_server_string") or ""
+    upnp_server_strings: list[str] = [upnp_server] if upnp_server else []
+
+    fb_result: dict | None = fingerbank_lookup(
+        dhcp_fingerprint=dhcp_fp,
+        mac=mac,
+        hostname=host.get("hostname") or "",
+        dhcp_vendor=dhcp_vendor,
+        mdns_services=mdns_svc_types,
+        upnp_server_strings=upnp_server_strings,
+    )
+
+    if fb_result:
+        # Persist the Fingerbank result in extra_info so the UI can display it.
+        if fb_result.get("device_name"):
+            extra_info["fingerbank_device_name"] = fb_result["device_name"]
+            extra_info["fingerbank_score"] = fb_result.get("score", 0)
+            if fb_result.get("version"):
+                extra_info["fingerbank_version"] = fb_result["version"]
+
+        fb_type = fb_result.get("device_type", "unknown")
+        fb_os = fb_result.get("os_family", "")
+
+        if fb_type != "unknown":
+            host["device_type"] = fb_type
+            log.debug(
+                "fingerbank_classify_used",
+                ip=ip, device_type=fb_type, os_family=fb_os,
+                score=fb_result.get("score", 0),
+            )
+        else:
+            # Fingerbank returned a result but couldn't map a device_type —
+            # fall back to the rule-based heuristic.
+            host["device_type"] = guess_device_type(
+                host.get("vendor"), host.get("open_ports", []),
+                host.get("os_guess"), extra_info, host.get("hostname"),
+                mac=mac,
+            )
+
+        # Populate os_guess from Fingerbank when nmap did not detect the OS.
+        if fb_os and fb_os not in ("unknown", "", "embedded") and not host.get("os_guess"):
+            host["os_guess"] = fb_os
+
     else:
-        # Heuristic fallback — retains all the high-specificity rules
-        # (mDNS service types, WSD, UPnP, SNMP, fingerbank result, etc.)
+        # Fingerbank disabled or no result — fall back to the heuristic.
         host["device_type"] = guess_device_type(
             host.get("vendor"), host.get("open_ports", []),
             host.get("os_guess"), extra_info, host.get("hostname"),
             mac=mac,
         )
-
-    # Fill in os_guess from the RF os_family prediction when nmap did not
-    # detect the OS (which is most of the time without a privileged scan).
-    if rf_os not in ("unknown", "") and not host.get("os_guess"):
-        host["os_guess"] = rf_os
 
     return host
 
@@ -3692,11 +3792,6 @@ def _discovery_subscribe_loop() -> None:
 def main():
     apply_migrations(REQUIRED_MIGRATIONS)
     _load_settings()
-
-    # Load the RF device-type classifier model (built at image build time by
-    # train_classifier.py).  Failure is non-fatal: the heuristic takes over.
-    if _dc is not None:
-        _dc.load_classifier()
 
     log.info(
         "discovery_service_start",
