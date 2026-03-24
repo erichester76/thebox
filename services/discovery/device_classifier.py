@@ -53,9 +53,11 @@ MODEL_PATH: str = os.environ.get(
 )
 
 # Minimum predicted-class probability to accept the RF label instead of
-# falling back to the heuristic.  Higher values = more conservative / fewer
-# overrides of the heuristic.
-RF_MIN_CONFIDENCE: float = float(os.environ.get("RF_MIN_CONFIDENCE", "0.50"))
+# falling back to the heuristic.  Lower values = more classifications; higher
+# values = more conservative (fewer overrides of the heuristic).  With the
+# typical 6-class feature space (and sparse data for ARP-only devices) a
+# threshold of 0.35 is a good balance between recall and precision.
+RF_MIN_CONFIDENCE: float = float(os.environ.get("RF_MIN_CONFIDENCE", "0.35"))
 
 # Master on/off switch — set RF_CLASSIFIER_ENABLED=false to disable entirely.
 RF_CLASSIFIER_ENABLED: bool = (
@@ -142,6 +144,10 @@ VENDOR_KEYWORDS: list[str] = [
     # IoT manufacturers
     "espressif", "shenzhen", "tuya", "amazon", "google", "philips",
     "belkin", "ring", "nest", "blink", "wemo", "lifx",
+    # Streaming / smart TV
+    "roku", "tcl", "sonos",
+    # IP cameras
+    "hikvision", "dahua",
     # Network equipment
     "cisco", "ubiquiti", "netgear", "tp-link", "aruba",
     "juniper", "mikrotik", "zyxel", "fortinet", "meraki",
@@ -173,6 +179,7 @@ MDNS_SERVICE_TYPES: list[str] = [
     "_mqtt._tcp",
     "_matter._tcp",
     "_spotify-connect._tcp",
+    "_companion-link._tcp",
 ]
 
 # HTTP Server header keyword flags — case-insensitive substring match.
@@ -251,7 +258,6 @@ def extract_features(
     """
     features: list[float] = []
     extra: dict = extra_info or {}
-    vendor_l: str = (vendor or "").lower()
     ports: set[int] = {p["port"] for p in (open_ports or [])}
 
     # ── DHCP option-55 flags ──────────────────────────────────────────────────
@@ -270,13 +276,25 @@ def extract_features(
         features.append(1.0 if port in ports else 0.0)
 
     # ── Vendor keyword bag-of-words ───────────────────────────────────────────
+    # Check both the OUI vendor string and the UPnP manufacturer independently.
+    # Many consumer devices ship with a generic chip-maker OUI (e.g. Hui Zhou
+    # Gaoshengda) but advertise their brand via UPnP (e.g. upnp_manufacturer=
+    # "Roku" or "TCL").  Checking separately avoids false positives that could
+    # arise from concatenating the two strings.
+    vendor_l: str = (vendor or "").lower()
+    upnp_vendor_l: str = (extra.get("upnp_manufacturer") or "").lower()
     for kw in VENDOR_KEYWORDS:
-        features.append(1.0 if kw in vendor_l else 0.0)
+        features.append(1.0 if kw in vendor_l or kw in upnp_vendor_l else 0.0)
 
     # ── mDNS service-type flags ───────────────────────────────────────────────
+    # Zeroconf returns fully-qualified service types with the mDNS domain
+    # appended (e.g. ``_airplay._tcp.local`` or ``_airplay._tcp.local.``).
+    # Strip that suffix so service types match the MDNS_SERVICE_TYPES list.
     mdns_types: set[str] = set()
     for svc in extra.get("mdns_services", []):
         stype = (svc.get("service_type") or "").lower()
+        # Strip trailing .local. / .local (mDNS domain suffix added by Zeroconf)
+        stype = stype.removesuffix(".local.").removesuffix(".local")
         if stype:
             mdns_types.add(stype)
     for stype in MDNS_SERVICE_TYPES:
