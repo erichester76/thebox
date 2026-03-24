@@ -103,6 +103,12 @@ DHCP_SNIFF_ENABLED = os.environ.get("DHCP_SNIFF_ENABLED", "true").lower() == "tr
 # ARP packet sniffing — real-time device detection between scan cycles
 ARP_SNIFF_ENABLED = os.environ.get("ARP_SNIFF_ENABLED", "true").lower() == "true"
 
+# How often (seconds) to drain the passive sniff queues and run SSDP/mDNS
+# discovery between full scan cycles.  Defaults to 30 s so that newly-seen
+# devices appear in the database within half a minute rather than waiting for
+# the next SCAN_INTERVAL window.
+SNIFF_PROCESS_INTERVAL = int(os.environ.get("SNIFF_PROCESS_INTERVAL", "30"))
+
 # IEEE OUI vendor database — downloaded at startup and cached locally
 _OUI_CSV_URL = os.environ.get(
     "OUI_CSV_URL", "https://standards-oui.ieee.org/oui/oui.csv"
@@ -2287,6 +2293,149 @@ def upsert_device(conn, rdb, device: dict) -> bool:
             return False
 
 
+# ─── Continuous sniff processor ─────────────────────────────────────────────
+
+def _process_ssdp_standalone(conn, rdb) -> int:
+    """Run SSDP discovery and upsert newly found devices into the database.
+
+    Sends UPnP/SSDP multicast probes and performs full enrichment (hostname,
+    vendor, nmap, banner grab) for any responding IP that is not yet tracked.
+    Called by :func:`_sniff_processor_loop` so that SSDP-discovered devices
+    reach the database between full scan cycles.
+
+    Returns the number of new devices added.
+    """
+    ssdp_data = ssdp_discover(timeout=SSDP_TIMEOUT)
+    if not ssdp_data:
+        return 0
+
+    log.info("ssdp_standalone_process", candidates=len(ssdp_data))
+    new_count = 0
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT ip_address FROM devices WHERE ip_address = ANY(%s)",
+            (list(ssdp_data.keys()),),
+        )
+        known_ips: set[str] = {row["ip_address"] for row in cur.fetchall() if row["ip_address"]}
+
+    for ip, ssdp_entry in ssdp_data.items():
+        if ip in known_ips:
+            continue
+
+        mac = arp_resolve(ip)
+        if not mac:
+            log.debug("ssdp_standalone_no_mac", ip=ip)
+            continue
+
+        host: dict = {"ip": ip, "mac": mac}
+        host["hostname"] = resolve_hostname(ip)
+        host["vendor"] = vendor_lookup(mac)
+        scan_data = nmap_scan(ip)
+        host.update(scan_data)
+        extra_info: dict = enrich_from_banners(ip, host.get("open_ports", []))
+        extra_info.update(ssdp_entry)
+        if extra_info.get("tls_cn") and not host.get("hostname"):
+            host["hostname"] = extra_info["tls_cn"]
+        host["extra_info"] = extra_info
+        host["device_type"] = guess_device_type(
+            host.get("vendor"), host.get("open_ports", []), host.get("os_guess"), extra_info,
+            host.get("hostname"),
+        )
+
+        is_new = upsert_device(conn, rdb, host)
+        if is_new:
+            new_count += 1
+            log.info("ssdp_standalone_new_device", ip=ip, mac=mac, vendor=host.get("vendor"))
+
+    return new_count
+
+
+def _process_mdns_standalone(conn) -> int:
+    """Drain the mDNS/Zeroconf service queue and update device records.
+
+    Processes mDNS service announcements captured by the Zeroconf
+    :class:`ServiceBrowser` thread.  For each IP with pending mDNS data:
+
+    - Updates the ``hostname`` column when the device exists but currently has
+      no hostname.
+    - Merges ``mdns_services`` and ``mdns_hostname`` into ``extra_info``.
+
+    Called by :func:`_sniff_processor_loop` so that mDNS enrichment is applied
+    between full scan cycles rather than only when :func:`run_scan` executes.
+
+    Returns the number of device rows updated.
+    """
+    mdns_data = process_mdns_queue()
+    if not mdns_data:
+        return 0
+
+    log.info("mdns_standalone_process", candidates=len(mdns_data))
+    updated = 0
+
+    for ip, entry in mdns_data.items():
+        hostname = entry.get("mdns_hostname")
+        services = entry.get("mdns_services", [])
+        extra_patch: dict = {"mdns_services": services}
+        if hostname:
+            extra_patch["mdns_hostname"] = hostname
+
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE devices
+                SET hostname   = COALESCE(NULLIF(hostname, ''), %s),
+                    extra_info = extra_info || %s::jsonb,
+                    last_seen  = NOW()
+                WHERE ip_address = %s
+                """,
+                (hostname, json.dumps(extra_patch), ip),
+            )
+        if cur.rowcount > 0:
+            updated += 1
+            log.info("mdns_standalone_hint_applied", ip=ip, hostname=hostname)
+
+    conn.commit()
+    return updated
+
+
+def _sniff_processor_loop() -> None:
+    """Background thread that continuously processes sniff queues.
+
+    Drains the ARP, DNS, mDNS, and DHCP passive-sniff queues and runs SSDP
+    and mDNS/Zeroconf discovery at :data:`SNIFF_PROCESS_INTERVAL`-second
+    intervals.  This ensures that devices detected via passive sniffing (DHCP
+    offers, DNS queries, ARP broadcasts, mDNS announcements, SSDP responses)
+    are written to the database promptly — without waiting for the next full
+    ``SCAN_INTERVAL`` window.
+
+    Runs as a daemon thread so it exits automatically when the main thread
+    terminates.
+    """
+    log.info("sniff_processor_start", interval=SNIFF_PROCESS_INTERVAL)
+    while True:
+        time.sleep(SNIFF_PROCESS_INTERVAL)
+        try:
+            conn = get_db()
+            rdb = get_redis()
+            try:
+                if ARP_SNIFF_ENABLED:
+                    process_arp_sniff_queue(conn, rdb)
+                if DNS_SNIFF_ENABLED:
+                    process_dns_sniff_queue(conn, rdb)
+                    process_mdns_sniff_queue(conn)
+                if DHCP_SNIFF_ENABLED:
+                    process_dhcp_sniff_queue(conn)
+                if MDNS_ENABLED:
+                    _process_mdns_standalone(conn)
+                if SSDP_ENABLED:
+                    _process_ssdp_standalone(conn, rdb)
+            finally:
+                conn.close()
+        except Exception as exc:
+            log.error("sniff_processor_error", error=str(exc))
+
+
 # ─── Main scan loop ──────────────────────────────────────────────────────────
 
 def run_scan():
@@ -2449,21 +2598,6 @@ def run_scan():
             if is_new:
                 new_count += 1
 
-        # Process any devices discovered via DNS packet sniffing since the
-        # last scan cycle.
-        if DNS_SNIFF_ENABLED:
-            new_count += process_dns_sniff_queue(conn, rdb)
-            # Apply mDNS hostname/device-type hints extracted by the DNS sniffer.
-            process_mdns_sniff_queue(conn)
-
-        # Process real-time ARP-sniffed devices (netsleuth-style live detection).
-        if ARP_SNIFF_ENABLED:
-            new_count += process_arp_sniff_queue(conn, rdb)
-
-        # Apply DHCP-sniffed hostnames to existing device records.
-        if DHCP_SNIFF_ENABLED:
-            process_dhcp_sniff_queue(conn)
-
         # Check for IoT learning sessions that have passed the observation window.
         process_completed_learnings(conn, rdb)
 
@@ -2577,6 +2711,12 @@ def main():
         start_mdns_discovery()
     else:
         log.info("mdns_discovery_disabled")
+
+    # Start the continuous sniff-queue processor so that passively sniffed
+    # devices (ARP, DNS, DHCP, mDNS, SSDP) are written to the database at
+    # SNIFF_PROCESS_INTERVAL-second intervals rather than waiting for the next
+    # full SCAN_INTERVAL window.
+    threading.Thread(target=_sniff_processor_loop, name="sniff-processor", daemon=True).start()
 
     # Run once immediately, then on schedule
     run_scan()

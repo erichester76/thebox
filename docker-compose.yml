@@ -99,6 +99,7 @@ services:
       NETBIOS_ENABLED: ${NETBIOS_ENABLED:-true}
       BANNER_GRAB_ENABLED: ${BANNER_GRAB_ENABLED:-true}
       BANNER_GRAB_TIMEOUT: ${BANNER_GRAB_TIMEOUT:-3}
+      SNIFF_PROCESS_INTERVAL: ${SNIFF_PROCESS_INTERVAL:-30}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - ./config/postgres/migrations:/app/migrations:ro
