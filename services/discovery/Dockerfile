@@ -5,6 +5,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         arp-scan \
         net-tools \
         iputils-ping \
+        iproute2 \
         libpcap-dev \
     && rm -rf /var/lib/apt/lists/*
 
