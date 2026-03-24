@@ -768,9 +768,8 @@ def process_completed_learnings(conn, rdb) -> int:
 
     1. Query Pi-hole for every DNS domain the device resolved during the
        learning period.
-    2. Insert those FQDNs into ``iot_allowlist`` as globally-shared entries
-       (``device_id = NULL``) so all IoT devices in the ``iot`` Pi-hole group
-       benefit from the learned allow-list.
+    2. Insert those FQDNs into ``iot_allowlist`` with the device's ``device_id``
+       so each entry is traceable back to the specific IoT device that learned it.
     3. Add each domain to Pi-hole's exact allow-list for the ``iot`` group.
     4. Reassign the Pi-hole client from the learning group to the ``iot`` group.
     5. Delete the temporary learning group from Pi-hole.
@@ -834,7 +833,7 @@ def process_completed_learnings(conn, rdb) -> int:
                     domains = pihole_get_queries_for_client(sid, ip, from_ts, until_ts)
                     log.info("iot_learning_domains_found", device_id=device_id, ip=ip, count=len(domains))
 
-                # ── 2. Store FQDNs in iot_allowlist as global entries ────────────
+                # ── 2. Store FQDNs in iot_allowlist tied to this device ──────────
                 if domains:
                     # Clamp domain names to the VARCHAR(255) column limit.
                     safe_domains = [d[:_FQDN_MAX_LEN] for d in domains if d]
@@ -843,10 +842,10 @@ def process_completed_learnings(conn, rdb) -> int:
                             cur.execute(
                                 """
                                 INSERT INTO iot_allowlist (device_id, fqdn)
-                                VALUES (NULL, %s)
-                                ON CONFLICT (fqdn) WHERE device_id IS NULL DO NOTHING
+                                VALUES (%s, %s)
+                                ON CONFLICT (device_id, fqdn) DO NOTHING
                                 """,
-                                (fqdn,),
+                                (device_id, fqdn),
                             )
                     conn.commit()
 
