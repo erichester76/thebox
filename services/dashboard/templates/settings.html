@@ -34,6 +34,22 @@ const CATEGORY_LABELS = {
   redirector: '↩️ Redirector',
 };
 
+function renderControl(s) {
+  const id = `setting-${escHtml(s.key)}`;
+  const aria = `aria-label="${escHtml(s.key)}"`;
+  if ((s.type === 'boolean' || s.type === 'choice') && s.options && s.options.length) {
+    const opts = s.options.map(o =>
+      `<option value="${escHtml(o)}"${s.value === o ? ' selected' : ''}>${escHtml(o)}</option>`
+    ).join('');
+    return `<select class="setting-input" id="${id}" ${aria}>${opts}</select>`;
+  }
+  if (s.type === 'integer') {
+    return `<input class="setting-input" id="${id}" type="number" value="${escHtml(s.value)}" ${aria} />`;
+  }
+  const inputType = s.key.toLowerCase().includes('password') ? 'password' : 'text';
+  return `<input class="setting-input" id="${id}" type="${inputType}" value="${escHtml(s.value)}" ${aria} />`;
+}
+
 async function loadSettings() {
   const container = document.getElementById('settings-container');
   try {
@@ -53,7 +69,7 @@ async function loadSettings() {
               <div class="setting-key">${escHtml(s.key)}</div>
               ${s.description ? `<div class="setting-desc">${escHtml(s.description)}</div>` : ''}
             </div>
-            <input class="setting-input" id="setting-${escHtml(s.key)}" type="${s.key.toLowerCase().includes('password') ? 'password' : 'text'}" value="${escHtml(s.value)}" aria-label="${escHtml(s.key)}" />
+            ${renderControl(s)}
             <button class="setting-save-btn" data-key="${escHtml(s.key)}" onclick="saveSetting(this)">Save</button>
           </div>`).join('')}
       </div>`).join('');

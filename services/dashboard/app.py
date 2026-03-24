@@ -53,6 +53,12 @@ _ENV_EXAMPLE_SKIP_KEYS: frozenset[str] = frozenset({
 # The ─ characters are U+2500 BOX DRAWINGS LIGHT HORIZONTAL.
 _SECTION_HEADER_RE = re.compile(r"^#\s*─+\s+(.+?)\s+─+")
 
+# Regex that matches option-list lines inside comments, e.g.:
+#   passive         — monitor only, no active redirection (default)
+# After the leading "# " has been stripped, the pattern looks for a bare word
+# followed by whitespace and an em-dash (—) or box-drawing dash (─).
+_OPTION_LINE_RE = re.compile(r"^(\S+)\s+[—─]")
+
 
 def _section_to_category(section_name: str) -> str:
     """Map a .env.example section header text to an internal category slug."""
@@ -78,8 +84,8 @@ def _section_to_category(section_name: str) -> str:
     return "general"
 
 
-def _parse_env_example() -> list[tuple[str, str, str, str]]:
-    """Parse .env.example and return ``(key, value, category, description)`` tuples.
+def _parse_env_example() -> list[tuple[str, str, str, str, str, list[str]]]:
+    """Parse .env.example and return ``(key, value, category, description, type, options)`` tuples.
 
     The ``value`` in each tuple is the raw default taken from the ``.env.example``
     file.  Callers should override this with values from ``os.environ`` or the
@@ -90,11 +96,12 @@ def _parse_env_example() -> list[tuple[str, str, str, str]]:
       into the description for that key.
     * An empty line resets the accumulated description.
     * Keys in ``_ENV_EXAMPLE_SKIP_KEYS`` are omitted from the output.
+    * ``type`` and ``options`` are inferred via :func:`_infer_type_and_options`.
 
     Returns an empty list when the file cannot be found (fails silently so that
     a missing mount does not crash the dashboard on startup).
     """
-    entries: list[tuple[str, str, str, str]] = []
+    entries: list[tuple[str, str, str, str, str, list[str]]] = []
     if not os.path.exists(_ENV_EXAMPLE_PATH):
         return entries
 
@@ -130,7 +137,8 @@ def _parse_env_example() -> list[tuple[str, str, str, str]]:
                 key = key.strip()
                 if key and key not in _ENV_EXAMPLE_SKIP_KEYS:
                     description = " ".join(pending_comments)
-                    entries.append((key, raw_val.strip(), current_category, description))
+                    itype, ioptions = _infer_type_and_options(raw_val.strip(), pending_comments)
+                    entries.append((key, raw_val.strip(), current_category, description, itype, ioptions))
                 pending_comments = []
 
     return entries
@@ -165,6 +173,39 @@ def _read_env_file() -> dict[str, str]:
 # Valid setting keys — populated from .env.example by bootstrap_settings().
 # Used to reject unknown keys in the PUT /api/settings endpoints.
 _VALID_SETTING_KEYS: frozenset[str] = frozenset()
+
+# Per-key type metadata — populated from .env.example by bootstrap_settings().
+# Each entry: {"type": "boolean"|"integer"|"choice"|"string", "options": [...]}
+# Used to enrich the GET /api/settings response so the UI can render the
+# correct control (dropdown, number input, text input) for each setting.
+_SETTING_META: dict[str, dict] = {}
+
+
+def _infer_type_and_options(value: str, comments: list[str]) -> tuple[str, list[str]]:
+    """Infer the UI control type and extract choice options for a setting.
+
+    Rules applied in order:
+    1. ``value`` is ``"true"`` or ``"false"`` (case-insensitive) → **boolean**
+    2. ``value`` is a non-empty string of decimal digits → **integer**
+       (All integer defaults in ``.env.example`` are non-negative, so
+       ``str.isdigit()`` is sufficient; negative defaults don't exist.)
+    3. Any comment line matches ``word  — description`` (option-list format) → **choice**
+    4. Everything else → **string**
+
+    Returns a ``(type_str, options)`` pair.  ``options`` is a non-empty list
+    only for *boolean* and *choice* types.
+    """
+    if value.lower() in ("true", "false"):
+        return ("boolean", ["true", "false"])
+
+    if value.isdigit():
+        return ("integer", [])
+
+    options = [m.group(1) for line in comments if (m := _OPTION_LINE_RE.match(line))]
+    if options:
+        return ("choice", options)
+
+    return ("string", [])
 
 # ─── Logging ─────────────────────────────────────────────────────────────────
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
@@ -316,7 +357,7 @@ def bootstrap_settings() -> None:
     conn = get_db()
     try:
         with conn.cursor() as cur:
-            for key, example_default, category, description in catalogue:
+            for key, example_default, category, description, _type, _options in catalogue:
                 # Value priority: process env (docker-compose) → .env file
                 # (for vars not forwarded to this container) → .env.example default.
                 value = os.environ.get(key) or env_file.get(key) or example_default
@@ -335,7 +376,14 @@ def bootstrap_settings() -> None:
 
     # Refresh valid-key set so the PUT /api/settings endpoints accept any key
     # that was just added to .env.example.
-    _VALID_SETTING_KEYS = frozenset(key for key, _, _, _ in catalogue)
+    _VALID_SETTING_KEYS = frozenset(key for key, *_ in catalogue)
+
+    # Rebuild the per-key type/options metadata used to enrich the API response.
+    global _SETTING_META
+    _SETTING_META = {
+        key: {"type": itype, "options": ioptions}
+        for key, _, _, _, itype, ioptions in catalogue
+    }
 
 
 def get_setting(key: str, default: str = "") -> str:
@@ -1309,9 +1357,13 @@ def api_settings():
     conn = get_db()
     rows = rows_to_list(conn, "SELECT key, value, category, description, updated_at FROM settings ORDER BY category, key")
     conn.close()
-    # Group by category for the UI
+    # Group by category for the UI; enrich each row with type/options metadata
+    # derived from .env.example so the UI can render the correct control.
     grouped: dict[str, list[dict]] = {}
     for row in rows:
+        meta = _SETTING_META.get(row["key"], {})
+        row["type"]    = meta.get("type", "string")
+        row["options"] = meta.get("options", [])
         cat = row["category"]
         grouped.setdefault(cat, []).append(row)
     return Response(json.dumps(grouped, default=serialize), mimetype="application/json")
