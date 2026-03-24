@@ -6,25 +6,36 @@ This script can be run:
    file and calls ``python train_classifier.py`` so the model is available
    the moment the container starts.
 
-2. **Manually with the fingerbank JSON dataset** for higher accuracy::
+2. **With a Fingerbank API key** (recommended for highest accuracy)::
+
+       python train_classifier.py --fingerbank-api-key <YOUR_API_KEY>
+
+   This pulls labelled DHCP fingerprint data directly from the Fingerbank REST
+   API (paginating ``/devices`` and ``/dhcp_fingerprints``).  Register for a
+   free key at https://fingerbank.org/users/register.  The ``FINGERBANK_API_KEY``
+   environment variable is also accepted automatically.
+
+3. **Manually with the fingerbank JSON dataset**::
 
        python train_classifier.py --fingerbank-json /path/to/fingerprints_and_devices.json
 
    The fingerbank Open Source Database (CC-licensed) is available at:
    https://github.com/fingerbank/open-source-database
 
-3. **Manually with the fingerbank SQLite database** for higher accuracy::
+4. **Manually with the fingerbank SQLite database**::
 
        python train_classifier.py --fingerbank-db /path/to/fingerbank.db
 
-   The ``fingerbank.db`` SQLite file can be downloaded from the Fingerbank API::
+   The ``fingerbank.db`` file can be downloaded from the Fingerbank API::
 
        curl -k -o fingerbank.db "https://api.fingerbank.org/api/v2/download/db?key=<YOUR_API_KEY>"
 
-   It contains a ``devices`` table (with ``id``, ``name``, ``parent_id``) and a
-   ``dhcp_fingerprints`` table (with ``id``, ``value``, ``device_id``).
+   .. note::
+       Many standard DB downloads have an empty ``combination`` table and
+       ``mac_vendor.device_id`` always set to 0, which yields no training
+       samples.  Prefer option 2 (``--fingerbank-api-key``) in that case.
 
-4. **Interactively** to inspect feature importances or cross-validation scores::
+5. **Interactively** to inspect feature importances or cross-validation scores::
 
        python train_classifier.py --cv --verbose
 
@@ -368,23 +379,15 @@ def _build_samples_from_fingerbank_db(path: str) -> tuple[list[list[float]], lis
 
     * ``device``           – ``id``, ``name``, ``parent_id`` (device-type hierarchy)
     * ``dhcp_fingerprint`` – ``id``, ``value``, ``ignored``  (DHCP opt-55 strings)
-    * ``mac_vendor``       – ``id``, ``name``, ``device_id`` (OUI vendor names, direct device link)
     * ``combination``      – ``dhcp_fingerprint_id``, ``mac_vendor_id``, ``device_id``
                              (links fingerprints + vendor to a classified device)
 
-    Two sources of labeled samples are used:
-
-    1. **combination** (primary) – each row joins ``dhcp_fingerprint`` and
-       ``mac_vendor`` to produce a sample carrying both the DHCP opt-55 string
-       and the vendor name.  This table may be empty in some DB snapshots; the
-       loader handles that gracefully.
-    2. **mac_vendor** (fallback) – rows whose ``device_id`` is non-NULL provide
-       vendor-only samples.  This is always populated and ensures the model
-       receives vendor signal even when ``combination`` is empty.
-
-    Both sources share a deduplication set keyed on ``(dhcp_fp, vendor,
-    device_id)`` so vendor entries already covered by ``combination`` rows are
-    not double-counted.
+    .. note::
+        In many DB snapshots downloaded from the Fingerbank API the
+        ``combination`` table is **empty** and ``mac_vendor.device_id`` is
+        always ``0``.  If that is your situation, use the
+        ``--fingerbank-api-key`` option instead to pull labelled data
+        directly from the Fingerbank REST API.
     """
     # Rough top-level Fingerbank category name → our label mapping.
     _FB_CATEGORY_MAP = {
@@ -444,9 +447,7 @@ def _build_samples_from_fingerbank_db(path: str) -> tuple[list[list[float]], lis
 
     # Join combination → dhcp_fingerprint (for the opt-55 string) and
     # mac_vendor (for the OUI vendor name).  Rows with ignored fingerprints
-    # or no device_id are excluded by the WHERE clause.  This table may be
-    # empty in some DB snapshots; errors are logged and we fall through to
-    # the mac_vendor fallback below.
+    # or no device_id are excluded by the WHERE clause.
     _COMBO_QUERY = """
         SELECT
             df.value  AS dhcp_fp,
@@ -496,54 +497,184 @@ def _build_samples_from_fingerbank_db(path: str) -> tuple[list[list[float]], lis
             y.append(label)
     except sqlite3.OperationalError as exc:
         log.error("fingerbank_db_combination_error error=%s", exc)
-
-    combo_loaded = len(y)
-    log.info("fingerbank_db_combination_loaded count=%d", combo_loaded)
-
-    # Fallback: pull vendor-only samples directly from mac_vendor.device_id.
-    # This table is always populated and is the only source of labelled data
-    # when combination is empty.
-    try:
-        for row in con.execute(
-            "SELECT name, device_id FROM mac_vendor WHERE device_id IS NOT NULL"
-        ):
-            vendor: str | None = (row["name"] or "").strip() or None
-            device_id: int = row["device_id"]
-            if vendor is None:
-                skipped += 1
-                continue
-
-            label = _root_category(device_id)
-            if label is None:
-                skipped += 1
-                continue
-
-            key = ("", vendor, device_id)
-            if key in seen_samples:
-                skipped += 1
-                continue
-            seen_samples.add(key)
-
-            feats = extract_features(
-                vendor=vendor,
-                open_ports=[],
-                extra_info=None,
-                dhcp_fingerprint=None,
-            )
-            X.append(feats)
-            y.append(label)
-    except sqlite3.OperationalError as exc:
-        log.error("fingerbank_db_mac_vendor_error error=%s", exc)
     finally:
         con.close()
 
-    log.info(
-        "fingerbank_db_load_done loaded=%d combo=%d mac_vendor=%d skipped=%d",
-        len(y),
-        combo_loaded,
-        len(y) - combo_loaded,
-        skipped,
-    )
+    if not y:
+        log.warning(
+            "fingerbank_db_no_samples: combination table appears empty or "
+            "mac_vendor.device_id is 0; consider using --fingerbank-api-key instead"
+        )
+    log.info("fingerbank_db_load_done loaded=%d skipped=%d", len(y), skipped)
+    return X, y
+
+
+
+def _build_samples_from_fingerbank_api(
+    api_key: str,
+    base_url: str = "https://api.fingerbank.org/api/v2",
+) -> tuple[list[list[float]], list[str]]:
+    """Pull labelled DHCP fingerprint data directly from the Fingerbank REST API.
+
+    This is the recommended approach when the local ``fingerbank.db`` SQLite
+    file has an empty ``combination`` table (or ``mac_vendor.device_id`` is
+    always 0), which is common with the standard API download.
+
+    Two paginated endpoints are used:
+
+    * ``GET /api/v2/devices``           – full device-type hierarchy
+    * ``GET /api/v2/dhcp_fingerprints`` – DHCP opt-55 strings with ``device_id``
+
+    The API key can be obtained for free at https://fingerbank.org/users/register
+    (also exposed as the ``FINGERBANK_API_KEY`` env var used by the discovery
+    service at runtime).
+
+    Parameters
+    ----------
+    api_key:
+        Fingerbank API key.
+    base_url:
+        Base URL for the Fingerbank API (default: ``https://api.fingerbank.org/api/v2``).
+    """
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+
+    # Rough top-level Fingerbank category name → our label mapping.
+    _FB_CATEGORY_MAP = {
+        "mobile device": "mobile",
+        "smartphone": "mobile",
+        "tablet": "mobile",
+        "ios device": "mobile",
+        "android": "mobile",
+        "iot": "iot",
+        "smart tv": "iot",
+        "streaming": "iot",
+        "game console": "iot",
+        "printer": "printer",
+        "network device": "network_device",
+        "router": "network_device",
+        "switch": "network_device",
+        "access point": "network_device",
+        "nas": "server",
+        "workstation": "desktop",
+        "desktop": "desktop",
+        "laptop": "desktop",
+        "computer": "desktop",
+        "server": "server",
+        "virtual machine": "server",
+    }
+
+    def _get_pages(endpoint: str) -> list[dict]:
+        """Fetch all pages from a paginated Fingerbank list endpoint."""
+        results: list[dict] = []
+        page = 1
+        per_page = 100
+        while True:
+            params = urllib.parse.urlencode(
+                {"key": api_key, "page": page, "per_page": per_page}
+            )
+            url = f"{base_url}/{endpoint}?{params}"
+            try:
+                with urllib.request.urlopen(url, timeout=30) as resp:  # noqa: S310
+                    data = json.loads(resp.read().decode())
+            except urllib.error.HTTPError as exc:
+                log.error("fingerbank_api_http_error endpoint=%s page=%d status=%d", endpoint, page, exc.code)
+                break
+            except Exception as exc:
+                log.error("fingerbank_api_error endpoint=%s page=%d error=%s", endpoint, page, exc)
+                break
+
+            # The API may return a bare list or a dict with a matching key.
+            if isinstance(data, list):
+                page_items = data
+            elif isinstance(data, dict):
+                # Try the endpoint name as the key (e.g. "dhcp_fingerprints").
+                page_items = data.get(endpoint) or data.get(endpoint.rstrip("s")) or []
+            else:
+                break
+
+            if not page_items:
+                break
+            results.extend(page_items)
+            log.info("fingerbank_api_page endpoint=%s page=%d fetched=%d total=%d", endpoint, page, len(page_items), len(results))
+            if len(page_items) < per_page:
+                # Last page.
+                break
+            page += 1
+        return results
+
+    log.info("fingerbank_api_load_start base_url=%s", base_url)
+
+    # ── 1. Load device hierarchy ──────────────────────────────────────────────
+    devices: dict[int, dict] = {}
+    for dev in _get_pages("devices"):
+        did = dev.get("id")
+        if did is None:
+            continue
+        devices[int(did)] = {
+            "name": (dev.get("name") or "").lower(),
+            "parent": dev.get("parent_id"),
+        }
+    log.info("fingerbank_api_devices_loaded count=%d", len(devices))
+
+    def _root_category(did: int | None) -> str | None:
+        seen: set[int] = set()
+        while did is not None and did not in seen:
+            seen.add(did)
+            node = devices.get(did, {})
+            name = node.get("name", "")
+            if name in _FB_CATEGORY_MAP:
+                return _FB_CATEGORY_MAP[name]
+            parent = node.get("parent")
+            if not isinstance(parent, int):
+                break
+            did = parent
+        return None
+
+    # ── 2. Load DHCP fingerprints ─────────────────────────────────────────────
+    X: list[list[float]] = []
+    y: list[str] = []
+    skipped = 0
+    seen_samples: set[tuple] = set()
+
+    for fp in _get_pages("dhcp_fingerprints"):
+        # Skip ignored fingerprints.
+        if fp.get("ignored"):
+            skipped += 1
+            continue
+
+        dhcp_fp: str = (fp.get("value") or "").strip()
+        if not dhcp_fp:
+            skipped += 1
+            continue
+
+        device_id = fp.get("device_id")
+        if not device_id:
+            skipped += 1
+            continue
+
+        label = _root_category(int(device_id))
+        if label is None:
+            skipped += 1
+            continue
+
+        key = (dhcp_fp, device_id)
+        if key in seen_samples:
+            skipped += 1
+            continue
+        seen_samples.add(key)
+
+        feats = extract_features(
+            vendor=None,
+            open_ports=[],
+            extra_info=None,
+            dhcp_fingerprint=dhcp_fp,
+        )
+        X.append(feats)
+        y.append(label)
+
+    log.info("fingerbank_api_load_done loaded=%d skipped=%d", len(y), skipped)
     return X, y
 
 
@@ -658,7 +789,20 @@ def main() -> None:
         help=(
             "Path to fingerbank.db SQLite database for augmentation. "
             "Download with: curl -k -o fingerbank.db "
-            "\"https://api.fingerbank.org/api/v2/download/db?key=<YOUR_API_KEY>\""
+            "\"https://api.fingerbank.org/api/v2/download/db?key=<YOUR_API_KEY>\". "
+            "NOTE: the standard downloaded DB often has an empty combination table "
+            "and device_id=0 in mac_vendor; use --fingerbank-api-key instead."
+        ),
+    )
+    parser.add_argument(
+        "--fingerbank-api-key",
+        metavar="KEY",
+        default=os.environ.get("FINGERBANK_API_KEY", ""),
+        help=(
+            "Fingerbank API key for pulling labelled data directly from the "
+            "Fingerbank REST API (recommended over --fingerbank-db). "
+            "Defaults to the FINGERBANK_API_KEY environment variable. "
+            "Register for a free key at https://fingerbank.org/users/register"
         ),
     )
     parser.add_argument(
@@ -685,7 +829,9 @@ def main() -> None:
 
     extra_X: list[list[float]] | None = None
     extra_y: list[str] | None = None
-    if args.fingerbank_db:
+    if args.fingerbank_api_key:
+        extra_X, extra_y = _build_samples_from_fingerbank_api(args.fingerbank_api_key)
+    elif args.fingerbank_db:
         extra_X, extra_y = _build_samples_from_fingerbank_db(args.fingerbank_db)
     elif args.fingerbank_json:
         extra_X, extra_y = _build_samples_from_fingerbank_json(args.fingerbank_json)
