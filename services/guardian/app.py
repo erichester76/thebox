@@ -400,6 +400,75 @@ def create_alert(conn, source: str, level: str, title: str, detail: str, device_
 
 # ─── Event handler ───────────────────────────────────────────────────────────
 
+def handle_block_ip_event(event: dict):
+    """React to a block_ip event published by the honeypot service.
+
+    Looks up the offending IP in the devices table.  If a matching device is
+    found, its status is updated to ``blocked`` and :func:`apply_device_policy`
+    enforces the new policy via the MAC-based ``thebox_blocked`` ipset.  When
+    the IP belongs to an unknown/external host that has no DB entry the IP is
+    blocked via a direct DROP rule in the ``THEBOX_POLICY`` iptables chain
+    (which is created on demand if it does not yet exist).
+
+    In both cases a ``critical`` alert is written to the ``alerts`` table.
+    """
+    ip = event.get("ip", "")
+    reason = event.get("reason", "honeypot")
+
+    if not ip:
+        log.warning("block_ip_event_missing_ip", event=event)
+        return
+
+    log.info("block_ip_event_received", ip=ip, reason=reason)
+
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, mac_address FROM devices WHERE ip_address=%s",
+                (ip,),
+            )
+            row = cur.fetchone()
+
+        if row:
+            device_id = row["id"]
+            mac = row["mac_address"]
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE devices SET status='blocked' WHERE id=%s",
+                    (device_id,),
+                )
+            conn.commit()
+            apply_device_policy(mac, ip, "blocked")
+            log.info("block_ip_device_blocked", ip=ip, mac=mac, device_id=device_id)
+            create_alert(
+                conn,
+                source="guardian",
+                level="critical",
+                title=f"Honeypot attack blocked: {ip}",
+                detail=f"IP: {ip}  Reason: {reason}\nDevice found in DB (MAC: {mac}) — status set to blocked.",
+                device_id=device_id,
+            )
+        else:
+            # Unknown/external IP — no DB entry.  Ensure the THEBOX_POLICY
+            # chain exists (idempotent) and insert a direct DROP rule.
+            # Remove any stale rules first so repeat events don't accumulate
+            # duplicate entries.
+            _bootstrap_iptables_ip_fallback()
+            _remove_iptables_ip_rules(ip)
+            _apply_iptables_ip_policy(ip, "blocked")
+            log.info("block_ip_external_blocked", ip=ip)
+            create_alert(
+                conn,
+                source="guardian",
+                level="critical",
+                title=f"Honeypot attack blocked (external IP): {ip}",
+                detail=f"IP: {ip}  Reason: {reason}\nNo matching device in DB — iptables DROP rule applied.",
+            )
+    finally:
+        conn.close()
+
+
 def handle_new_device_event(event: dict):
     """React to a new device appearing on the network."""
     mac = event.get("mac")
@@ -498,6 +567,8 @@ def subscribe_loop():
             etype = event.get("type")
             if etype == "new_device":
                 handle_new_device_event(event)
+            elif etype == "block_ip":
+                handle_block_ip_event(event)
             elif etype == "iot_learning_started":
                 # Discovery has set the device status to 'iot_learning' in the
                 # DB; apply unrestricted policy immediately so Pi-hole can see
