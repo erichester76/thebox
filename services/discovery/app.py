@@ -72,6 +72,13 @@ PIHOLE_IOT_GROUP = os.environ.get("PIHOLE_IOT_GROUP", "iot")
 # Used to tell Pi-hole where to fetch the IoT allow-list as an adlist URL.
 DASHBOARD_URL = os.environ.get("DASHBOARD_URL", "").rstrip("/")
 
+# Maximum pages to fetch from Pi-hole's paginated queries API per learning
+# session (1 000 pages × 1 000 results = up to 1 million queries).  Prevents
+# an infinite loop when Pi-hole keeps returning a cursor on every page.
+_PIHOLE_QUERY_MAX_PAGES = 1000
+# Maximum domain-name length stored in iot_allowlist.fqdn (VARCHAR(255)).
+_FQDN_MAX_LEN = 255
+
 # DNS packet sniffing
 DNS_SNIFF_ENABLED = os.environ.get("DNS_SNIFF_ENABLED", "true").lower() == "true"
 DNS_SNIFF_IFACE = os.environ.get("DNS_SNIFF_IFACE") or None  # None → scapy auto-selects
@@ -583,9 +590,16 @@ def pihole_ensure_group(sid: str, name: str, comment: str = "") -> int | None:
 
 
 def pihole_delete_group(sid: str, name: str) -> None:
-    """Delete a Pi-hole group by name (best-effort; errors are logged only)."""
-    _pihole_request("DELETE", f"/groups/{name}", sid)
-    log.info("pihole_group_deleted", name=name)
+    """Delete a Pi-hole group by name (best-effort; errors are logged only).
+
+    Pi-hole v6 DELETE /api/groups/{id} requires an integer ID, so we look
+    up the ID first and skip the delete if the group no longer exists.
+    """
+    gid = _pihole_get_group_id(sid, name)
+    if gid is None:
+        return
+    _pihole_request("DELETE", f"/groups/{gid}", sid)
+    log.info("pihole_group_deleted", name=name, id=gid)
 
 
 def pihole_assign_client_to_groups(sid: str, client_ip: str, group_ids: list[int]) -> bool:
@@ -616,12 +630,13 @@ def pihole_get_queries_for_client(
 
     Iterates through paginated results using the ``cursor`` field returned by
     the Pi-hole v6 queries API.  Stops when Pi-hole returns an empty page or
-    no cursor.
+    no cursor.  A hard cap of 1 000 pages (~1 million queries) prevents an
+    infinite loop should Pi-hole always return a cursor on the final page.
     """
     domains: set[str] = set()
     cursor: str | None = None
 
-    while True:
+    for _page_num in range(_PIHOLE_QUERY_MAX_PAGES):
         params: dict = {
             "client": client_ip,
             "from": int(from_ts),
@@ -633,14 +648,21 @@ def pihole_get_queries_for_client(
 
         data = _pihole_request("GET", "/queries", sid, params=params)
         page = data.get("queries", [])
+        if not isinstance(page, list):
+            log.warning("pihole_queries_unexpected_format", client=client_ip, type=type(page).__name__)
+            break
         for q in page:
+            if not isinstance(q, dict):
+                continue
             domain = q.get("domain")
-            if domain:
+            if domain and isinstance(domain, str):
                 domains.add(domain)
 
         cursor = data.get("cursor")
         if not cursor or not page:
             break
+    else:
+        log.warning("pihole_queries_page_limit_reached", client=client_ip, pages=_PIHOLE_QUERY_MAX_PAGES)
 
     log.info("pihole_queries_fetched", client=client_ip, count=len(domains))
     return list(domains)
@@ -839,85 +861,103 @@ def process_completed_learnings(conn, rdb) -> int:
 
             log.info("iot_learning_completing", device_id=device_id, ip=ip, group=group_name)
 
-            # ── 1. Collect DNS queries from Pi-hole ──────────────────────────
-            domains: list[str] = []
-            if sid:
-                from_ts = started_at.timestamp()
-                until_ts = datetime.now(timezone.utc).timestamp()
-                domains = pihole_get_queries_for_client(sid, ip, from_ts, until_ts)
-                log.info("iot_learning_domains_found", device_id=device_id, ip=ip, count=len(domains))
+            try:
+                # ── 1. Collect DNS queries from Pi-hole ──────────────────────────
+                domains: list[str] = []
+                if sid:
+                    from_ts = started_at.timestamp()
+                    until_ts = datetime.now(timezone.utc).timestamp()
+                    domains = pihole_get_queries_for_client(sid, ip, from_ts, until_ts)
+                    log.info("iot_learning_domains_found", device_id=device_id, ip=ip, count=len(domains))
 
-            # ── 2. Store FQDNs in iot_allowlist as global entries ────────────
-            if domains:
+                # ── 2. Store FQDNs in iot_allowlist as global entries ────────────
+                if domains:
+                    # Clamp domain names to the VARCHAR(255) column limit.
+                    safe_domains = [d[:_FQDN_MAX_LEN] for d in domains if d]
+                    with conn.cursor() as cur:
+                        for fqdn in safe_domains:
+                            cur.execute(
+                                """
+                                INSERT INTO iot_allowlist (device_id, fqdn)
+                                VALUES (NULL, %s)
+                                ON CONFLICT (fqdn) WHERE device_id IS NULL DO NOTHING
+                                """,
+                                (fqdn,),
+                            )
+                    conn.commit()
+
+                    # ── 3. Register the allow-list URL with Pi-hole and add domains ──
+                    if sid and iot_group_id is not None:
+                        # Register the dashboard URL as a Pi-hole adlist (idempotent).
+                        # Pi-hole will fetch it on the next gravity update so it serves
+                        # as the durable, URL-based source of truth for the allow-list.
+                        if DASHBOARD_URL:
+                            allowlist_url = f"{DASHBOARD_URL}/iot-allowlist.txt"
+                            pihole_register_iot_allowlist(sid, allowlist_url, [iot_group_id])
+
+                        # Also insert domains individually for immediate effect
+                        # (adlist requires a gravity update before it takes effect).
+                        for fqdn in safe_domains:
+                            pihole_add_domain_to_allowlist(sid, fqdn, [iot_group_id])
+
+                # ── 4. Move Pi-hole client to the iot group ──────────────────────
+                if sid and iot_group_id is not None:
+                    pihole_assign_client_to_groups(sid, ip, [iot_group_id])
+
+                # ── 5. Delete the temporary learning group ───────────────────────
+                if sid:
+                    pihole_delete_group(sid, group_name)
+
+                # ── 6. Update device status and mark session complete ────────────
                 with conn.cursor() as cur:
-                    for fqdn in domains:
-                        cur.execute(
-                            """
-                            INSERT INTO iot_allowlist (device_id, fqdn)
-                            VALUES (NULL, %s)
-                            ON CONFLICT (fqdn) WHERE device_id IS NULL DO NOTHING
-                            """,
-                            (fqdn,),
-                        )
+                    cur.execute(
+                        "UPDATE devices SET status = 'iot' WHERE id = %s",
+                        (device_id,),
+                    )
+                    cur.execute(
+                        """
+                        UPDATE iot_learning_sessions
+                        SET status = 'completed', learning_completed_at = NOW()
+                        WHERE id = %s
+                        """,
+                        (session["id"],),
+                    )
                 conn.commit()
 
-                # ── 3. Register the allow-list URL with Pi-hole and add domains ──
-                if sid and iot_group_id is not None:
-                    # Register the dashboard URL as a Pi-hole adlist (idempotent).
-                    # Pi-hole will fetch it on the next gravity update so it serves
-                    # as the durable, URL-based source of truth for the allow-list.
-                    if DASHBOARD_URL:
-                        allowlist_url = f"{DASHBOARD_URL}/iot-allowlist.txt"
-                        pihole_register_iot_allowlist(sid, allowlist_url, [iot_group_id])
-
-                    # Also insert domains individually for immediate effect
-                    # (adlist requires a gravity update before it takes effect).
-                    for fqdn in domains:
-                        pihole_add_domain_to_allowlist(sid, fqdn, [iot_group_id])
-
-            # ── 4. Move Pi-hole client to the iot group ──────────────────────
-            if sid and iot_group_id is not None:
-                pihole_assign_client_to_groups(sid, ip, [iot_group_id])
-
-            # ── 5. Delete the temporary learning group ───────────────────────
-            if sid:
-                pihole_delete_group(sid, group_name)
-
-            # ── 6. Update device status and mark session complete ────────────
-            with conn.cursor() as cur:
-                cur.execute(
-                    "UPDATE devices SET status = 'iot' WHERE id = %s",
-                    (device_id,),
+                log.info(
+                    "iot_learning_completed",
+                    device_id=device_id,
+                    ip=ip,
+                    domains_learned=len(domains),
                 )
-                cur.execute(
-                    """
-                    UPDATE iot_learning_sessions
-                    SET status = 'completed', learning_completed_at = NOW()
-                    WHERE id = %s
-                    """,
-                    (session["id"],),
+
+                rdb.publish(
+                    "thebox:events",
+                    json.dumps({
+                        "type": "iot_learning_completed",
+                        "device_id": device_id,
+                        "ip": ip,
+                        "domains_learned": len(domains),
+                        "ts": datetime.now(timezone.utc).isoformat(),
+                    }),
                 )
-            conn.commit()
 
-            log.info(
-                "iot_learning_completed",
-                device_id=device_id,
-                ip=ip,
-                domains_learned=len(domains),
-            )
+                completed += 1
 
-            rdb.publish(
-                "thebox:events",
-                json.dumps({
-                    "type": "iot_learning_completed",
-                    "device_id": device_id,
-                    "ip": ip,
-                    "domains_learned": len(domains),
-                    "ts": datetime.now(timezone.utc).isoformat(),
-                }),
-            )
-
-            completed += 1
+            except Exception as exc:
+                log.error(
+                    "iot_learning_complete_error",
+                    device_id=device_id,
+                    ip=ip,
+                    error=str(exc),
+                )
+                # Roll back any partial DB writes so subsequent sessions can
+                # still use the connection without hitting an aborted-transaction
+                # error.
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
 
     finally:
         if sid:
