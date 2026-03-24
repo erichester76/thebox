@@ -146,7 +146,9 @@ _OUI_CSV_URL = os.environ.get(
 _OUI_CSV_PATH = os.environ.get("OUI_CSV_PATH", "/tmp/oui.csv")
 
 # ─── Logging ─────────────────────────────────────────────────────────────────
-logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
+# force=True ensures the level is applied even when a dependency has already
+# installed root-logger handlers before this module is first imported.
+logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO), force=True)
 structlog.configure(
     wrapper_class=structlog.make_filtering_bound_logger(getattr(logging, LOG_LEVEL, logging.INFO)),
 )
@@ -321,7 +323,13 @@ def fingerbank_lookup(
     with _fingerbank_lock:
         if cache_key in _fingerbank_cache:
             cached = _fingerbank_cache[cache_key]
-            return cached if cached else None
+            log.debug(
+                "fingerbank_cache_hit",
+                fingerprint=dhcp_fingerprint,
+                vendor_class=vendor_class,
+                result=cached or None,
+            )
+            return cached or None
 
         # Rate-limit: enforce minimum interval between calls atomically so
         # concurrent threads cannot both slip through at the same time.
@@ -341,6 +349,14 @@ def fingerbank_lookup(
         params["hostname"] = hostname
     if FINGERBANK_API_KEY:
         params["key"] = FINGERBANK_API_KEY
+
+    log.debug(
+        "fingerbank_request",
+        fingerprint=dhcp_fingerprint,
+        vendor_class=vendor_class,
+        hostname=hostname,
+        authenticated=bool(FINGERBANK_API_KEY),
+    )
 
     try:
         resp = requests.get(_FINGERBANK_API_URL, params=params, timeout=5)
@@ -374,6 +390,7 @@ def fingerbank_lookup(
             # Unknown fingerprint — cache empty result to avoid retrying.
             with _fingerbank_lock:
                 _fingerbank_cache[cache_key] = {}
+            log.debug("fingerbank_unknown_fingerprint", fingerprint=dhcp_fingerprint)
             return None
         log.debug("fingerbank_http_error", status=resp.status_code)
         return None
@@ -3044,6 +3061,14 @@ def _enrich_and_classify(host: dict, extra_seed: dict | None = None) -> dict:
     ip = host["ip"]
     mac = host.get("mac", "")
 
+    log.debug(
+        "enrich_start",
+        ip=ip,
+        mac=mac,
+        hostname=host.get("hostname"),
+        vendor=host.get("vendor"),
+    )
+
     host["hostname"] = host.get("hostname") or resolve_hostname(ip)
     host["vendor"] = host.get("vendor") or vendor_lookup(mac)
 
@@ -3062,6 +3087,18 @@ def _enrich_and_classify(host: dict, extra_seed: dict | None = None) -> dict:
 
     host["extra_info"] = extra_info
 
+    ports_open = [p["port"] for p in host.get("open_ports", [])]
+    log.debug(
+        "enrich_scan_complete",
+        ip=ip,
+        hostname=host.get("hostname"),
+        vendor=host.get("vendor"),
+        open_ports=ports_open,
+        os_guess=host.get("os_guess"),
+        extra_info_keys=sorted(extra_info.keys()),
+        dhcp_fingerprint=extra_info.get("dhcp_fingerprint"),
+    )
+
     # ── RF classifier (primary) ───────────────────────────────────────────────
     # Try the RandomForest models first.  classify_device() returns a
     # (device_type, os_family, confidence) triple.  Both predictions share the
@@ -3078,6 +3115,8 @@ def _enrich_and_classify(host: dict, extra_seed: dict | None = None) -> dict:
             extra_info,
             dhcp_fingerprint=dhcp_fp,
         )
+    else:
+        log.debug("rf_classify_skipped", ip=ip, reason="classifier_not_loaded")
 
     if rf_type != "unknown":
         host["device_type"] = rf_type
@@ -3088,6 +3127,12 @@ def _enrich_and_classify(host: dict, extra_seed: dict | None = None) -> dict:
     else:
         # Heuristic fallback — retains all the high-specificity rules
         # (mDNS service types, WSD, UPnP, SNMP, fingerbank result, etc.)
+        log.debug(
+            "rf_classify_fallback",
+            ip=ip,
+            reason="rf_type_unknown",
+            rf_confidence=round(rf_conf, 3),
+        )
         host["device_type"] = guess_device_type(
             host.get("vendor"), host.get("open_ports", []),
             host.get("os_guess"), extra_info, host.get("hostname"),
@@ -3098,6 +3143,15 @@ def _enrich_and_classify(host: dict, extra_seed: dict | None = None) -> dict:
     # detect the OS (which is most of the time without a privileged scan).
     if rf_os not in ("unknown", "") and not host.get("os_guess"):
         host["os_guess"] = rf_os
+
+    log.debug(
+        "enrich_complete",
+        ip=ip,
+        device_type=host.get("device_type"),
+        os_guess=host.get("os_guess"),
+        hostname=host.get("hostname"),
+        vendor=host.get("vendor"),
+    )
 
     return host
 
