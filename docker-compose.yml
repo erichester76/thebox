@@ -83,23 +83,7 @@ services:
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER:-thebox}:${POSTGRES_PASSWORD:-thebox_secret}@postgres:5432/${POSTGRES_DB:-thebox}
       REDIS_URL: redis://redis:6379/0
-      SCAN_INTERVAL: ${SCAN_INTERVAL:-300}
-      NETWORK_RANGES: ${NETWORK_RANGES:-192.168.1.0/24}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
-      PIHOLE_URL: ${PIHOLE_URL:-http://pihole:80}
-      PIHOLE_PASSWORD: ${PIHOLE_PASSWORD:-thebox_pihole}
-      DNS_SNIFF_ENABLED: ${DNS_SNIFF_ENABLED:-true}
-      DNS_SNIFF_IFACE: ${DNS_SNIFF_IFACE:-}
-      IOT_LEARNING_HOURS: ${IOT_LEARNING_HOURS:-48}
-      PIHOLE_IOT_GROUP: ${PIHOLE_IOT_GROUP:-iot}
-      DASHBOARD_URL: http://dashboard:3000
-      SSDP_ENABLED: ${SSDP_ENABLED:-true}
-      SSDP_TIMEOUT: ${SSDP_TIMEOUT:-5}
-      MDNS_ENABLED: ${MDNS_ENABLED:-true}
-      NETBIOS_ENABLED: ${NETBIOS_ENABLED:-true}
-      BANNER_GRAB_ENABLED: ${BANNER_GRAB_ENABLED:-true}
-      BANNER_GRAB_TIMEOUT: ${BANNER_GRAB_TIMEOUT:-3}
-      SNIFF_PROCESS_INTERVAL: ${SNIFF_PROCESS_INTERVAL:-30}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - ./config/postgres/migrations:/app/migrations:ro
@@ -126,18 +110,7 @@ services:
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER:-thebox}:${POSTGRES_PASSWORD:-thebox_secret}@postgres:5432/${POSTGRES_DB:-thebox}
       REDIS_URL: redis://redis:6379/0
-      QUARANTINE_VLAN: ${QUARANTINE_VLAN:-192.168.99.0/24}
-      TRUSTED_NETWORKS: ${TRUSTED_NETWORKS:-192.168.1.0/24}
-      AUTO_QUARANTINE: ${AUTO_QUARANTINE:-true}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
-      ALERT_EMAIL: ${ALERT_EMAIL:-}
-      SMTP_HOST: ${SMTP_HOST:-}
-      SMTP_PORT: ${SMTP_PORT:-587}
-      SMTP_FROM: ${SMTP_FROM:-alerts@thebox.local}
-      SMTP_USER: ${SMTP_USER:-}
-      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
-      SMTP_TLS: ${SMTP_TLS:-true}
-      ALERT_WEBHOOK_URL: ${ALERT_WEBHOOK_URL:-}
     volumes:
       - ./config/postgres/migrations:/app/migrations:ro
     cap_add:
@@ -166,24 +139,7 @@ services:
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER:-thebox}:${POSTGRES_PASSWORD:-thebox_secret}@postgres:5432/${POSTGRES_DB:-thebox}
       REDIS_URL: redis://redis:6379/0
-      HONEYPOT_PORTS: ${HONEYPOT_PORTS:-21,22,23,25,53,80,110,135,143,389,443,445,1433,3306,3389,5432,5900,5985,6379,8080,8443,9200,11211,27017}
-      HONEYPOT_IGNORED_NETWORKS: ${HONEYPOT_IGNORED_NETWORKS:-172.16.0.0/12,127.0.0.0/8}
-      HONEYPOT_THRESHOLD_COUNT: ${HONEYPOT_THRESHOLD_COUNT:-3}
-      HONEYPOT_THRESHOLD_WINDOW: ${HONEYPOT_THRESHOLD_WINDOW:-60}
-      HONEYPOT_SWEEP_THRESHOLD: ${HONEYPOT_SWEEP_THRESHOLD:-4}
-      HONEYPOT_SWEEP_WINDOW: ${HONEYPOT_SWEEP_WINDOW:-60}
-      HONEYPOT_RECV_TIMEOUT: ${HONEYPOT_RECV_TIMEOUT:-4}
-      HONEYPOT_MAX_PAYLOAD_LENGTH: ${HONEYPOT_MAX_PAYLOAD_LENGTH:-2000}
-      HONEYPOT_CREDENTIAL_WINDOW_MULTIPLIER: ${HONEYPOT_CREDENTIAL_WINDOW_MULTIPLIER:-5}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
-      ALERT_EMAIL: ${ALERT_EMAIL:-}
-      SMTP_HOST: ${SMTP_HOST:-}
-      SMTP_PORT: ${SMTP_PORT:-587}
-      SMTP_FROM: ${SMTP_FROM:-alerts@thebox.local}
-      SMTP_USER: ${SMTP_USER:-}
-      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
-      SMTP_TLS: ${SMTP_TLS:-true}
-      ALERT_WEBHOOK_URL: ${ALERT_WEBHOOK_URL:-}
     volumes:
       - ./config/postgres/migrations:/app/migrations:ro
     depends_on:
@@ -207,27 +163,7 @@ services:
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER:-thebox}:${POSTGRES_PASSWORD:-thebox_secret}@postgres:5432/${POSTGRES_DB:-thebox}
       REDIS_URL: redis://redis:6379/0
-      REDIRECT_MODE: ${REDIRECT_MODE:-passive}
-      NETWORK_INTERFACE: ${NETWORK_INTERFACE:-eth0}
-      GATEWAY_IP: ${GATEWAY_IP:-}
-      NETWORK_RANGES: ${NETWORK_RANGES:-192.168.1.0/24}
-      PIHOLE_IP: ${PIHOLE_IP:-}
-      BOX_IP: ${BOX_IP:-}
-      BLACKHOLE_QUARANTINED: ${BLACKHOLE_QUARANTINED:-false}
-      ARP_REFRESH_INTERVAL: ${ARP_REFRESH_INTERVAL:-10}
-      CAPTIVE_PORTAL_ENABLED: ${CAPTIVE_PORTAL_ENABLED:-true}
-      CAPTIVE_PORTAL_PORT: ${CAPTIVE_PORTAL_PORT:-8082}
-      CAPTIVE_PORTAL_MESSAGE: ${CAPTIVE_PORTAL_MESSAGE:-Your device has been quarantined because it was not recognized on this network.}
-      CAPTIVE_PORTAL_CONTACT: ${CAPTIVE_PORTAL_CONTACT:-}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
-      ALERT_EMAIL: ${ALERT_EMAIL:-}
-      SMTP_HOST: ${SMTP_HOST:-}
-      SMTP_PORT: ${SMTP_PORT:-587}
-      SMTP_FROM: ${SMTP_FROM:-alerts@thebox.local}
-      SMTP_USER: ${SMTP_USER:-}
-      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
-      SMTP_TLS: ${SMTP_TLS:-true}
-      ALERT_WEBHOOK_URL: ${ALERT_WEBHOOK_URL:-}
     volumes:
       - ./config/postgres/migrations:/app/migrations:ro
     cap_add:
@@ -253,10 +189,6 @@ services:
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER:-thebox}:${POSTGRES_PASSWORD:-thebox_secret}@postgres:5432/${POSTGRES_DB:-thebox}
       REDIS_URL: redis://redis:6379/0
-      SECRET_KEY: ${SECRET_KEY:-change_me_in_production}
-      PIHOLE_URL: ${PIHOLE_URL:-http://pihole:80}
-      PIHOLE_PASSWORD: ${PIHOLE_PASSWORD:-thebox_pihole}
-      PIHOLE_SID_TTL: ${PIHOLE_SID_TTL:-240}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     volumes:
       - ./.env.example:/app/.env.example:ro
