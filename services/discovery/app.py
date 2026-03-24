@@ -2158,12 +2158,63 @@ def upsert_device(conn, rdb, device: dict) -> bool:
     session.  The ``iot_learning_started`` event published by that function
     replaces the standard ``new_device`` event for IoT devices so that the
     guardian service does not attempt to quarantine them.
+
+    Duplicate-prevention: if no record exists for *device["mac"]* but the
+    same IP already has a record whose MAC is the synthetic placeholder we
+    generated earlier (``_synthetic_mac_for_ip``), that placeholder row is
+    updated in-place with the now-known real MAC instead of creating a second
+    row for the same physical device.
     """
     with conn.cursor() as cur:
         cur.execute("SELECT id, status FROM devices WHERE mac_address = %s", (device["mac"],))
         row = cur.fetchone()
 
         if row is None:
+            # Before inserting, check whether this IP already has a record
+            # carrying our synthetic placeholder MAC.  If so, promote it to
+            # the real MAC rather than adding a duplicate row.
+            synthetic_mac = _synthetic_mac_for_ip(device["ip"])
+            if device["mac"] != synthetic_mac:
+                cur.execute(
+                    "SELECT id, status FROM devices WHERE mac_address = %s",
+                    (synthetic_mac,),
+                )
+                synthetic_row = cur.fetchone()
+                if synthetic_row is not None:
+                    cur.execute(
+                        """
+                        UPDATE devices
+                        SET mac_address=%s, ip_address=%s,
+                            ipv6_address=COALESCE(%s, ipv6_address),
+                            hostname=%s, vendor=%s, device_type=%s,
+                            os_guess=%s, open_ports=%s, extra_info=%s,
+                            last_seen=NOW()
+                        WHERE mac_address=%s AND ip_address=%s
+                        """,
+                        (
+                            device["mac"],
+                            device["ip"],
+                            device.get("ipv6") or None,
+                            device.get("hostname"),
+                            device.get("vendor"),
+                            device.get("device_type", "unknown"),
+                            device.get("os_guess"),
+                            json.dumps(device.get("open_ports", [])),
+                            json.dumps(device.get("extra_info", {})),
+                            synthetic_mac,
+                            device["ip"],
+                        ),
+                    )
+                    conn.commit()
+                    log.info(
+                        "synthetic_mac_replaced",
+                        ip=device["ip"],
+                        old_mac=synthetic_mac,
+                        new_mac=device["mac"],
+                        vendor=device.get("vendor"),
+                    )
+                    return False
+
             cur.execute(
                 """
                 INSERT INTO devices
