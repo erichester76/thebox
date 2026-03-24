@@ -261,6 +261,8 @@ def _load_settings() -> None:
     """Read redirector settings from the database, falling back to env vars."""
     global REDIRECT_MODES, NETWORK_INTERFACE, GATEWAY_IP, NETWORK_RANGES
     global PIHOLE_IP, BOX_IP, BLACKHOLE_QUARANTINED, ARP_REFRESH_INTERVAL
+    global CAPTIVE_PORTAL_ENABLED, CAPTIVE_PORTAL_PORT
+    global CAPTIVE_PORTAL_MESSAGE, CAPTIVE_PORTAL_CONTACT
 
     raw_mode = get_setting("REDIRECT_MODE", ",".join(REDIRECT_MODES) if REDIRECT_MODES else "passive")
     REDIRECT_MODES    = {m.strip().lower() for m in raw_mode.split(",") if m.strip()}
@@ -271,6 +273,10 @@ def _load_settings() -> None:
     BOX_IP            = get_setting("BOX_IP", BOX_IP)
     BLACKHOLE_QUARANTINED = get_setting("BLACKHOLE_QUARANTINED", str(BLACKHOLE_QUARANTINED).lower()).lower() == "true"
     ARP_REFRESH_INTERVAL  = int(get_setting("ARP_REFRESH_INTERVAL", str(ARP_REFRESH_INTERVAL)))
+    CAPTIVE_PORTAL_ENABLED = get_setting("CAPTIVE_PORTAL_ENABLED", str(CAPTIVE_PORTAL_ENABLED).lower()).lower() == "true"
+    CAPTIVE_PORTAL_PORT    = int(get_setting("CAPTIVE_PORTAL_PORT", str(CAPTIVE_PORTAL_PORT)))
+    CAPTIVE_PORTAL_MESSAGE = get_setting("CAPTIVE_PORTAL_MESSAGE", CAPTIVE_PORTAL_MESSAGE)
+    CAPTIVE_PORTAL_CONTACT = get_setting("CAPTIVE_PORTAL_CONTACT", CAPTIVE_PORTAL_CONTACT)
     log.info("settings_loaded", redirect_modes=sorted(REDIRECT_MODES))
 
 
