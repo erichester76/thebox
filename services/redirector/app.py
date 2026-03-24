@@ -186,49 +186,57 @@ def run_cmd(args: list[str], check: bool = True) -> subprocess.CompletedProcess:
 
 # ─── Database helpers ────────────────────────────────────────────────────────
 
-def ensure_schema():
-    """Create tables this service reads from or writes to.
+_MIGRATIONS_DIR = "/app/migrations"
+REQUIRED_MIGRATIONS = ["0001"]
 
-    Scoped to: ``redirect_events``, ``alerts``.  All DDL uses
-    ``IF NOT EXISTS`` so this is safe to call on every startup.
+
+def apply_migrations(required_versions):
+    """Apply all required migrations that have not yet been recorded.
+
+    Reads SQL from ``_MIGRATIONS_DIR``/NNNN_*.sql files and applies each
+    version in ascending order, skipping any already recorded in
+    schema_migrations.
     """
-    statements = [
-        # redirect_events — redirector writes every ARP-spoof / DNS-redirect action
-        """CREATE TABLE IF NOT EXISTS redirect_events (
-            id          SERIAL PRIMARY KEY,
-            action      VARCHAR(64)  NOT NULL,
-            target_ip   VARCHAR(45)  NOT NULL,
-            target_mac  VARCHAR(17),
-            mode        VARCHAR(64)  NOT NULL,
-            detail      TEXT,
-            device_id   INTEGER REFERENCES devices(id),
-            created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )""",
-        # alerts — redirector writes quarantine-start / stop alerts
-        """CREATE TABLE IF NOT EXISTS alerts (
-            id           SERIAL PRIMARY KEY,
-            source       VARCHAR(64) NOT NULL,
-            level        VARCHAR(16) NOT NULL DEFAULT 'info',
-            title        VARCHAR(255) NOT NULL,
-            detail       TEXT,
-            device_id    INTEGER REFERENCES devices(id),
-            acknowledged BOOLEAN NOT NULL DEFAULT FALSE,
-            created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )""",
-        "CREATE INDEX IF NOT EXISTS idx_redirect_target_ip ON redirect_events(target_ip)",
-        "CREATE INDEX IF NOT EXISTS idx_redirect_created   ON redirect_events(created_at)",
-        "CREATE INDEX IF NOT EXISTS idx_alerts_level       ON alerts(level)",
-        "CREATE INDEX IF NOT EXISTS idx_alerts_created     ON alerts(created_at)",
-    ]
     conn = get_db()
     try:
         with conn.cursor() as cur:
-            for stmt in statements:
-                cur.execute(stmt)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS schema_migrations (
+                    version     VARCHAR(16) NOT NULL PRIMARY KEY,
+                    applied_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
         conn.commit()
+        for version in sorted(required_versions):
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT 1 FROM schema_migrations WHERE version = %s",
+                    (version,)
+                )
+                if cur.fetchone():
+                    continue
+                sql_file = None
+                for name in sorted(os.listdir(_MIGRATIONS_DIR)):
+                    if name.startswith(f"{version}_") and name.endswith(".sql"):
+                        sql_file = os.path.join(_MIGRATIONS_DIR, name)
+                        break
+                if sql_file is None:
+                    raise RuntimeError(
+                        f"Migration {version} not found in {_MIGRATIONS_DIR}"
+                    )
+                with open(sql_file) as fh:
+                    sql = fh.read()
+                cur.execute(sql)
+                cur.execute(
+                    "INSERT INTO schema_migrations (version) VALUES (%s)"
+                    " ON CONFLICT (version) DO NOTHING",
+                    (version,)
+                )
+                conn.commit()
+                log.info("migration_applied", version=version, file=os.path.basename(sql_file))
     finally:
         conn.close()
-    log.info("schema_ensured")
+    log.info("migrations_complete")
 
 
 # ─── Settings helpers ────────────────────────────────────────────────────────
@@ -889,7 +897,7 @@ def sync_quarantine_targets(gateway_ip: str, gateway_mac: str):
 # ─── Main ────────────────────────────────────────────────────────────────────
 
 def main():
-    ensure_schema()
+    apply_migrations(REQUIRED_MIGRATIONS)
     _load_settings()
 
     log.info("redirector_service_start", modes=sorted(REDIRECT_MODES))

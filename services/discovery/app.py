@@ -197,93 +197,57 @@ def get_redis():
 
 # ─── Schema bootstrap ────────────────────────────────────────────────────────
 
-def ensure_schema():
-    """Create tables this service reads from or writes to.
+_MIGRATIONS_DIR = "/app/migrations"
+REQUIRED_MIGRATIONS = ["0001", "0002", "0003"]
 
-    Scoped to: ``users`` (FK dependency for devices), ``devices``,
-    ``scan_runs``, ``iot_allowlist``, ``iot_learning_sessions``.
-    All DDL uses ``IF NOT EXISTS`` so this is safe to call on every startup.
+
+def apply_migrations(required_versions):
+    """Apply all required migrations that have not yet been recorded.
+
+    Reads SQL from ``_MIGRATIONS_DIR``/NNNN_*.sql files and applies each
+    version in ascending order, skipping any already recorded in
+    schema_migrations.
     """
-    statements = [
-        # users — FK dependency for devices.owner_id
-        """CREATE TABLE IF NOT EXISTS users (
-            id              SERIAL PRIMARY KEY,
-            username        VARCHAR(64) NOT NULL UNIQUE,
-            display_name    VARCHAR(255),
-            email           VARCHAR(255),
-            created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )""",
-        # devices — discovery inserts / updates every discovered host
-        """CREATE TABLE IF NOT EXISTS devices (
-            id              SERIAL PRIMARY KEY,
-            mac_address     VARCHAR(17) NOT NULL UNIQUE,
-            ip_address      VARCHAR(45),
-            hostname        VARCHAR(255),
-            vendor          VARCHAR(255),
-            device_type     VARCHAR(64) DEFAULT 'unknown',
-            os_guess        VARCHAR(255),
-            first_seen      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            last_seen       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            status          VARCHAR(32) NOT NULL DEFAULT 'new',
-            notes           TEXT,
-            open_ports      JSONB DEFAULT '[]',
-            extra_info      JSONB DEFAULT '{}',
-            owner_id        INTEGER REFERENCES users(id) ON DELETE SET NULL
-        )""",
-        # scan_runs — discovery records each scan cycle
-        """CREATE TABLE IF NOT EXISTS scan_runs (
-            id              SERIAL PRIMARY KEY,
-            started_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            finished_at     TIMESTAMPTZ,
-            network_range   VARCHAR(64) NOT NULL,
-            devices_found   INTEGER NOT NULL DEFAULT 0,
-            new_devices     INTEGER NOT NULL DEFAULT 0,
-            status          VARCHAR(32) NOT NULL DEFAULT 'running'
-        )""",
-        # iot_allowlist — FQDNs permitted for IoT devices.
-        # device_id is nullable: NULL means the entry is global (shared across
-        # all IoT devices); a non-NULL value ties the entry to a specific device.
-        """CREATE TABLE IF NOT EXISTS iot_allowlist (
-            id          SERIAL PRIMARY KEY,
-            device_id   INTEGER REFERENCES devices(id) ON DELETE CASCADE,
-            fqdn        VARCHAR(255) NOT NULL,
-            created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            UNIQUE(device_id, fqdn)
-        )""",
-        # iot_learning_sessions — tracks the 48-hour observation window for
-        # each newly-discovered IoT device.
-        """CREATE TABLE IF NOT EXISTS iot_learning_sessions (
-            id                    SERIAL PRIMARY KEY,
-            device_id             INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
-            pihole_group_name     VARCHAR(64) NOT NULL,
-            learning_started_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            learning_completed_at TIMESTAMPTZ,
-            status                VARCHAR(32) NOT NULL DEFAULT 'active',
-            UNIQUE(device_id)
-        )""",
-        "CREATE INDEX IF NOT EXISTS idx_devices_mac        ON devices(mac_address)",
-        "CREATE INDEX IF NOT EXISTS idx_devices_ip         ON devices(ip_address)",
-        "CREATE INDEX IF NOT EXISTS idx_devices_status     ON devices(status)",
-        "CREATE INDEX IF NOT EXISTS idx_iot_learning_status  ON iot_learning_sessions(status)",
-        "CREATE INDEX IF NOT EXISTS idx_iot_learning_started ON iot_learning_sessions(learning_started_at)",
-        # Partial unique index: only one global entry (device_id IS NULL) per FQDN.
-        # The UNIQUE(device_id, fqdn) constraint above allows multiple NULLs.
-        """CREATE UNIQUE INDEX IF NOT EXISTS idx_iot_allowlist_global_fqdn
-            ON iot_allowlist(fqdn) WHERE device_id IS NULL""",
-        # Migration: add ipv6_address column if the table already exists without it.
-        "ALTER TABLE devices ADD COLUMN IF NOT EXISTS ipv6_address VARCHAR(45)",
-        "CREATE INDEX IF NOT EXISTS idx_devices_ipv6       ON devices(ipv6_address)",
-    ]
     conn = get_db()
     try:
         with conn.cursor() as cur:
-            for stmt in statements:
-                cur.execute(stmt)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS schema_migrations (
+                    version     VARCHAR(16) NOT NULL PRIMARY KEY,
+                    applied_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
         conn.commit()
+        for version in sorted(required_versions):
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT 1 FROM schema_migrations WHERE version = %s",
+                    (version,)
+                )
+                if cur.fetchone():
+                    continue
+                sql_file = None
+                for name in sorted(os.listdir(_MIGRATIONS_DIR)):
+                    if name.startswith(f"{version}_") and name.endswith(".sql"):
+                        sql_file = os.path.join(_MIGRATIONS_DIR, name)
+                        break
+                if sql_file is None:
+                    raise RuntimeError(
+                        f"Migration {version} not found in {_MIGRATIONS_DIR}"
+                    )
+                with open(sql_file) as fh:
+                    sql = fh.read()
+                cur.execute(sql)
+                cur.execute(
+                    "INSERT INTO schema_migrations (version) VALUES (%s)"
+                    " ON CONFLICT (version) DO NOTHING",
+                    (version,)
+                )
+                conn.commit()
+                log.info("migration_applied", version=version, file=os.path.basename(sql_file))
     finally:
         conn.close()
-    log.info("schema_ensured")
+    log.info("migrations_complete")
 
 
 # ─── Settings helpers ────────────────────────────────────────────────────────
@@ -311,7 +275,7 @@ def get_setting(key: str, default: str = "") -> str:
 def _load_settings() -> None:
     """Read all tuneable settings from the database and update module globals.
 
-    Called once at startup *after* ``ensure_schema``.  Uses env-var values as
+    Called once at startup *after* ``apply_migrations``.  Uses env-var values as
     the fallback so that existing deployments keep working unchanged.
     """
     global NETWORK_RANGES, SCAN_INTERVAL, PIHOLE_URL, PIHOLE_PASSWORD
@@ -2524,7 +2488,7 @@ def _discovery_subscribe_loop() -> None:
 
 
 def main():
-    ensure_schema()
+    apply_migrations(REQUIRED_MIGRATIONS)
     _load_settings()
 
     log.info(
