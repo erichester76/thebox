@@ -244,8 +244,7 @@ def _is_locally_administered_mac(mac: str) -> bool:
     *unicast* MAC has first-octet bit1=1, bit0=0 — e.g. 02:xx, 0A:xx, etc.
 
     When no OUI vendor match exists for such a MAC it is almost certainly a
-    mobile device using MAC address randomization, so :func:`guess_device_type`
-    uses this flag to classify it as ``mobile`` rather than ``unknown``.
+    mobile device using MAC address randomization.
     """
     try:
         first_octet = int(mac.replace(":", "").replace("-", "")[:2], 16)
@@ -1511,7 +1510,7 @@ def start_dhcp_sniffer() -> threading.Thread:
     (option 60) are enqueued for DB update via :func:`process_dhcp_sniff_queue`.
     The VCI string provides a firmware-level IoT signal that is independent of
     MAC OUI assignments — for example BusyBox-based IoT Linux sends
-    ``"udhcp X.Y.Z"`` which matches :data:`_IOT_DHCP_VCI_KEYWORDS`.
+    ``"udhcp X.Y.Z"`` firmware string in option 60.
 
     Returns the :class:`threading.Thread` object (already started).
     """
@@ -1571,20 +1570,16 @@ def process_dhcp_sniff_queue(conn) -> int:
         if not mac or not hostname:
             continue
 
-        vci_is_iot = bool(dhcp_vci and any(kw in dhcp_vci for kw in _IOT_DHCP_VCI_KEYWORDS))
-
-        # Query fingerbank if we have an option-55 fingerprint.
+        # Derive the best device_type hint from the fingerbank result.
+        # VCI string (option 60) is stored in extra_info for context but is
+        # not used as a static classification rule — the RF classifier handles
+        # device-type inference.  Never set "unknown".
         fb_result: dict | None = None
         if dhcp_fp:
             fb_result = fingerbank_lookup(dhcp_fp, vendor_class=dhcp_vci, hostname=hostname)
-
-        # Derive the best device_type hint from all signals.
-        # Priority: fingerbank > VCI IoT keyword.  Never set "unknown".
         inferred_type: str | None = None
         if fb_result and fb_result.get("device_type") and fb_result["device_type"] != "unknown":
             inferred_type = fb_result["device_type"]
-        elif vci_is_iot:
-            inferred_type = "iot"
 
         # Build extra_info patch with fingerbank results.
         extra_patch: dict = {}
@@ -1654,7 +1649,7 @@ def process_dhcp_sniff_queue(conn) -> int:
                 log.info(
                     "dhcp_hostname_updated",
                     mac=mac, hostname=hostname, ip=ip,
-                    dhcp_vci=dhcp_vci or None, vci_iot=vci_is_iot,
+                    dhcp_vci=dhcp_vci or None,
                     fingerbank=fb_result.get("device_name") if fb_result else None,
                 )
 
@@ -2164,8 +2159,8 @@ def process_mdns_queue() -> dict[str, dict]:
     TXT record key/value pairs carry rich metadata on Apple HomeKit accessories
     (``md`` = model, ``am`` = Apple model identifier), Chromecasts (``fn`` =
     friendly name), printers (``ty`` = device type), and ESPHome devices.
-    Surfacing these as top-level fields lets :func:`guess_device_type` use them
-    without iterating nested service lists.
+    Surfacing these as top-level fields in ``extra_info`` makes them available
+    as training signals and lets the RF classifier use them directly.
     """
     # TXT record keys whose values represent a model name.
     _MODEL_KEYS = {"md", "model", "mn", "am"}
@@ -2618,523 +2613,6 @@ def vendor_lookup(mac: str) -> str | None:
         return None
 
 
-# ─── Device-type classification signal tables ────────────────────────────────
-# All sets below are used as case-insensitive substring matches against the
-# relevant field (vendor OUI string, OS fingerprint, hostname, etc.).  A broad
-# prefix like "espressif" therefore matches "Espressif Systems", "ESPRESSIF
-# INC.", and any future variant reported by MAC-vendor databases.
-
-# OUI vendor strings that reliably identify IoT hardware.
-# All entries are matched as case-insensitive substrings of the vendor field,
-# so a short prefix like "espressif" covers "Espressif Systems, Inc." and any
-# future variant reported by MAC-vendor databases.
-#
-# Note: a subset of these keywords also appears in ``device_classifier.py``'s
-# ``VENDOR_KEYWORDS`` list, which is the RF classifier's binary feature set.
-# The two lists serve different roles: ``VENDOR_KEYWORDS`` drives the trained
-# model (must be kept short for tractable feature counts), while
-# ``_IOT_VENDOR_KEYWORDS`` drives the heuristic rule engine (can be as broad
-# as needed, no size constraint).  Both sets must be updated when adding new
-# IoT module / chip OEM keywords so that both the RF classifier and the
-# heuristic fallback benefit from the new signal.
-_IOT_VENDOR_KEYWORDS: frozenset[str] = frozenset({
-    # Microcontroller / embedded-SoC manufacturers
-    "espressif", "espressif systems", "raspberry pi", "raspberrypi",
-    "microchip technology", "nordic semiconductor", "silicon labs", "silabs",
-    "texas instruments", "stmicroelectronics", "nxp semiconductors",
-    "arduino", "particle industries", "pycom", "seeed", "adafruit",
-    "bouffalo lab", "beken corporation", "winner micro",
-    # Smart-home protocols / hubs
-    "z-wave", "zigbee", "insteon", "lutron", "leviton", "ge lighting",
-    "smartthings", "samsung smarthings", "hubitat",
-    "aeotec", "fibar group", "fibaro", "homeseer", "micasaverde",
-    "athom", "zipato", "vera control",
-    # Smart lighting
-    "signify", "philips lighting", "lifx", "osram", "sylvania", "sengled",
-    "innr", "yeelight", "milight", "nanoleaf", "govee", "feit electric",
-    "ikea of sweden", "magic home", "zengge", "magichue",
-    # Smart plugs / switches / automation
-    "tuya", "ewelink", "shelly", "sonoff", "tasmota", "esphome", "meross",
-    "wemo", "belkin", "kasa", "tp-link", "tp link", "tplink",
-    "gosund", "switchbot", "wonder innovation", "broadlink",
-    # Thermostats / HVAC
-    "nest", "ecobee", "honeywell", "tado", "thermosmart",
-    "emerson electric", "johnson controls", "bosch thermotechnology",
-    # IP cameras / doorbells / security
-    "ring", "arlo", "blink", "eufy", "amcrest", "foscam", "reolink",
-    "hikvision", "dahua", "axis communications", "hanwha", "vivotek",
-    "pelco", "mobotix", "uniview", "zosi", "zmodo", "annke", "tenvis",
-    "doorbird", "bird home automation", "august home",
-    "alarm.com", "digital ally",
-    # Smart speakers / voice assistants / streaming
-    "sonos", "roku", "amazon technologies", "amazon.com",
-    "google nest", "nest labs",
-    # Smart locks / access control
-    "august home", "kwikset", "allegion", "dormakaba",
-    # Robot vacuums / smart appliances
-    "irobot", "ecovacs robotics", "roborock", "neato robotics", "shark ninja",
-    # Consumer IoT / misc
-    "wyze", "anker innovations", "xiaomi", "aqara", "miio",
-    "d-link", "dlink", "vizio", "tcl", "hisense",
-    "withings", "netatmo", "eve systems", "elgato",
-    "somfy", "hunter douglas", "velux",
-    "chamberlain", "liftmaster", "genie company",
-    # IoT module / chip makers whose OUI appears on commodity IoT hardware
-    "smart innovation",   # Smart Innovation LLC — IoT WiFi modules
-    "hui zhou gaoshengda",  # Hui Zhou Gaoshengda Technology — IoT/media module OEM
-    "shenzhen aisens",
-    "shenzhen bilian",
-})
-
-# OS / firmware fingerprint substrings that indicate embedded systems.
-_IOT_OS_KEYWORDS: frozenset[str] = frozenset({
-    "embedded linux", "uclinux", "openwrt", "lede", "dd-wrt", "buildroot",
-    "vxworks", "freertos", "threadx", "nucleus rtos", "contiki", "tinyos",
-    "busybox", "yocto", "mongoose os", "micropython",
-    "zephyr", "riot os", "nuttx", "azure rtos", "mbed os",
-    "balena", "ubuntu core", "android things",
-})
-
-# TCP/UDP port numbers whose presence strongly hints at an IoT device.
-_IOT_PORT_SIGNALS: frozenset[int] = frozenset({
-    1883,   # MQTT
-    8883,   # MQTT over TLS
-    5683,   # CoAP
-    5684,   # CoAP over DTLS
-    554,    # RTSP (IP cameras / NVR)
-    8554,   # RTSP alternate
-    47808,  # BACnet/IP (building automation)
-    502,    # Modbus TCP (industrial sensors)
-    44818,  # EtherNet/IP (industrial)
-    4840,   # OPC-UA (industrial IoT)
-    9293,   # Zigbee TCP gateway (some hubs)
-    8009,   # Google Cast (Chromecast)
-    8008,   # Google Cast control channel
-    9999,   # TP-Link Kasa smart home protocol
-    4911,   # Niagara BACnet (building automation)
-    18443,  # Some smart home hub APIs
-    49153,  # Belkin WeMo UPnP event listener
-})
-
-# Hostname substrings that indicate IoT devices.
-_IOT_HOSTNAME_KEYWORDS: frozenset[str] = frozenset({
-    # ESP / Arduino microcontroller defaults
-    "esp-", "esp8266", "esp32", "wemos", "arduino-",
-    # Firmware / platform names that appear in mDNS hostnames
-    "shelly", "tasmota", "sonoff", "tuya-", "esphome-",
-    # Xiaomi smart home
-    "miio-", "yeelink-",
-    # Amazon smart devices
-    "amazon-", "echo-", "alexa-", "fire-tv", "firetv", "firestick",
-    # Google / Nest smart devices
-    "google-home", "googlehome", "googlenest", "nest-", "nest-hub",
-    # Apple smart devices
-    "homepod", "appletv", "apple-tv",
-    # Other smart speakers / streaming
-    "roku-", "lifx", "chromecast-",
-    # Ring / Arlo / Wyze / security
-    "ring-", "arlo-", "wyze-", "blink-",
-    # IP cameras
-    "cam-", "nvr-", "dvr-", "ipcam", "ipcamera",
-    # Smart lighting / mesh
-    "hue-bridge", "philips-hue", "tradfri", "dirigera", "govee-", "wled-",
-    # Smart home controllers / hubs
-    "ecobee", "tado-", "octoprint", "homebridge",
-    "hassio", "homeassistant", "ha-",
-    "smartthings", "hubitat",
-    # Misc smart home
-    "broadlink", "switchbot", "meross-",
-    "roomba", "robovac", "roborock",
-    "insteon-", "vera-", "homeseer",
-    "netatmo-", "withings-",
-    "doorbell", "smartplug", "smartbulb",
-    "sensor-", "plug-",
-})
-
-# HTTP ``Server`` header substrings that identify IoT / embedded web servers.
-# Matched case-insensitively against the ``http_server`` field captured by
-# :func:`enrich_from_banners`.  Embedded web servers like GoAhead, Boa, and
-# lwIP are almost exclusively found on IoT and industrial devices.
-_IOT_HTTP_SERVER_KEYWORDS: frozenset[str] = frozenset({
-    # Embedded / lightweight web servers
-    "lwip",            # Lightweight IP stack (ESP8266, ESP32, many IoT SoCs)
-    "goahead",         # Embedthis GoAhead (IP cameras, smart home, HVAC)
-    "boa",             # Boa web server (legacy IoT devices, routers)
-    "uhttpd",          # OpenWrt µHTTPd
-    "mini_httpd",      # mini_httpd (embedded systems)
-    "mongoose",        # Mongoose OS / Cesanta web server (ESP, embedded)
-    "micropython",     # MicroPython HTTP server
-    "esp-idf",         # Espressif IoT Development Framework
-    "shelly",          # Shelly smart relays / dimmers
-    "tasmota",         # Tasmota open-source firmware
-    "openwrt",         # OpenWrt — embedded Linux for routers / hubs
-    "dd-wrt",          # DD-WRT router firmware
-    # IP camera / NVR brands
-    "hikvision",       # Hikvision IP cameras
-    "dnvrs-webs",      # Dahua NVR / DVR web server
-    "dahua",           # Dahua IP cameras
-    "axis",            # Axis network cameras
-    "vivotek",         # VIVOTEK IP cameras
-    "amcrest",         # Amcrest cameras
-    "reolink",         # Reolink cameras
-    "foscam",          # Foscam cameras
-    "netwave",         # NetWave IP cameras
-    # Smart home brands
-    "ewelink",         # Sonoff / eWeLink firmware
-    "wemo",            # Belkin WeMo smart plug
-    "homeseer",        # HomeSeer smart home controller
-    "vera",            # MiCasaVerde Vera home controller
-})
-
-# DHCP option 60 (Vendor Class Identifier) substrings that indicate embedded /
-# IoT DHCP clients.  Many IoT devices advertise their firmware or DHCP client
-# name in this option, giving a reliable classification signal that is
-# independent of MAC OUI assignments.
-_IOT_DHCP_VCI_KEYWORDS: frozenset[str] = frozenset({
-    "udhcp",        # BusyBox udhcpd / udhcpc (embedded Linux — ubiquitous in IoT)
-    "busybox",      # BusyBox DHCP client
-    "shelly",       # Shelly firmware DHCP client
-    "esp-idf",      # Espressif IDF DHCP client
-    "tasmota",      # Tasmota firmware
-    "openwrt",      # OpenWrt DHCP client
-    "dd-wrt",       # DD-WRT firmware
-    "freertos",     # FreeRTOS TCP/IP stack
-    "contiki",      # Contiki OS DHCP
-    "lwip",         # lwIP DHCP client (very common in ESP chips)
-    "micropython",  # MicroPython urequests / usocket
-    "mongoose",     # Mongoose OS
-})
-
-# UPnP manufacturer name substrings that identify IoT devices.
-# Matched case-insensitively against the ``upnp_manufacturer`` field extracted
-# from UPnP device-description XML by :func:`ssdp_discover`.
-_IOT_UPNP_MANUFACTURERS: frozenset[str] = frozenset({
-    "tuya", "espressif", "shelly", "philips", "sonos", "ring", "nest",
-    "ecobee", "amazon", "google", "ikea", "govee", "irobot", "ecovacs",
-    "roborock", "withings", "netatmo", "fibaro", "aeotec", "belkin",
-    "wemo", "kasa", "switchbot", "broadlink", "hikvision", "dahua",
-    "axis", "amcrest", "reolink", "foscam", "wyze", "eufy", "blink",
-    "arlo", "august", "chamberlain", "liftmaster",
-    # Streaming / smart-TV manufacturers advertised via UPnP
-    "roku", "tcl", "hisense", "vizio", "tivo", "directv", "samsung",
-    "lg electronics", "lg", "sony", "sharp", "panasonic",
-})
-
-# HTML page title substrings (from nmap ``http-title`` NSE script) that
-# indicate IoT / embedded devices.  Matched case-insensitively.
-_IOT_HTTP_TITLE_KEYWORDS: frozenset[str] = frozenset({
-    # Routers / gateways
-    "router", "gateway", "modem", "tp-link", "tplink", "netgear", "asus router",
-    "d-link", "dlink", "linksys", "belkin", "zyxel", "mikrotik", "routeros",
-    "openwrt", "dd-wrt", "tomato", "asuswrt", "merlin",
-    # Access points / switches
-    "access point", "unifi", "ubiquiti", "edgerouter", "edgeswitch",
-    "aironet", "aruba", "ruckus", "meraki",
-    # IP cameras / NVRs
-    "ip camera", "network camera", "ipcam", "hikvision", "dahua", "foscam",
-    "amcrest", "reolink", "axis camera", "vivotek", "nvr", "dvr",
-    # Smart home devices / hubs
-    "smart home", "home automation", "home assistant", "homebridge",
-    "smartthings", "hubitat", "vera", "fibaro", "domoticz", "openhab",
-    # NAS / storage
-    "synology diskstation", "qnap", "nas manager", "diskstation manager",
-    "readynas", "buffalo nas",
-    # Printers
-    "hp laserjet", "hp officejet", "hp deskjet", "brother", "canon print",
-    "epson", "xerox", "printer", "jetdirect",
-    # Smart speakers / media
-    "chromecast", "google home", "amazon echo", "fire tv", "roku",
-    "apple tv", "sonos", "plex media",
-    # Misc embedded / IoT
-    "shelly", "tasmota", "esphome", "wled", "octoprint",
-})
-
-# SNMP sysDescr substrings that identify specific device categories.
-# Matched case-insensitively against the ``snmp_sysdescr`` field.
-_SNMP_NETWORK_DEVICE_KEYWORDS: frozenset[str] = frozenset({
-    "cisco ios", "cisco nx-os", "ios-xe", "ios xr",
-    "junos", "juniper",
-    "routeros", "mikrotik",
-    "edgeos", "edgerouter",
-    "arubaos", "aruba",
-    "openwrt", "dd-wrt",
-    "zyxel", "zywall",
-    "fortios", "fortigate",
-    "panos", "pan-os",
-    "comware",
-    "procurve",
-    "extremexos",
-    "sonic", "dell sonic",
-    "freebsd",          # pfSense / OPNsense
-    "opnsense", "pfsense",
-})
-
-_SNMP_PRINTER_KEYWORDS: frozenset[str] = frozenset({
-    "jetdirect", "laserjet", "officejet", "deskjet",
-    "brother", "bizhub", "konica", "kyocera",
-    "xerox", "lexmark", "ricoh", "epson", "canon",
-    "printer", "print server",
-})
-
-_SNMP_IOT_KEYWORDS: frozenset[str] = frozenset({
-    "esp-idf", "freertos", "ucos", "lwip", "contiki",
-    "shelly", "tasmota", "openwrt", "lede",
-    "hikvision", "dahua", "axis", "amcrest",
-    "raspberry pi", "raspbian",
-})
-
-# OUI vendor strings that reliably identify dedicated network infrastructure.
-# These are distinct from IoT vendors — they do NOT appear in _IOT_VENDOR_KEYWORDS.
-_NETWORK_DEVICE_VENDOR_KEYWORDS: frozenset[str] = frozenset({
-    "ubiquiti", "ubnt",
-    "cisco systems", "cisco",
-    "juniper networks", "juniper",
-    "aruba networks", "aruba",
-    "mikrotik", "routerboard",
-    "zyxel",
-    "fortinet",
-    "meraki",
-    "ruckus",
-    "aerohive",
-    "sophos",
-    "watchguard",
-    "barracuda",
-    "sonicwall",
-    "palo alto",
-    "extreme networks",
-    "cambium networks",
-    "cradlepoint",
-})
-
-# OUI vendor strings that reliably identify NAS / storage appliances.
-_NAS_SERVER_VENDOR_KEYWORDS: frozenset[str] = frozenset({
-    "synology",
-    "qnap",
-    "western digital",
-    "wd connected",
-    "drobo",
-    "asustor",
-    "buffalo",
-    "netgear ready",  # ReadyNAS
-    "seagate technology",
-    "promise technology",
-    "overland-tandberg",
-})
-
-def guess_device_type(
-    vendor: str | None,
-    open_ports: list[dict],
-    os_guess: str | None,
-    extra_info: str | None = None,
-    hostname: str | None = None,
-    mac: str | None = None,
-) -> str:
-    """Heuristic device-type classifier.
-
-    Uses MAC vendor string, nmap OS fingerprint, open port set, mDNS service
-    types and TXT records, WSD device-type strings, UPnP device/manufacturer
-    fields, HTTP server banner, HTTP page title, SNMP sysDescr/sysName,
-    DHCP fingerbank results, MAC address randomization flag, and hostname to
-    produce a best-effort device category.
-
-    Returns one of: ``iot``, ``desktop``, ``server``, ``mobile``,
-    ``printer``, ``network_device``, or ``unknown``.
-    """
-
-    vendor_l = (vendor or "").lower()
-    os_l = (os_guess or "").lower()
-    hostname_l = (hostname or "").lower()
-    ports = {p["port"] for p in open_ports}
-    extra = extra_info or {}
-
-    # ── mDNS service-type hints (highest specificity) ─────────────────────────
-    # Collect ALL advertised service types before applying rules so that
-    # multi-service combinations (e.g. _airplay + _spotify-connect) are
-    # evaluated together rather than returning on the first matching service.
-    _mdns_stypes: set[str] = {
-        svc.get("service_type", "") for svc in extra.get("mdns_services", [])
-    }
-    if _mdns_stypes:
-        _has_companion = any("_companion-link._tcp" in s for s in _mdns_stypes)
-        _has_workstation = any("_workstation._tcp" in s for s in _mdns_stypes)
-        _has_ssh_mdns = any("_ssh._tcp" in s for s in _mdns_stypes)
-
-        if any("_googlecast._tcp" in s or "_cast._tcp" in s for s in _mdns_stypes):
-            return "iot"
-        if any("_homekit._tcp" in s or "_hap._tcp" in s or "_matter._tcp" in s for s in _mdns_stypes):
-            return "iot"
-        if any("_printer._tcp" in s or "_ipp._tcp" in s or "_ipps._tcp" in s for s in _mdns_stypes):
-            return "printer"
-        if _has_workstation:
-            return "desktop"
-        if any("_smb._tcp" in s or "_afpovertcp._tcp" in s for s in _mdns_stypes):
-            return "desktop"
-        # Streaming / media device indicators (e.g. Roku, Sonos, Android TV) —
-        # check before _airplay._tcp so these devices are not misclassified as mobile.
-        if any("_spotify-connect._tcp" in s for s in _mdns_stypes):
-            return "iot"
-        # Additional IoT-specific mDNS service types
-        if any(
-            kw in s
-            for s in _mdns_stypes
-            for kw in (
-                "_hue._tcp", "_deconz._tcp", "_wled._tcp", "_elg._tcp",
-                "_axis-video._tcp", "_androidtvremote._tcp", "_viziocast._tcp",
-                "_nvstream._tcp", "_amazon-setup._tcp", "_miio._udp",
-            )
-        ):
-            return "iot"
-        # _companion-link._tcp is an iOS/iPadOS Continuity protocol.  A device
-        # advertising it without desktop-class mDNS (_workstation, _ssh) is a
-        # phone or tablet.
-        if _has_companion and not (_has_workstation or _has_ssh_mdns):
-            return "mobile"
-        # _airplay._tcp / _raop._tcp without _companion-link → Apple TV, HomePod,
-        # or a third-party AirPlay receiver (Roku, Android TV).  Classify as iot
-        # rather than mobile; macOS laptops with AirPlay will have been caught
-        # earlier by _workstation._tcp or the RF classifier.
-        if any("_airplay._tcp" in s or "_raop._tcp" in s for s in _mdns_stypes):
-            return "iot"
-
-    # ── mDNS TXT record hints (model / device-type strings from Bonjour TXTs) ─
-    # Keys like ``md`` (HomeKit model), ``ty`` (printer type), ``am`` (Apple
-    # model identifier like "iPhone14,2") expose the exact device identity.
-    mdns_txt_type_l = extra.get("mdns_txt_type", "").lower() if isinstance(extra.get("mdns_txt_type"), str) else ""
-    mdns_txt_model_l = extra.get("mdns_txt_model", "").lower() if isinstance(extra.get("mdns_txt_model"), str) else ""
-    if mdns_txt_type_l:
-        if any(kw in mdns_txt_type_l for kw in ("printer", "scanner", "fax")):
-            return "printer"
-        if any(kw in mdns_txt_type_l for kw in ("camera", "nvr", "iot", "smart")):
-            return "iot"
-    if mdns_txt_model_l:
-        # Apple model identifiers: "iPhone" / "iPad" → mobile; "MacBook" → desktop
-        if any(kw in mdns_txt_model_l for kw in ("iphone", "ipad", "ipod")):
-            return "mobile"
-        if any(kw in mdns_txt_model_l for kw in ("macbook", "imac", "mac mini", "mac pro")):
-            return "desktop"
-        if any(kw in mdns_txt_model_l for kw in _IOT_VENDOR_KEYWORDS):
-            return "iot"
-
-    # ── WSD device-type hints (Windows PCs, printers, ONVIF cameras) ──────────
-    wsd_types_l = extra.get("wsd_types", "").lower() if isinstance(extra.get("wsd_types"), str) else ""
-    wsd_scopes_l = extra.get("wsd_scopes", "").lower() if isinstance(extra.get("wsd_scopes"), str) else ""
-    if wsd_types_l:
-        if any(kw in wsd_types_l for kw in ("pri:printer", "printdevice", "wscn:")):
-            return "printer"
-        if any(kw in wsd_types_l for kw in ("networkvideotransmitter", "networkvideodisplay")):
-            return "iot"  # ONVIF IP camera
-        if "scandevicetype" in wsd_types_l:
-            return "printer"  # WS-Scan scanner
-    if wsd_scopes_l:
-        if "onvif" in wsd_scopes_l:
-            return "iot"  # ONVIF-capable camera/encoder
-
-    # ── UPnP device-type hints ────────────────────────────────────────────────
-    upnp_type = extra.get("upnp_device_type", "")
-    upnp_mfr = extra.get("upnp_manufacturer", "").lower()
-    upnp_friendly = extra.get("upnp_friendly_name", "").lower()
-    upnp_model = extra.get("upnp_model_name", "").lower()
-    if "InternetGatewayDevice" in upnp_type:
-        return "network_device"
-    if "MediaRenderer" in upnp_type or "MediaServer" in upnp_type:
-        return "iot"
-    if "printer" in upnp_type.lower():
-        return "printer"
-    if "WLANAccessPoint" in upnp_type or "WANDevice" in upnp_type:
-        return "network_device"
-    if any(v in upnp_mfr for v in _IOT_UPNP_MANUFACTURERS):
-        return "iot"
-    # Also check UPnP friendly name and model for IoT keywords
-    upnp_combined = f"{upnp_friendly} {upnp_model}"
-    if any(kw in upnp_combined for kw in _IOT_VENDOR_KEYWORDS):
-        return "iot"
-
-    # ── IoT signals — checked first; most specific ────────────────────────────
-    if any(kw in vendor_l for kw in _IOT_VENDOR_KEYWORDS):
-        return "iot"
-    if any(kw in os_l for kw in _IOT_OS_KEYWORDS):
-        return "iot"
-    if ports & _IOT_PORT_SIGNALS:
-        return "iot"
-    if any(kw in hostname_l for kw in _IOT_HOSTNAME_KEYWORDS):
-        return "iot"
-
-    # ── Dedicated network infrastructure vendors ──────────────────────────────
-    # Checked after IoT (Ubiquiti is never IoT; Cisco, Aruba, etc. likewise).
-    if any(kw in vendor_l for kw in _NETWORK_DEVICE_VENDOR_KEYWORDS):
-        return "network_device"
-
-    # ── NAS / storage appliance vendors ──────────────────────────────────────
-    if any(kw in vendor_l for kw in _NAS_SERVER_VENDOR_KEYWORDS):
-        return "server"
-
-    # ── HTTP server banner hints ──────────────────────────────────────────────
-    http_server_l = extra.get("http_server", "").lower() if isinstance(extra.get("http_server"), str) else ""
-    if http_server_l and any(kw in http_server_l for kw in _IOT_HTTP_SERVER_KEYWORDS):
-        return "iot"
-
-    # ── HTTP page title hints ─────────────────────────────────────────────────
-    http_title_l = extra.get("http_title", "").lower() if isinstance(extra.get("http_title"), str) else ""
-    if http_title_l:
-        if any(kw in http_title_l for kw in _IOT_HTTP_TITLE_KEYWORDS):
-            return "iot"
-        # Printer titles (HP / Epson / Canon / etc.)
-        if any(kw in http_title_l for kw in ("printer", "jetdirect", "laserjet", "officejet")):
-            return "printer"
-        # NAS / storage appliance
-        if any(kw in http_title_l for kw in ("diskstation", "qnap", "nas", "readynas")):
-            return "server"
-
-    # ── SNMP sysDescr hints ───────────────────────────────────────────────────
-    snmp_descr_l = extra.get("snmp_sysdescr", "").lower() if isinstance(extra.get("snmp_sysdescr"), str) else ""
-    snmp_name_l = extra.get("snmp_sysname", "").lower() if isinstance(extra.get("snmp_sysname"), str) else ""
-    if snmp_descr_l:
-        if any(kw in snmp_descr_l for kw in _SNMP_NETWORK_DEVICE_KEYWORDS):
-            return "network_device"
-        if any(kw in snmp_descr_l for kw in _SNMP_PRINTER_KEYWORDS):
-            return "printer"
-        if any(kw in snmp_descr_l for kw in _SNMP_IOT_KEYWORDS):
-            return "iot"
-        if "windows" in snmp_descr_l:
-            return "desktop"
-        # Linux host with SSH open is likely a server; without = ambiguous
-        if "linux" in snmp_descr_l:
-            return "server" if 22 in ports else "unknown"
-    # SNMP sysName can also disambiguate (e.g. "rtr-01", "sw-01")
-    if snmp_name_l and any(kw in snmp_name_l for kw in ("rtr", "router", "sw-", "switch", "fw-", "ap-")):
-        return "network_device"
-
-    # ── Desktop / workstation ─────────────────────────────────────────────────
-    if "windows" in os_l:
-        return "desktop"
-    if "macos" in os_l or "mac os" in os_l:
-        return "desktop"
-
-    # ── Server ────────────────────────────────────────────────────────────────
-    if "linux" in os_l and 22 in ports:
-        return "server"
-
-    # ── Mobile ───────────────────────────────────────────────────────────────
-    if "android" in os_l or "apple" in vendor_l or "ios" in os_l:
-        return "mobile"
-
-    # ── MAC randomization → mobile device ────────────────────────────────────
-    # Locally-administered (private/random) MACs with no known OUI vendor are
-    # almost exclusively modern phones and tablets using MAC address rotation.
-    if mac and not vendor_l and _is_locally_administered_mac(mac):
-        return "mobile"
-
-    # ── Open-port heuristics ──────────────────────────────────────────────────
-    if 9100 in ports or "print" in vendor_l:
-        return "printer"
-
-    # ── Network device ────────────────────────────────────────────────────────
-    if 80 in ports or 443 in ports or 8080 in ports:
-        return "network_device"
-
-    return "unknown"
-
-
 # ─── Per-host enrichment helper ──────────────────────────────────────────────
 
 def _enrich_and_classify(host: dict, extra_seed: dict | None = None) -> dict:
@@ -3194,12 +2672,11 @@ def _enrich_and_classify(host: dict, extra_seed: dict | None = None) -> dict:
         dhcp_fingerprint=extra_info.get("dhcp_fingerprint"),
     )
 
-    # ── RF classifier (primary) ───────────────────────────────────────────────
-    # Try the RandomForest models first.  classify_device() returns a
-    # (device_type, os_family, confidence) triple.  Both predictions share the
-    # same feature vector and are only accepted above RF_MIN_CONFIDENCE.
-    # The heuristic is used as a fallback when RF confidence is too low.
-    dhcp_fp: str | None = extra_info.get("dhcp_fingerprint") or None
+    # ── RF classifier ─────────────────────────────────────────────────────────
+    # classify_device() returns a (device_type, os_family, confidence) triple.
+    # Both predictions share the same feature vector and are only accepted
+    # above RF_MIN_CONFIDENCE.  When confidence is too low the device_type
+    # is left as "unknown" — no heuristic fallback.
     rf_type: str = "unknown"
     rf_os: str = "unknown"
     rf_conf: float = 0.0
@@ -3208,30 +2685,21 @@ def _enrich_and_classify(host: dict, extra_seed: dict | None = None) -> dict:
             host.get("vendor"),
             host.get("open_ports", []),
             extra_info,
-            dhcp_fingerprint=dhcp_fp,
         )
     else:
         log.debug("rf_classify_skipped", ip=ip, reason="classifier_not_loaded")
 
+    host["device_type"] = rf_type if rf_type != "unknown" else "unknown"
     if rf_type != "unknown":
-        host["device_type"] = rf_type
         log.debug(
             "rf_classify_used",
             ip=ip, device_type=rf_type, os_family=rf_os, confidence=round(rf_conf, 3),
         )
     else:
-        # Heuristic fallback — retains all the high-specificity rules
-        # (mDNS service types, WSD, UPnP, SNMP, fingerbank result, etc.)
         log.debug(
-            "rf_classify_fallback",
+            "rf_classify_low_confidence",
             ip=ip,
-            reason="rf_type_unknown",
             rf_confidence=round(rf_conf, 3),
-        )
-        host["device_type"] = guess_device_type(
-            host.get("vendor"), host.get("open_ports", []),
-            host.get("os_guess"), extra_info, host.get("hostname"),
-            mac=mac,
         )
 
     # Fill in os_guess from the RF os_family prediction when nmap did not
@@ -3492,7 +2960,7 @@ def _process_mdns_standalone(conn) -> int:
         extra_patch: dict = {"mdns_services": services}
         if hostname:
             extra_patch["mdns_hostname"] = hostname
-        # Propagate TXT record fields so guess_device_type can use them.
+        # Propagate TXT record fields so the RF classifier can use them.
         for txt_key in ("mdns_txt_model", "mdns_txt_type", "mdns_txt_friendly_name"):
             if entry.get(txt_key):
                 extra_patch[txt_key] = entry[txt_key]

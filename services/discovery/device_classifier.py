@@ -52,12 +52,11 @@ MODEL_PATH: str = os.environ.get(
     "RF_MODEL_PATH", "/app/models/device_classifier.pkl"
 )
 
-# Minimum predicted-class probability to accept the RF label instead of
-# falling back to the heuristic.  Lower values = more classifications; higher
-# values = more conservative (fewer overrides of the heuristic).  With the
-# typical 6-class feature space (and sparse data for ARP-only devices) a
-# threshold of 0.35 is a good balance between recall and precision.
-RF_MIN_CONFIDENCE: float = float(os.environ.get("RF_MIN_CONFIDENCE", "0.35"))
+# Minimum predicted-class probability to accept the RF label.  Lower values =
+# more classifications; higher values = more conservative.  Without a
+# heuristic fallback, 0.22 is a good balance — it means the classifier has
+# a clear plurality preference among the 6 classes (random = 0.167).
+RF_MIN_CONFIDENCE: float = float(os.environ.get("RF_MIN_CONFIDENCE", "0.22"))
 
 # Master on/off switch — set RF_CLASSIFIER_ENABLED=false to disable entirely.
 RF_CLASSIFIER_ENABLED: bool = (
@@ -65,45 +64,12 @@ RF_CLASSIFIER_ENABLED: bool = (
 )
 
 # ── Feature definitions ───────────────────────────────────────────────────────
-
-# Individual DHCP option codes whose *presence* in the option-55 Parameter
-# Request List is used as a binary feature.  These 30 codes cover the most
-# discriminative options across Windows, macOS, iOS, Android, Linux and
-# embedded/IoT firmware DHCP stacks.
-DHCP_OPTIONS: list[int] = [
-    1,   # Subnet Mask
-    2,   # Time Offset
-    3,   # Router
-    4,   # Time Server
-    6,   # DNS Server
-    7,   # Log Server
-    12,  # Hostname
-    15,  # Domain Name
-    17,  # Root Path
-    23,  # Default IP TTL
-    28,  # Broadcast Address
-    31,  # Perform Router Discovery
-    33,  # Static Route
-    40,  # NIS Domain
-    41,  # NIS Server
-    42,  # NTP Server
-    43,  # Vendor Specific
-    44,  # NetBIOS Name Server
-    46,  # NetBIOS Node Type
-    47,  # NetBIOS Scope
-    51,  # Lease Time
-    54,  # Server Identifier
-    58,  # Renewal Time
-    59,  # Rebinding Time
-    95,  # LDAP
-    100, # Timezone (POSIX-TZ)
-    101, # Timezone (TZ-Database)
-    119, # Domain Search
-    121, # Classless Static Route
-    252, # Private / Proxy Autodiscovery
-]
-
-# Ports whose open/closed state is used as a binary feature.
+# DHCP option-55 fingerprints are intentionally excluded from the feature
+# vector.  In practice the vast majority of devices are discovered via ARP
+# scan, passive mDNS/SSDP, or nmap — not DHCP snooping — so DHCP flags
+# would be zero for most samples and would dilute classifier confidence.
+# Classification relies entirely on vendor OUI, open ports, and extra_info
+# signals (mDNS services, HTTP server banner, UPnP manufacturer).# Ports whose open/closed state is used as a binary feature.
 FEATURE_PORTS: list[int] = [
     21,    # FTP
     22,    # SSH
@@ -134,6 +100,7 @@ FEATURE_PORTS: list[int] = [
     8008,  # Google Cast control channel (Chromecast / Android TV)
     8009,  # Google Cast media channel
     8080,  # HTTP alt
+    8291,  # Winbox (MikroTik router management — extremely specific)
     8443,  # HTTPS alt
     8883,  # MQTT TLS (IoT)
     9100,  # RAW print / JetDirect
@@ -213,8 +180,7 @@ HTTP_SERVER_KEYWORDS: list[str] = [
 
 # Total feature vector length (used by train_classifier.py too).
 FEATURE_COUNT: int = (
-    len(DHCP_OPTIONS)
-    + len(FEATURE_PORTS)
+    len(FEATURE_PORTS)
     + len(VENDOR_KEYWORDS)
     + len(MDNS_SERVICE_TYPES)
     + len(HTTP_SERVER_KEYWORDS)
@@ -248,9 +214,13 @@ def extract_features(
     vendor: str | None,
     open_ports: list[dict],
     extra_info: dict | None,
-    dhcp_fingerprint: str | None = None,
 ) -> list[float]:
     """Return a fixed-length feature vector (list of 0.0 / 1.0 floats).
+
+    The feature vector covers only the signals that are routinely available
+    from ARP/nmap discovery and passive mDNS/SSDP sniffing.  DHCP option-55
+    fingerprints are excluded because the vast majority of discovered devices
+    are found without a DHCP exchange being observed.
 
     Parameters
     ----------
@@ -261,10 +231,7 @@ def extract_features(
         (e.g. ``[{"port": 80, "state": "open", "service": "http"}]``).
     extra_info:
         The ``extra_info`` dict stored on the device record, which may
-        contain ``mdns_services``, ``http_server``, etc.
-    dhcp_fingerprint:
-        Comma-separated DHCP option-55 Parameter Request List string
-        (e.g. ``"1,3,6,15,119,252"``).  ``None`` when unknown.
+        contain ``mdns_services``, ``http_server``, ``upnp_manufacturer``, etc.
 
     Returns
     -------
@@ -274,17 +241,6 @@ def extract_features(
     features: list[float] = []
     extra: dict = extra_info or {}
     ports: set[int] = {p["port"] for p in (open_ports or [])}
-
-    # ── DHCP option-55 flags ──────────────────────────────────────────────────
-    # Parse the fingerprint string into a set of integer option codes.
-    fp_opts: set[int] = set()
-    if dhcp_fingerprint:
-        try:
-            fp_opts = {int(c.strip()) for c in dhcp_fingerprint.split(",") if c.strip()}
-        except (ValueError, AttributeError):
-            pass
-    for opt in DHCP_OPTIONS:
-        features.append(1.0 if opt in fp_opts else 0.0)
 
     # ── Open-port multi-hot ───────────────────────────────────────────────────
     for port in FEATURE_PORTS:
@@ -384,14 +340,13 @@ def classify_device(
     vendor: str | None,
     open_ports: list[dict],
     extra_info: dict | None,
-    dhcp_fingerprint: str | None = None,
     min_confidence: float | None = None,
 ) -> tuple[str, str, float]:
     """Classify a device using the loaded RF models.
 
     Parameters
     ----------
-    vendor, open_ports, extra_info, dhcp_fingerprint:
+    vendor, open_ports, extra_info:
         Same semantics as :func:`extract_features`.
     min_confidence:
         Override the module-level *RF_MIN_CONFIDENCE* threshold for this call.
@@ -425,7 +380,7 @@ def classify_device(
     try:
         import numpy as np  # noqa: PLC0415
 
-        features = extract_features(vendor, open_ports, extra_info, dhcp_fingerprint)
+        features = extract_features(vendor, open_ports, extra_info)
         active_features = sum(1 for f in features if f > 0.0)
         ports_in = [p["port"] for p in (open_ports or [])]
         log.debug(
@@ -433,7 +388,6 @@ def classify_device(
             vendor=vendor,
             open_ports=ports_in,
             extra_info=extra_info,
-            dhcp_fingerprint=dhcp_fingerprint,
             active_features=active_features,
             total_features=len(features),
             threshold=threshold,
