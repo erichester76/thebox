@@ -2570,7 +2570,7 @@ def nmap_scan(ip: str) -> dict:
         nm_tcp.scan(
             ip,
             arguments=(
-                f"-sS -sV -O --osscan-guess -T4 --host-timeout 60s --open"
+                f"-sS -sV -O --osscan-guess -T4 --open"
                 f" -p {_NMAP_TCP_PORT_SPEC}"
                 " --script=http-server-header,http-title,ssl-cert,banner"
             ),
@@ -2584,7 +2584,7 @@ def nmap_scan(ip: str) -> dict:
         nm_udp.scan(
             ip,
             arguments=(
-                "-sU -T4 --host-timeout 10s --open"
+                "-sU -T4 --open"
                 " -p 161"
                 " --script=snmp-info"
             ),
