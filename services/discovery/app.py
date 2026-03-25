@@ -2518,24 +2518,21 @@ def enrich_from_banners(ip: str, open_ports: list[dict]) -> dict:
 
 # ─── nmap port/OS scan ───────────────────────────────────────────────────────
 
-# Explicit TCP port list that mirrors FEATURE_PORTS in device_classifier.py.
+# TCP port list that mirrors FEATURE_PORTS in device_classifier.py.
 # Keeping them in sync ensures the scan covers exactly the ports used as
-# classifier features.  Also probes UDP 161 so the snmp-info NSE script can
-# collect sysDescr (SNMP is UDP-only; a pure TCP scan never discovers it).
+# classifier features.  UDP 161 (SNMP) is probed in a separate nmap pass
+# so that the slow UDP scan never blocks TCP port discovery.
 # Generated at module load from _dc.FEATURE_PORTS so the two lists can never
 # drift apart; falls back to a hardcoded string when device_classifier is
 # unavailable (import failed).
-_NMAP_PORT_SPEC: str = (
-    "T:{ports},U:161".format(
-        ports=",".join(str(p) for p in sorted(_dc.FEATURE_PORTS))
-    )
+_NMAP_TCP_PORT_SPEC: str = (
+    ",".join(str(p) for p in sorted(_dc.FEATURE_PORTS))
     if _dc is not None
     else (
         # Fallback: keep manually in sync with device_classifier.FEATURE_PORTS
-        "T:21-23,25,53,80,110,139,143,161,443,445,502,515,554,631,"
+        "21-23,25,53,80,110,139,143,161,443,445,502,515,554,631,"
         "993,995,1883,3306,3389,5000,5353,5432,5683,5900,7547,"
-        "8008-8009,8080,8291,8443,8883,9100,49152,62078,"
-        "U:161"
+        "8008-8009,8080,8291,8443,8883,9100,49152,62078"
     )
 )
 
@@ -2543,59 +2540,92 @@ _NMAP_PORT_SPEC: str = (
 def nmap_scan(ip: str) -> dict:
     """Run a quick nmap scan on *ip* and return port list + OS guess.
 
-    Uses nmap's built-in NSE scripts so that enrichment data is collected in
-    the same scan pass rather than requiring separate socket connections.
-    Scripts enabled:
+    Executes two separate nmap passes to avoid the 50-second slowdown caused
+    by combining TCP SYN and UDP scans in a single invocation:
+
+    **Pass 1 — TCP SYN scan** (fast; typically completes in < 5 s):
+    Scans all :data:`_NMAP_TCP_PORT_SPEC` ports with service-version detection
+    and the following NSE scripts:
 
     - ``http-server-header`` — HTTP ``Server:`` response header
     - ``http-title`` — HTML page title (useful for device identification)
     - ``ssl-cert`` — TLS certificate fields (CN, org, SANs)
-    - ``snmp-info`` — SNMP system description, name, contact, location
-      (runs on UDP port 161 when the device responds to SNMP)
     - ``banner`` — generic TCP banner for non-HTTP services
 
-    The script output is attached to each port entry under the ``"scripts"``
-    key and consumed by :func:`enrich_from_banners`.
+    **Pass 2 — UDP port 161 only** (lightweight SNMP probe):
+
+    - ``snmp-info`` — SNMP system description, name, contact, location
+
+    Results from both passes are merged before returning.  OS detection
+    (``-O`` / ``--osscan-guess``) runs in the TCP pass where it has enough
+    open-port data to make a reliable guess; the result is returned as
+    ``os_guess`` and used by the enrichment pipeline when RF classifier
+    confidence is below the minimum threshold.
     """
-    nm = nmap.PortScanner()
+    nm_tcp = nmap.PortScanner()
+    nm_udp = nmap.PortScanner()
+
+    # ── Pass 1: TCP SYN + OS detection + service version + NSE scripts ──────
     try:
-        nm.scan(
+        nm_tcp.scan(
             ip,
             arguments=(
-                f"-O -sS -sV -sU --osscan-guess -T4 --host-timeout 30s --open"
-                f" -p {_NMAP_PORT_SPEC}"
-                " --script=http-server-header,http-title,ssl-cert,snmp-info,banner"
+                f"-sS -sV -O --osscan-guess -T4 --host-timeout 15s --open"
+                f" -p {_NMAP_TCP_PORT_SPEC}"
+                " --script=http-server-header,http-title,ssl-cert,banner"
             ),
         )
     except Exception as exc:
-        log.warning("nmap_scan_error", ip=ip, error=str(exc))
-        return {"open_ports": [], "os_guess": None}
+        log.warning("nmap_tcp_scan_error", ip=ip, error=str(exc))
+        nm_tcp = None
 
-    if ip not in nm.all_hosts():
-        return {"open_ports": [], "os_guess": None}
+    # ── Pass 2: UDP 161 (SNMP) only ───────────────────────────────────────────
+    try:
+        nm_udp.scan(
+            ip,
+            arguments=(
+                "-sU -T4 --host-timeout 10s --open"
+                " -p 161"
+                " --script=snmp-info"
+            ),
+        )
+    except Exception as exc:
+        log.warning("nmap_udp_scan_error", ip=ip, error=str(exc))
+        nm_udp = None
 
-    host = nm[ip]
+    # ── Merge results ─────────────────────────────────────────────────────────
     open_ports = []
-    for proto in host.all_protocols():
-        for port, info in host[proto].items():
-            if info.get("state") == "open":
-                port_data: dict = {
-                    "port": port,
-                    "protocol": proto,
-                    "service": info.get("name", ""),
-                    "version": info.get("version", ""),
-                }
-                # Include NSE script output so enrich_from_banners() can
-                # consume http-server-header, ssl-cert, and snmp-info results
-                # without opening additional TCP/UDP connections.
-                scripts = info.get("script", {})
-                if scripts:
-                    port_data["scripts"] = scripts
-                open_ports.append(port_data)
+
+    tcp_ok = nm_tcp is not None and ip in nm_tcp.all_hosts()
+    udp_ok = nm_udp is not None and ip in nm_udp.all_hosts()
+    if not tcp_ok:
+        log.debug("nmap_tcp_no_results", ip=ip)
+    if not udp_ok:
+        log.debug("nmap_udp_no_results", ip=ip)
+
+    for nm in (nm_tcp, nm_udp):
+        if nm is None or ip not in nm.all_hosts():
+            continue
+        host = nm[ip]
+        for proto in host.all_protocols():
+            for port, info in host[proto].items():
+                if info.get("state") == "open":
+                    port_data: dict = {
+                        "port": port,
+                        "protocol": proto,
+                        "service": info.get("name", ""),
+                        "version": info.get("version", ""),
+                    }
+                    scripts = info.get("script", {})
+                    if scripts:
+                        port_data["scripts"] = scripts
+                    open_ports.append(port_data)
 
     os_guess = None
-    if "osmatch" in host and host["osmatch"]:
-        os_guess = host["osmatch"][0].get("name")
+    if tcp_ok:
+        osmatch = nm_tcp[ip].get("osmatch")
+        if osmatch:
+            os_guess = osmatch[0].get("name")
 
     return {"open_ports": open_ports, "os_guess": os_guess}
 
