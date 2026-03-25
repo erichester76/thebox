@@ -2570,7 +2570,7 @@ def nmap_scan(ip: str) -> dict:
         nm_tcp.scan(
             ip,
             arguments=(
-                f"-sS -sV -O --osscan-guess -T4 --host-timeout 15s --open"
+                f"-sS -sV -O --osscan-guess -T4 --host-timeout 60s --open"
                 f" -p {_NMAP_TCP_PORT_SPEC}"
                 " --script=http-server-header,http-title,ssl-cert,banner"
             ),
