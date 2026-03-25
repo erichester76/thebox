@@ -2518,6 +2518,28 @@ def enrich_from_banners(ip: str, open_ports: list[dict]) -> dict:
 
 # ─── nmap port/OS scan ───────────────────────────────────────────────────────
 
+# Explicit TCP port list that mirrors FEATURE_PORTS in device_classifier.py.
+# Keeping them in sync ensures the scan covers exactly the ports used as
+# classifier features.  Also probes UDP 161 so the snmp-info NSE script can
+# collect sysDescr (SNMP is UDP-only; a pure TCP scan never discovers it).
+# Generated at module load from _dc.FEATURE_PORTS so the two lists can never
+# drift apart; falls back to a hardcoded string when device_classifier is
+# unavailable (import failed).
+_NMAP_PORT_SPEC: str = (
+    "T:{ports},U:161".format(
+        ports=",".join(str(p) for p in sorted(_dc.FEATURE_PORTS))
+    )
+    if _dc is not None
+    else (
+        # Fallback: keep manually in sync with device_classifier.FEATURE_PORTS
+        "T:21-23,25,53,80,110,139,143,161,443,445,502,515,554,631,"
+        "993,995,1883,3306,3389,5000,5353,5432,5683,5900,7547,"
+        "8008-8009,8080,8291,8443,8883,9100,49152,62078,"
+        "U:161"
+    )
+)
+
+
 def nmap_scan(ip: str) -> dict:
     """Run a quick nmap scan on *ip* and return port list + OS guess.
 
@@ -2529,6 +2551,7 @@ def nmap_scan(ip: str) -> dict:
     - ``http-title`` — HTML page title (useful for device identification)
     - ``ssl-cert`` — TLS certificate fields (CN, org, SANs)
     - ``snmp-info`` — SNMP system description, name, contact, location
+      (runs on UDP port 161 when the device responds to SNMP)
     - ``banner`` — generic TCP banner for non-HTTP services
 
     The script output is attached to each port entry under the ``"scripts"``
@@ -2539,7 +2562,8 @@ def nmap_scan(ip: str) -> dict:
         nm.scan(
             ip,
             arguments=(
-                "-O -sV --osscan-guess -T4 --host-timeout 10s --open"
+                f"-O -sV -sU --osscan-guess -T4 --host-timeout 10s --open"
+                f" -p {_NMAP_PORT_SPEC}"
                 " --script=http-server-header,http-title,ssl-cert,snmp-info,banner"
             ),
         )
@@ -2562,8 +2586,8 @@ def nmap_scan(ip: str) -> dict:
                     "version": info.get("version", ""),
                 }
                 # Include NSE script output so enrich_from_banners() can
-                # consume http-server-header and ssl-cert results without
-                # opening additional TCP connections.
+                # consume http-server-header, ssl-cert, and snmp-info results
+                # without opening additional TCP/UDP connections.
                 scripts = info.get("script", {})
                 if scripts:
                     port_data["scripts"] = scripts
