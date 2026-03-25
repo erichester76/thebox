@@ -5,12 +5,14 @@ sklearn RandomForestClassifier models (~100 KB each on disk).  The models
 are trained by ``train_classifier.py`` (run during Docker image build) and
 loaded once at service startup.
 
-Feature vector (180 dimensions total):
-  - DHCP option-55 individual option-code flags     (30 flags)
-  - Open port multi-hot vector                      (34 flags)
-  - OUI vendor name keyword bag-of-words            (70 flags)
-  - mDNS service-type presence/absence flags        (19 flags)
-  - HTTP Server header keyword flags                (27 flags)
+Feature vector (dimensions computed from list lengths below — currently 205):
+  - Open port multi-hot vector                         (FEATURE_PORTS flags)
+  - OUI vendor name keyword bag-of-words               (VENDOR_KEYWORDS flags)
+  - mDNS service-type presence/absence flags           (MDNS_SERVICE_TYPES flags)
+  - HTTP Server header keyword flags                   (HTTP_SERVER_KEYWORDS flags)
+  - SNMP sysDescr keyword flags                        (SNMP_SYSDESCR_KEYWORDS flags)
+  - HTTP page-title keyword flags                      (HTTP_TITLE_KEYWORDS flags)
+  - UPnP device-type URI keyword flags                 (UPNP_DEVICE_TYPE_KEYWORDS flags)
 
 Both classifiers share the same 180-dimension feature vector.  The
 feature vector is intentionally designed to work well when DHCP data is
@@ -68,8 +70,10 @@ RF_CLASSIFIER_ENABLED: bool = (
 # vector.  In practice the vast majority of devices are discovered via ARP
 # scan, passive mDNS/SSDP, or nmap — not DHCP snooping — so DHCP flags
 # would be zero for most samples and would dilute classifier confidence.
-# Classification relies entirely on vendor OUI, open ports, and extra_info
-# signals (mDNS services, HTTP server banner, UPnP manufacturer).# Ports whose open/closed state is used as a binary feature.
+# Classification relies on vendor OUI, open ports, and extra_info signals
+# (mDNS services, HTTP server/title banners, SNMP sysDescr, UPnP device type).
+
+# Ports whose open/closed state is used as a binary feature.
 FEATURE_PORTS: list[int] = [
     21,    # FTP
     22,    # SSH
@@ -106,6 +110,7 @@ FEATURE_PORTS: list[int] = [
     9100,  # RAW print / JetDirect
     49152, # UPnP / dynamic
     5000,  # UPnP / custom IoT
+    62078, # iOS sync (iTunes/Finder device sync — iOS-exclusive)
 ]
 
 # OUI vendor name keywords — case-insensitive substring match.
@@ -178,12 +183,67 @@ HTTP_SERVER_KEYWORDS: list[str] = [
     "gws", "android",
 ]
 
+# SNMP sysDescr / sysEnterprise keyword flags — case-insensitive substring match.
+# These appear in the ``snmp_sysdescr`` and ``snmp_enterprise`` extra_info keys
+# collected by the ``snmp-info`` nmap NSE script (requires UDP port 161 scan).
+SNMP_SYSDESCR_KEYWORDS: list[str] = [
+    # Network OS / firmware strings (high signal — very specific)
+    "cisco ios", "junos", "routeros", "edgeos", "arubaos", "fortios",
+    "pfsense", "opnsense",
+    # Vendor names commonly embedded in sysDescr
+    "cisco", "juniper", "mikrotik", "ubiquiti", "fortinet",
+    # Server OS strings
+    "linux", "windows",
+    # Embedded / IoT firmware environments
+    "freertos", "esp-idf", "tasmota",
+    # Printers
+    "jetdirect",
+]
+
+# HTTP page-title keyword flags — case-insensitive substring match against
+# the ``http_title`` extra_info key populated by the ``http-title`` nmap NSE
+# script.  Page titles are highly device-specific for devices that expose a
+# management web interface.
+HTTP_TITLE_KEYWORDS: list[str] = [
+    # Network device management UIs
+    "router", "gateway", "access point",
+    "routeros", "edgerouter", "unifi", "edgeos",
+    "pfsense", "opnsense", "fortigate", "sophos",
+    # NAS / storage management
+    "synology", "diskstation", "qnap",
+    # Printers
+    "printer", "laserjet",
+]
+
+# UPnP device-type URI keyword flags — case-insensitive substring match
+# against the ``upnp_device_type`` extra_info key populated by SSDP discovery.
+# UPnP device-type URIs are highly discriminative (e.g. ``InternetGateway
+# Device`` only appears on residential gateways / routers).
+UPNP_DEVICE_TYPE_KEYWORDS: list[str] = [
+    # Network gateways / routers
+    "internetgatewaydevice",
+    "wandevice",
+    "wlanaccesspoint",
+    # Media streaming devices (IoT — smart TVs, streaming sticks)
+    "mediarenderer",
+    "mediaserver",
+    # Roku streaming devices (very specific vendor URI)
+    "roku-com",
+    # Printers
+    "device:printer",
+    # IP cameras / NVR
+    "digitalsecuritycamera",
+]
+
 # Total feature vector length (used by train_classifier.py too).
 FEATURE_COUNT: int = (
     len(FEATURE_PORTS)
     + len(VENDOR_KEYWORDS)
     + len(MDNS_SERVICE_TYPES)
     + len(HTTP_SERVER_KEYWORDS)
+    + len(SNMP_SYSDESCR_KEYWORDS)
+    + len(HTTP_TITLE_KEYWORDS)
+    + len(UPNP_DEVICE_TYPE_KEYWORDS)
 )
 
 # Canonical device-type labels (must match training labels in train_classifier.py).
@@ -275,6 +335,26 @@ def extract_features(
     http_server_l: str = (extra.get("http_server") or "").lower()
     for kw in HTTP_SERVER_KEYWORDS:
         features.append(1.0 if kw in http_server_l else 0.0)
+
+    # ── SNMP sysDescr keyword flags ───────────────────────────────────────────
+    # Combine sysDescr and sysEnterprise for broader keyword coverage.
+    snmp_l: str = (
+        (extra.get("snmp_sysdescr") or "")
+        + " "
+        + (extra.get("snmp_enterprise") or "")
+    ).lower()
+    for kw in SNMP_SYSDESCR_KEYWORDS:
+        features.append(1.0 if kw in snmp_l else 0.0)
+
+    # ── HTTP page-title keyword flags ─────────────────────────────────────────
+    http_title_l: str = (extra.get("http_title") or "").lower()
+    for kw in HTTP_TITLE_KEYWORDS:
+        features.append(1.0 if kw in http_title_l else 0.0)
+
+    # ── UPnP device-type URI keyword flags ────────────────────────────────────
+    upnp_dt_l: str = (extra.get("upnp_device_type") or "").lower()
+    for kw in UPNP_DEVICE_TYPE_KEYWORDS:
+        features.append(1.0 if kw in upnp_dt_l else 0.0)
 
     return features
 

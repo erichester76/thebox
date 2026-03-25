@@ -41,8 +41,11 @@ if _THIS_DIR not in sys.path:
 from device_classifier import (  # noqa: E402
     DEVICE_TYPES,
     FEATURE_COUNT,
+    HTTP_TITLE_KEYWORDS,
     MODEL_PATH,
     OS_FAMILIES,
+    SNMP_SYSDESCR_KEYWORDS,
+    UPNP_DEVICE_TYPE_KEYWORDS,
     extract_features,
 )
 
@@ -379,6 +382,14 @@ def _build_synthetic_samples() -> list[dict]:  # noqa: C901
          _mh("_googlecast._tcp", upnp_manufacturer="Roku"))
     _iot("Hui Zhou Gaoshengda Technology Co.,LTD", [],
          {"upnp_manufacturer": "TCL"})
+    # Gaoshengda / TCL / Roku with AirPlay + Spotify-Connect mDNS (Roku TV signal)
+    _iot("Hui Zhou Gaoshengda Technology Co.,LTD", [],
+         _mh("_airplay._tcp", "_spotify-connect._tcp", upnp_manufacturer="TCL"))
+    _iot("Hui Zhou Gaoshengda Technology Co.,LTD", [],
+         _mh("_airplay._tcp", "_spotify-connect._tcp", upnp_manufacturer="Roku"))
+    _iot("Hui Zhou Gaoshengda Technology Co.,LTD", [],
+         {"upnp_device_type": "urn:roku-com:device:player:1-0",
+          "upnp_manufacturer": "TCL"})
     _iot("Smart Innovation LLC",        _p(80),           {})
     _iot("Smart Innovation LLC",        [],               {})
     _iot("Shenzhen Bilian Electronic",  _p(80),           _h("uhttpd"))
@@ -422,6 +433,12 @@ def _build_synthetic_samples() -> list[dict]:  # noqa: C901
         _iot(extra={"upnp_manufacturer": mfr})
     _iot(extra={"upnp_device_type": "urn:schemas-upnp-org:device:MediaRenderer:1"})
     _iot(extra={"upnp_device_type": "urn:schemas-upnp-org:device:MediaServer:1"})
+    # Roku-specific UPnP device type (urn:roku-com:device:player:...)
+    _iot(extra={"upnp_device_type": "urn:roku-com:device:player:1-0"})
+    _iot(extra={"upnp_device_type": "urn:roku-com:device:player:1-0",
+                "upnp_manufacturer": "Roku"})
+    # IP camera UPnP device type
+    _iot(extra={"upnp_device_type": "urn:schemas-upnp-org:device:DigitalSecurityCamera:1"})
 
     # 7. SNMP sysDescr IoT keywords
     for kw in _SNMP_IOT_KEYWORDS:
@@ -488,6 +505,14 @@ def _build_synthetic_samples() -> list[dict]:  # noqa: C901
     for kw in _SNMP_NETWORK_DEVICE_KEYWORDS:
         _net(ports=_p(22, 80, 161),
              extra={"snmp_sysdescr": f"Software: {kw} Version 15.1"})
+    # SNMP-only (no open TCP ports — common for firewalled or SNMP-only devices)
+    for kw in _SNMP_NETWORK_DEVICE_KEYWORDS:
+        _net(extra={"snmp_sysdescr": f"Software: {kw} Version 15.1"})
+    # Ubiquiti-specific SNMP sysDescr strings (EdgeOS / UniFi OS)
+    _net("Ubiquiti Inc.",    [], {"snmp_sysdescr": "EdgeOS 2.0.9 running on ubnt-us-24-250w"})
+    _net("Ubiquiti Inc.",    [], {"snmp_sysdescr": "UniFi OS running on UCK-G2"})
+    _net("Ubiquiti Networks",[], {"snmp_sysdescr": "EdgeOS running on EdgeRouter"})
+    _net("Ubiquiti Inc.",    [], {"snmp_enterprise": "Ubiquiti Networks, Inc."})
 
     # 5. SNMP sysName patterns → network device
     for name in ("rtr-01", "router-core", "sw-01", "switch-access",
@@ -497,12 +522,22 @@ def _build_synthetic_samples() -> list[dict]:  # noqa: C901
     # 6. HTTP title → network device
     for title in ("router", "gateway", "routeros", "edgerouter", "unifi",
                   "ubiquiti", "meraki", "fortigate", "opnsense", "pfsense",
-                  "arubaos", "sophos xg"):
+                  "arubaos", "sophos xg", "access point", "edgeos"):
         _net(ports=_p(80, 443), extra={"http_title": title})
+    # HTTP title without open ports (management UI on non-standard port)
+    for title in ("router", "gateway", "unifi", "edgerouter", "edgeos", "pfsense",
+                  "opnsense", "fortigate"):
+        _net(extra={"http_title": title})
 
     # 7. UPnP device type → network device
-    _net(extra={"upnp_device_type": "urn:schemas-upnp-org:device:InternetGatewayDevice:1"})
-    _net(extra={"upnp_device_type": "urn:schemas-upnp-org:device:WANDevice:1"})
+    # Add multiple vendor+UPnP combinations so the internetgatewaydevice feature
+    # appears in enough tree splits to be statistically significant.
+    for v in ("TP-Link Technologies", "Netgear Inc.", "ASUS", None):
+        _net(vendor=v,
+             extra={"upnp_device_type": "urn:schemas-upnp-org:device:InternetGatewayDevice:1"})
+    for v in ("TP-Link Technologies", None):
+        _net(vendor=v,
+             extra={"upnp_device_type": "urn:schemas-upnp-org:device:WANDevice:1"})
     _net(extra={"upnp_device_type": "urn:schemas-upnp-org:device:WLANAccessPoint:1"})
 
     # =========================================================================
@@ -523,6 +558,11 @@ def _build_synthetic_samples() -> list[dict]:  # noqa: C901
     _srv("Western Digital Technologies", _p(80, 443, 445),   _mh("_smb._tcp"))
     _srv("Seagate Technology",           _p(80, 443, 445),   {})
     _srv("Buffalo Inc.",                 _p(22, 80, 443, 445), {})
+
+    # NAS HTTP title signals (DSM / QTS are highly specific)
+    for title in ("synology", "diskstation", "qnap", "nas"):
+        _srv(ports=_p(80, 443), extra={"http_title": title})
+        _srv(extra={"http_title": title})
 
     # 3. Linux server: SSH + web stack (definitive Linux server signature)
     _linux_server_patterns = [
@@ -707,16 +747,21 @@ def _build_synthetic_samples() -> list[dict]:  # noqa: C901
     for v in _CANONICAL_PRINTER_VENDORS:
         _prt(vendor=v, extra=_m("_ipp._tcp"))
 
-    # SNMP sysDescr → printer
+    # SNMP sysDescr → printer (with and without ports)
     for kw in _SNMP_PRINTER_KEYWORDS:
         _prt(ports=_p(9100, 161),
              extra={"snmp_sysdescr": f"HP {kw} Series"})
+        _prt(extra={"snmp_sysdescr": f"HP {kw} Series"})
 
-    # HTTP title → printer
+    # HTTP title → printer (case-insensitive keywords in title)
     for title in ("HP LaserJet", "HP OfficeJet", "Brother Printer",
                   "Canon PRINT", "Epson Printer", "Xerox Printer",
-                  "KYOCERA", "Konica Minolta", "Ricoh"):
+                  "KYOCERA", "Konica Minolta", "Ricoh",
+                  "printer", "laserjet"):
         _prt(ports=_p(80, 9100), extra={"http_title": title})
+    # HTTP title without open ports
+    for title in ("printer", "laserjet"):
+        _prt(extra={"http_title": title})
 
     # HTTP banner printer
     _prt(ports=_p(9100, 80), extra=_h("jetdirect"))
